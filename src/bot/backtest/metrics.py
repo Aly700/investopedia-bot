@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from math import sqrt
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
@@ -35,6 +35,18 @@ OBJECTIVE_DIRECTIONS = {
     "average_loss": "max",
     "expectancy": "max",
 }
+OBJECTIVE_CHOICES = tuple(OBJECTIVE_DIRECTIONS.keys())
+
+COMPARISON_PARAMETER_FIELDS = (
+    "preset_name",
+    "parameter_id",
+    "breakout_lookback",
+    "relative_volume_threshold",
+    "initial_stop_atr",
+    "trailing_stop_atr",
+    "risk_per_trade",
+)
+COMPARISON_COLUMNS = (*COMPARISON_PARAMETER_FIELDS, *SUMMARY_METRIC_FIELDS)
 
 
 def empty_summary_metrics() -> dict[str, float | int]:
@@ -127,6 +139,36 @@ def calculate_summary_metrics(
         "average_loss": average_loss,
         "expectancy": expectancy,
     }
+
+
+def build_strategy_comparison_frame(
+    rows: Sequence[dict[str, Any]] | Sequence[Mapping[str, Any]],
+) -> pd.DataFrame:
+    """Return a normalized frame for preset comparison runs."""
+
+    if not rows:
+        return pd.DataFrame(columns=COMPARISON_COLUMNS)
+
+    frame = pd.DataFrame(rows).copy()
+    if "preset_name" not in frame.columns:
+        raise KeyError("Comparison rows must include a 'preset_name' column.")
+
+    if "parameter_id" not in frame.columns:
+        frame["parameter_id"] = frame["preset_name"].astype(str)
+
+    numeric_columns = [
+        "breakout_lookback",
+        "relative_volume_threshold",
+        "initial_stop_atr",
+        "trailing_stop_atr",
+        "risk_per_trade",
+        *SUMMARY_METRIC_FIELDS,
+    ]
+    for column in numeric_columns:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    return frame.reindex(columns=COMPARISON_COLUMNS)
 
 
 def aggregate_metric_frame(
@@ -268,6 +310,33 @@ def select_top_parameter_sets(
         ascending.append(True)
 
     return filtered.sort_values(sort_columns, ascending=ascending, kind="stable").head(top_n)
+
+
+def rank_strategy_comparisons(
+    comparison_frame: pd.DataFrame,
+    *,
+    objective: str,
+    top_n: int | None = None,
+) -> pd.DataFrame:
+    """Rank preset comparison rows by the requested objective."""
+
+    _validate_objective(objective)
+    if top_n is not None and top_n <= 0:
+        raise ValueError("top_n must be greater than zero when provided.")
+    if comparison_frame.empty:
+        ranked = comparison_frame.copy()
+        if "rank" not in ranked.columns:
+            ranked.insert(0, "rank", pd.Series(dtype=int))
+        return ranked
+
+    limit = len(comparison_frame) if top_n is None else min(int(top_n), len(comparison_frame))
+    ranked = select_top_metric_rows(
+        comparison_frame,
+        objective=objective,
+        top_n=len(comparison_frame),
+    ).reset_index(drop=True)
+    ranked.insert(0, "rank", range(1, len(ranked) + 1))
+    return ranked.head(limit)
 
 
 def metrics_to_serializable_dict(metrics: dict[str, Any]) -> dict[str, Any]:

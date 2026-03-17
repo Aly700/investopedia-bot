@@ -185,6 +185,33 @@ This command:
 
 If sweep arguments are omitted, the command uses the current single values from `config/strategy.yaml`.
 
+### Compare named strategy presets
+
+```bash
+investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31
+investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset-names conservative_breakout,standard_breakout,aggressive_breakout --objective sharpe_ratio
+investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset "name=research_fast,breakout_lookback=15,relative_volume_threshold=1.2,initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.012"
+```
+
+This command:
+
+- compares named breakout/risk presets over the same symbols and date range
+- reuses the deterministic backtest engine and the existing summary metric logic
+- writes `comparison_results`, `ranked_presets`, and `summary.json` in machine-readable formats
+
+Built-in presets are `conservative_breakout`, `standard_breakout`, and `aggressive_breakout`.
+You can also add repo-local presets in `config/strategy.yaml` with an optional `comparison_presets` section:
+
+```yaml
+comparison_presets:
+  research_breakout:
+    breakout_lookback: 30
+    relative_volume_threshold: 1.7
+    initial_stop_atr: 2.7
+    trailing_stop_atr: 3.3
+    risk_per_trade: 0.008
+```
+
 ## Architecture Notes
 
 - Signal generation should stay separate from execution. Research code can emit candidate trades, while execution modules only format or route orders.
@@ -195,6 +222,7 @@ If sweep arguments are omitted, the command uses the current single values from 
 - The backtest engine uses decision-on-close and fill-on-next-open semantics to avoid look-ahead bias. Trailing stops only update after the close and become active on the following session.
 - The manual execution layer is intentionally report-first. It produces human-readable orders and research artifacts, but it does not submit anything to Investopedia yet.
 - Walk-forward tooling is the main robustness check. Prefer parameter sets that remain acceptable across many test folds over ones that win one in-sample run.
+- Strategy comparison is a faster preset-level screen. Use it to narrow candidates, then confirm the survivors with walk-forward outputs before trusting a setting.
 - Browser automation and any live web executor are intentionally out of scope for this baseline.
 
 ## Development

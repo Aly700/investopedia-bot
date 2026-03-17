@@ -11,10 +11,17 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
+import pandas as pd
 import yaml
 
 from bot.backtest.engine import DailyBarBacktestEngine
-from bot.backtest.metrics import metrics_to_serializable_dict
+from bot.backtest.metrics import (
+    OBJECTIVE_CHOICES,
+    build_strategy_comparison_frame,
+    metrics_to_serializable_dict,
+    rank_strategy_comparisons,
+)
+from bot.backtest.slippage_costs import TransactionCostModel
 from bot.backtest.walkforward import (
     generate_walkforward_folds,
     parameter_grid_from_config,
@@ -23,6 +30,7 @@ from bot.backtest.walkforward import (
     write_walkforward_reports,
 )
 from bot.config import (
+    AppConfig,
     ConfigError,
     default_config_dir,
     default_env_file,
@@ -43,7 +51,12 @@ from bot.reporting.daily_report import build_daily_signal_report, write_daily_si
 from bot.reporting.equity_curve import write_equity_curve_report
 from bot.reporting.trade_log import write_trade_log_report
 from bot.risk.portfolio_rules import PortfolioConstraints, assess_signal_candidate
-from bot.strategy.breakout_momentum import BreakoutMomentumSettings, generate_breakout_signal
+from bot.strategy.breakout_momentum import (
+    BreakoutMomentumSettings,
+    BreakoutStrategyPreset,
+    generate_breakout_signal,
+    resolve_breakout_strategy_presets,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -407,19 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     walkforward_parser.add_argument(
         "--objective",
-        choices=(
-            "starting_equity",
-            "ending_equity",
-            "total_return",
-            "cagr",
-            "max_drawdown",
-            "sharpe_ratio",
-            "trade_count",
-            "win_rate",
-            "average_win",
-            "average_loss",
-            "expectancy",
-        ),
+        choices=OBJECTIVE_CHOICES,
         default="sharpe_ratio",
         help="Objective used to rank parameter sets.",
     )
@@ -447,6 +448,88 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass local cache and force provider fetches.",
     )
     walkforward_parser.set_defaults(handler=_handle_walkforward)
+
+    compare_parser = subparsers.add_parser(
+        "compare-strategies",
+        help="Compare named breakout strategy presets over the same symbols and date range.",
+    )
+    compare_parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    compare_parser.add_argument(
+        "--start",
+        type=_parse_iso_date,
+        required=True,
+        help="Inclusive comparison start date in YYYY-MM-DD format.",
+    )
+    compare_parser.add_argument(
+        "--end",
+        type=_parse_iso_date,
+        required=True,
+        help="Inclusive comparison end date in YYYY-MM-DD format.",
+    )
+    compare_parser.add_argument(
+        "--preset-names",
+        default=None,
+        help="Comma-separated preset names to compare. Defaults to all built-in and config-defined presets.",
+    )
+    compare_parser.add_argument(
+        "--preset",
+        action="append",
+        default=None,
+        help=(
+            "Inline custom preset definition. "
+            "Format: name=my_preset,breakout_lookback=20,relative_volume_threshold=1.5,"
+            "initial_stop_atr=2.5,trailing_stop_atr=3.0,risk_per_trade=0.01"
+        ),
+    )
+    compare_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter.",
+    )
+    compare_parser.add_argument(
+        "--require-relative-volume",
+        action="store_true",
+        help="Require relative-volume confirmation for all compared presets.",
+    )
+    compare_parser.add_argument(
+        "--disable-regime-filter",
+        action="store_true",
+        help="Disable the benchmark-based regime filter for all compared presets.",
+    )
+    compare_parser.add_argument(
+        "--objective",
+        choices=OBJECTIVE_CHOICES,
+        default="sharpe_ratio",
+        help="Objective used to rank presets.",
+    )
+    compare_parser.add_argument(
+        "--top-n",
+        type=int,
+        default=5,
+        help="Number of top-ranked presets to include in the summary output.",
+    )
+    compare_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for comparison CSV and JSON outputs.",
+    )
+    compare_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    compare_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    compare_parser.set_defaults(handler=_handle_compare_strategies)
 
     return parser
 
@@ -919,6 +1002,122 @@ def _handle_walkforward(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_compare_strategies(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    preset_names = _parse_text_list(args.preset_names)
+    configured_presets = _load_strategy_comparison_presets(args.config_dir)
+    presets = resolve_breakout_strategy_presets(
+        config.strategy.signals,
+        config.strategy.risk,
+        configured_presets=configured_presets,
+        cli_preset_definitions=tuple(args.preset or ()),
+        preset_names=preset_names,
+    )
+
+    symbols = load_candidate_symbols(args.candidate_path)
+    if not symbols:
+        raise ValueError(f"No symbols were found in {args.candidate_path.resolve()}.")
+
+    fetch_start = _comparison_warmup_start(
+        start_date=args.start,
+        atr_window=config.strategy.risk.atr_length,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        presets=presets,
+        enable_regime_filter=not args.disable_regime_filter,
+    )
+    symbol_frames: dict[str, object] = {}
+    for symbol in symbols:
+        try:
+            bars = provider.fetch_daily_bars(
+                symbol,
+                fetch_start,
+                args.end,
+                refresh_cache=args.refresh_cache,
+            )
+        except DataProviderError as exc:
+            LOGGER.warning("Skipping %s due to provider error: %s", symbol, exc)
+            continue
+
+        if bars.empty:
+            LOGGER.warning("Skipping %s because no bars were returned in the requested range.", symbol)
+            continue
+        symbol_frames[symbol] = bars
+
+    if not symbol_frames:
+        raise ValueError("No symbol data was available for the requested strategy comparison.")
+
+    benchmark_frame = None
+    if not args.disable_regime_filter:
+        benchmark_symbol = (
+            args.benchmark_symbol.strip().upper()
+            if args.benchmark_symbol
+            else config.strategy.signals.benchmark_symbol
+        )
+        if benchmark_symbol in symbol_frames:
+            benchmark_frame = symbol_frames[benchmark_symbol]
+        else:
+            benchmark_frame = provider.fetch_daily_bars(
+                benchmark_symbol,
+                fetch_start,
+                args.end,
+                refresh_cache=args.refresh_cache,
+            )
+        if benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
+            )
+
+    comparison_frame = _run_breakout_strategy_comparison(
+        config=config,
+        symbol_frames=symbol_frames,
+        benchmark_frame=benchmark_frame,
+        start_date=args.start,
+        end_date=args.end,
+        presets=presets,
+        benchmark_symbol_override=args.benchmark_symbol,
+        require_relative_volume_confirmation=args.require_relative_volume,
+        enable_regime_filter=not args.disable_regime_filter,
+    )
+    ranked_presets = rank_strategy_comparisons(
+        comparison_frame,
+        objective=args.objective,
+        top_n=args.top_n,
+    )
+
+    output_dir = (
+        args.output_dir
+        or (
+            config.project_root
+            / "data"
+            / "processed"
+            / "strategy_comparison"
+            / f"{args.start.isoformat()}_{args.end.isoformat()}"
+        )
+    ).resolve()
+    outputs = _write_strategy_comparison_reports(
+        comparison_frame,
+        ranked_presets,
+        output_dir=output_dir,
+        objective=args.objective,
+    )
+
+    payload = {
+        "provider": config.data_sources.provider,
+        "start_date": args.start.isoformat(),
+        "end_date": args.end.isoformat(),
+        "objective": args.objective,
+        "preset_count": len(presets),
+        "preset_names": [preset.name for preset in presets],
+        "symbols_requested": len(symbols),
+        "symbols_tested": len(symbol_frames),
+        "ranked_presets": _dataframe_records(ranked_presets),
+        "outputs": outputs,
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
 def _default_order_output_path(project_root: Path, as_of_date: date) -> Path:
     output_dir = project_root / "data" / "processed" / "orders"
     return output_dir / f"{as_of_date.isoformat()}_manual_orders.csv"
@@ -939,6 +1138,138 @@ def _strategy_warmup_start(
         settings.benchmark_sma_slow if settings.enable_regime_filter else 1,
     )
     return as_of_date - timedelta(days=max(largest_window * 3, 30))
+
+
+def _comparison_warmup_start(
+    *,
+    start_date: date,
+    atr_window: int,
+    benchmark_sma_slow: int,
+    presets: Sequence[BreakoutStrategyPreset],
+    enable_regime_filter: bool,
+) -> date:
+    max_breakout_lookback = max((preset.breakout_lookback for preset in presets), default=1)
+    largest_window = max(
+        max_breakout_lookback + 1,
+        atr_window,
+        max_breakout_lookback + 1,
+        benchmark_sma_slow if enable_regime_filter else 1,
+    )
+    return start_date - timedelta(days=max(largest_window * 3, 30))
+
+
+def _run_breakout_strategy_comparison(
+    *,
+    config: AppConfig,
+    symbol_frames: dict[str, pd.DataFrame],
+    benchmark_frame: pd.DataFrame | None,
+    start_date: date,
+    end_date: date,
+    presets: Sequence[BreakoutStrategyPreset],
+    benchmark_symbol_override: str | None,
+    require_relative_volume_confirmation: bool,
+    enable_regime_filter: bool,
+) -> pd.DataFrame:
+    base_settings = BreakoutMomentumSettings.from_configs(
+        config.strategy.signals,
+        config.strategy.risk,
+        require_relative_volume_confirmation=require_relative_volume_confirmation,
+        enable_regime_filter=enable_regime_filter,
+    )
+    if benchmark_symbol_override is not None and benchmark_symbol_override.strip():
+        base_settings = replace(
+            base_settings,
+            benchmark_symbol=benchmark_symbol_override.strip().upper(),
+        )
+
+    cost_model = TransactionCostModel.from_game_rules(config.game_rules)
+    portfolio_constraints = PortfolioConstraints.from_configs(
+        config.strategy.risk,
+        config.game_rules.rules,
+    )
+
+    rows: list[dict[str, object]] = []
+    for preset in presets:
+        engine = DailyBarBacktestEngine(
+            strategy_settings=preset.apply_to_settings(base_settings),
+            portfolio_constraints=portfolio_constraints,
+            starting_cash=config.game_rules.starting_cash,
+            base_risk_per_trade=preset.risk_per_trade,
+            cost_model=cost_model,
+            trailing_stop_atr_multiple=preset.trailing_stop_atr,
+            close_positions_at_end=True,
+        )
+        result = engine.run(
+            symbol_frames=symbol_frames,
+            benchmark_frame=benchmark_frame,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        row = preset.to_dict()
+        row.update(metrics_to_serializable_dict(result.summary_metrics))
+        rows.append(row)
+
+    return build_strategy_comparison_frame(rows)
+
+
+def _write_strategy_comparison_reports(
+    comparison_frame: pd.DataFrame,
+    ranked_presets: pd.DataFrame,
+    *,
+    output_dir: Path,
+    objective: str,
+) -> dict[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    comparison_csv = output_dir / "comparison_results.csv"
+    comparison_json = output_dir / "comparison_results.json"
+    ranked_csv = output_dir / "ranked_presets.csv"
+    ranked_json = output_dir / "ranked_presets.json"
+    summary_json = output_dir / "summary.json"
+
+    comparison_frame.to_csv(comparison_csv, index=False)
+    ranked_presets.to_csv(ranked_csv, index=False)
+    comparison_json.write_text(
+        json.dumps(_dataframe_records(comparison_frame), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    ranked_json.write_text(
+        json.dumps(_dataframe_records(ranked_presets), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    summary_json.write_text(
+        json.dumps(
+            {
+                "objective": objective,
+                "preset_count": int(len(comparison_frame)),
+                "top_presets": _dataframe_records(ranked_presets),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "comparison_results_csv": str(comparison_csv),
+        "comparison_results_json": str(comparison_json),
+        "ranked_presets_csv": str(ranked_csv),
+        "ranked_presets_json": str(ranked_json),
+        "summary_json": str(summary_json),
+    }
+
+
+def _load_strategy_comparison_presets(config_dir: Path) -> dict[str, object]:
+    strategy_path = config_dir / "strategy.yaml"
+    if not strategy_path.exists():
+        return {}
+
+    raw_config = yaml.safe_load(strategy_path.read_text(encoding="utf-8")) or {}
+    configured_presets = raw_config.get("comparison_presets", {})
+    if configured_presets is None:
+        return {}
+    if not isinstance(configured_presets, dict):
+        raise ValueError("comparison_presets in strategy.yaml must be a mapping when provided.")
+    return dict(configured_presets)
 
 
 def _print_structured(payload: dict[str, object], *, output_format: str) -> None:
@@ -973,6 +1304,15 @@ def _parse_float_list(raw_value: str | None) -> tuple[float, ...] | None:
     if not cleaned_values:
         raise ValueError("Parameter lists cannot be empty.")
     return tuple(float(value) for value in cleaned_values)
+
+
+def _parse_text_list(raw_value: str | None) -> tuple[str, ...] | None:
+    if raw_value is None:
+        return None
+    cleaned_values = tuple(part.strip() for part in raw_value.split(",") if part.strip())
+    if not cleaned_values:
+        raise ValueError("Text lists cannot be empty.")
+    return cleaned_values
 
 
 def _dataframe_records(frame: object) -> list[dict[str, object]]:

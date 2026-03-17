@@ -1,10 +1,10 @@
-"""Long-only breakout momentum signal generation."""
+"""Long-only breakout momentum signal generation and preset helpers."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
@@ -86,6 +86,209 @@ class BreakoutMomentumSettings:
             mode=self.regime_filter_mode,
             enabled=self.enable_regime_filter,
         )
+
+
+@dataclass(frozen=True)
+class BreakoutStrategyPreset:
+    """A named breakout/risk preset for backtest and comparison workflows."""
+
+    name: str
+    breakout_lookback: int
+    relative_volume_threshold: float
+    initial_stop_atr: float
+    trailing_stop_atr: float
+    risk_per_trade: float
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("Preset name cannot be empty.")
+        if self.breakout_lookback <= 0:
+            raise ValueError("breakout_lookback must be greater than zero.")
+        if self.relative_volume_threshold <= 0:
+            raise ValueError("relative_volume_threshold must be greater than zero.")
+        if self.initial_stop_atr <= 0:
+            raise ValueError("initial_stop_atr must be greater than zero.")
+        if self.trailing_stop_atr <= 0:
+            raise ValueError("trailing_stop_atr must be greater than zero.")
+        if self.risk_per_trade <= 0:
+            raise ValueError("risk_per_trade must be greater than zero.")
+
+    @classmethod
+    def from_mapping(cls, name: str, data: Mapping[str, Any]) -> "BreakoutStrategyPreset":
+        """Build a preset from a config-style mapping."""
+
+        return cls(
+            name=name.strip(),
+            breakout_lookback=_mapping_int(data, "breakout_lookback"),
+            relative_volume_threshold=_mapping_float(data, "relative_volume_threshold"),
+            initial_stop_atr=_mapping_float(data, "initial_stop_atr"),
+            trailing_stop_atr=_mapping_float(data, "trailing_stop_atr"),
+            risk_per_trade=_mapping_float(data, "risk_per_trade"),
+        )
+
+    @property
+    def parameter_id(self) -> str:
+        """Return a stable identifier for the preset parameters."""
+
+        return (
+            f"lookback={self.breakout_lookback}|"
+            f"rv={self.relative_volume_threshold:g}|"
+            f"initial_stop={self.initial_stop_atr:g}|"
+            f"trailing_stop={self.trailing_stop_atr:g}|"
+            f"risk={self.risk_per_trade:g}"
+        )
+
+    def apply_to_settings(self, settings: BreakoutMomentumSettings) -> BreakoutMomentumSettings:
+        """Return strategy settings with the preset's strategy fields applied."""
+
+        return replace(
+            settings,
+            breakout_lookback=self.breakout_lookback,
+            relative_volume_threshold=self.relative_volume_threshold,
+            stop_atr_multiple=self.initial_stop_atr,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation of the preset."""
+
+        return {
+            "preset_name": self.name,
+            "parameter_id": self.parameter_id,
+            "breakout_lookback": self.breakout_lookback,
+            "relative_volume_threshold": self.relative_volume_threshold,
+            "initial_stop_atr": self.initial_stop_atr,
+            "trailing_stop_atr": self.trailing_stop_atr,
+            "risk_per_trade": self.risk_per_trade,
+        }
+
+
+def build_default_breakout_presets(
+    signal_config: SignalConfig,
+    risk_config: RiskConfig,
+) -> dict[str, BreakoutStrategyPreset]:
+    """Return the built-in preset catalog derived from the repo defaults."""
+
+    standard = BreakoutStrategyPreset(
+        name="standard_breakout",
+        breakout_lookback=signal_config.breakout_lookback,
+        relative_volume_threshold=signal_config.relative_volume_threshold,
+        initial_stop_atr=risk_config.initial_stop_atr,
+        trailing_stop_atr=risk_config.trailing_stop_atr,
+        risk_per_trade=risk_config.risk_per_trade,
+    )
+    conservative = BreakoutStrategyPreset(
+        name="conservative_breakout",
+        breakout_lookback=max(signal_config.breakout_lookback + 10, int(round(signal_config.breakout_lookback * 1.5))),
+        relative_volume_threshold=signal_config.relative_volume_threshold + 0.5,
+        initial_stop_atr=risk_config.initial_stop_atr + 0.5,
+        trailing_stop_atr=risk_config.trailing_stop_atr + 0.5,
+        risk_per_trade=max(risk_config.risk_per_trade * 0.5, 0.0025),
+    )
+    aggressive = BreakoutStrategyPreset(
+        name="aggressive_breakout",
+        breakout_lookback=max(5, signal_config.breakout_lookback - 10),
+        relative_volume_threshold=max(1.0, signal_config.relative_volume_threshold - 0.5),
+        initial_stop_atr=max(1.0, risk_config.initial_stop_atr - 0.5),
+        trailing_stop_atr=max(1.0, risk_config.trailing_stop_atr - 0.5),
+        risk_per_trade=min(0.05, risk_config.risk_per_trade * 1.5),
+    )
+    return {
+        conservative.name: conservative,
+        standard.name: standard,
+        aggressive.name: aggressive,
+    }
+
+
+def breakout_presets_from_mapping(
+    preset_mapping: Mapping[str, Any] | None,
+) -> dict[str, BreakoutStrategyPreset]:
+    """Parse breakout presets from a config-style mapping."""
+
+    if preset_mapping is None:
+        return {}
+    presets: dict[str, BreakoutStrategyPreset] = {}
+    for name, raw_value in preset_mapping.items():
+        if not isinstance(raw_value, Mapping):
+            raise ValueError(f"Preset '{name}' must be a mapping of breakout parameters.")
+        preset = BreakoutStrategyPreset.from_mapping(str(name), raw_value)
+        presets[preset.name] = preset
+    return presets
+
+
+def breakout_preset_from_cli_definition(raw_value: str) -> BreakoutStrategyPreset:
+    """Parse an inline CLI preset definition.
+
+    Expected format:
+    ``name=my_preset,breakout_lookback=20,relative_volume_threshold=1.5,initial_stop_atr=2.5,trailing_stop_atr=3.0,risk_per_trade=0.01``
+    """
+
+    cleaned = raw_value.strip()
+    if not cleaned:
+        raise ValueError("Preset definitions cannot be empty.")
+
+    values: dict[str, str] = {}
+    for chunk in cleaned.split(","):
+        part = chunk.strip()
+        if not part:
+            continue
+        key, separator, value = part.partition("=")
+        if not separator:
+            raise ValueError(
+                "Invalid preset definition segment "
+                f"'{part}'. Expected key=value pairs separated by commas."
+            )
+        normalized_key = key.strip()
+        normalized_value = value.strip()
+        if not normalized_key or not normalized_value:
+            raise ValueError(
+                f"Invalid preset definition segment '{part}'. Keys and values cannot be empty."
+            )
+        values[normalized_key] = normalized_value
+
+    name = values.pop("name", "").strip()
+    if not name:
+        raise ValueError("Preset definitions must include a non-empty name=... field.")
+    return BreakoutStrategyPreset.from_mapping(name, values)
+
+
+def resolve_breakout_strategy_presets(
+    signal_config: SignalConfig,
+    risk_config: RiskConfig,
+    *,
+    configured_presets: Mapping[str, Any] | None = None,
+    cli_preset_definitions: Sequence[str] = (),
+    preset_names: Sequence[str] | None = None,
+) -> list[BreakoutStrategyPreset]:
+    """Resolve the preset catalog from defaults, config overrides, and CLI definitions."""
+
+    resolved = build_default_breakout_presets(signal_config, risk_config)
+    resolved.update(breakout_presets_from_mapping(configured_presets))
+    for raw_definition in cli_preset_definitions:
+        preset = breakout_preset_from_cli_definition(raw_definition)
+        resolved[preset.name] = preset
+
+    if preset_names:
+        selected: list[BreakoutStrategyPreset] = []
+        missing: list[str] = []
+        for raw_name in preset_names:
+            name = raw_name.strip()
+            if not name:
+                continue
+            preset = resolved.get(name)
+            if preset is None:
+                missing.append(name)
+                continue
+            selected.append(preset)
+        if missing:
+            available = ", ".join(sorted(resolved))
+            raise ValueError(
+                f"Unknown preset name(s): {', '.join(missing)}. Available presets: {available}."
+            )
+        if not selected:
+            raise ValueError("Preset selection cannot be empty.")
+        return selected
+
+    return list(resolved.values())
 
 
 def compute_breakout_features(
@@ -226,3 +429,21 @@ def _build_signal_metadata(
         "regime_passed": regime_passed,
         "atr": _optional_float(latest_row["atr"]),
     }
+
+
+def _mapping_int(data: Mapping[str, Any], key: str) -> int:
+    try:
+        return int(data[key])
+    except KeyError as exc:
+        raise ValueError(f"Preset mapping is missing required field '{key}'.") from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Preset field '{key}' must be an integer.") from exc
+
+
+def _mapping_float(data: Mapping[str, Any], key: str) -> float:
+    try:
+        return float(data[key])
+    except KeyError as exc:
+        raise ValueError(f"Preset mapping is missing required field '{key}'.") from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Preset field '{key}' must be a float.") from exc
