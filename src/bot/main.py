@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import date
+from datetime import timedelta
 import json
 from pathlib import Path
 import sys
@@ -23,11 +25,18 @@ from bot.config import (
 from bot.data.providers import DataProviderConfigurationError, DataProviderError, create_daily_bar_provider
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
 from bot.execution.manual_executor import (
+    ManualExecutor,
     ManualOrderError,
     load_orders_from_csv,
+    write_execution_batch,
     write_manual_order_sheet,
 )
 from bot.logging_utils import get_logger, setup_logging
+from bot.reporting.daily_report import build_daily_signal_report, write_daily_signal_report
+from bot.reporting.equity_curve import write_equity_curve_report
+from bot.reporting.trade_log import write_trade_log_report
+from bot.risk.portfolio_rules import PortfolioConstraints, assess_signal_candidate
+from bot.strategy.breakout_momentum import BreakoutMomentumSettings, generate_breakout_signal
 
 
 LOGGER = get_logger(__name__)
@@ -160,6 +169,73 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass local cache and force provider fetches.",
     )
     build_universe_parser.set_defaults(handler=_handle_build_universe)
+
+    generate_orders_parser = subparsers.add_parser(
+        "generate-orders",
+        help="Generate a manual daily order sheet from current signals and risk checks.",
+    )
+    generate_orders_parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    generate_orders_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Right edge of the signal evaluation window.",
+    )
+    generate_orders_parser.add_argument(
+        "--equity",
+        type=float,
+        default=None,
+        help="Current account equity used for position sizing. Defaults to config starting_cash.",
+    )
+    generate_orders_parser.add_argument(
+        "--current-drawdown",
+        type=float,
+        default=0.0,
+        help="Current portfolio drawdown as a decimal fraction for drawdown-aware risk reduction.",
+    )
+    generate_orders_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=20,
+        help="Lookback window used for universe liquidity screening.",
+    )
+    generate_orders_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter.",
+    )
+    generate_orders_parser.add_argument(
+        "--require-relative-volume",
+        action="store_true",
+        help="Require relative-volume confirmation for breakout entries.",
+    )
+    generate_orders_parser.add_argument(
+        "--disable-regime-filter",
+        action="store_true",
+        help="Disable the benchmark-based regime filter.",
+    )
+    generate_orders_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for the manual order sheet and daily reports.",
+    )
+    generate_orders_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    generate_orders_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    generate_orders_parser.set_defaults(handler=_handle_generate_orders)
 
     render_orders_parser = subparsers.add_parser(
         "render-orders",
@@ -348,6 +424,135 @@ def _handle_build_universe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_generate_orders(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    builder = UniverseBuilder(provider, config.strategy.universe)
+    universe_members = builder.screen_candidates(
+        args.candidate_path,
+        as_of_date=args.as_of,
+        lookback_days=args.lookback_days,
+        refresh_cache=args.refresh_cache,
+    )
+
+    strategy_settings = BreakoutMomentumSettings.from_configs(
+        config.strategy.signals,
+        config.strategy.risk,
+        require_relative_volume_confirmation=args.require_relative_volume,
+        enable_regime_filter=not args.disable_regime_filter,
+    )
+    if args.benchmark_symbol:
+        strategy_settings = replace(
+            strategy_settings,
+            benchmark_symbol=args.benchmark_symbol.strip().upper(),
+        )
+
+    current_equity = (
+        config.game_rules.starting_cash if args.equity is None else float(args.equity)
+    )
+    if current_equity <= 0:
+        raise ValueError("equity must be greater than zero.")
+    if args.current_drawdown < 0:
+        raise ValueError("current_drawdown must be non-negative.")
+
+    benchmark_frame = None
+    fetch_start = _strategy_warmup_start(args.as_of, strategy_settings)
+    if strategy_settings.enable_regime_filter and universe_members:
+        benchmark_frame = provider.fetch_daily_bars(
+            strategy_settings.benchmark_symbol,
+            fetch_start,
+            args.as_of,
+            refresh_cache=args.refresh_cache,
+        )
+        if benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{strategy_settings.benchmark_symbol}'."
+            )
+
+    constraints = PortfolioConstraints.from_configs(
+        config.strategy.risk,
+        config.game_rules.rules,
+    )
+    assessed_candidates = []
+    no_signal_symbols: list[str] = []
+
+    for member in universe_members:
+        try:
+            bars = provider.fetch_daily_bars(
+                member.symbol,
+                fetch_start,
+                args.as_of,
+                refresh_cache=args.refresh_cache,
+            )
+        except DataProviderError as exc:
+            LOGGER.warning("Skipping %s due to provider error: %s", member.symbol, exc)
+            no_signal_symbols.append(member.symbol)
+            continue
+
+        if bars.empty:
+            no_signal_symbols.append(member.symbol)
+            continue
+
+        signal = generate_breakout_signal(
+            bars,
+            settings=strategy_settings,
+            benchmark_frame=benchmark_frame,
+            has_open_position=False,
+            symbol=member.symbol,
+        )
+        if signal is None:
+            no_signal_symbols.append(member.symbol)
+            continue
+
+        assessed_candidates.append(
+            assess_signal_candidate(
+                signal,
+                current_equity=current_equity,
+                base_risk_per_trade=config.strategy.risk.risk_per_trade,
+                constraints=constraints,
+                current_positions=(),
+                current_drawdown=float(args.current_drawdown),
+            )
+        )
+
+    executor = ManualExecutor()
+    batch = executor.build_execution_batch(assessed_candidates, as_of_date=args.as_of)
+    report = build_daily_signal_report(
+        as_of_date=args.as_of,
+        execution_batch=batch,
+        assessed_candidates=assessed_candidates,
+        universe_symbols=[member.symbol for member in universe_members],
+        no_signal_symbols=no_signal_symbols,
+        benchmark_symbol=strategy_settings.benchmark_symbol if strategy_settings.enable_regime_filter else None,
+    )
+
+    output_dir = (args.output_dir or _default_daily_output_dir(config.project_root, args.as_of)).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    order_sheet_path = write_execution_batch(batch, output_dir / "manual_order_sheet.csv")
+    signal_report_json_path = write_daily_signal_report(report, output_dir / "daily_signal_report.json")
+    signal_report_csv_path = write_daily_signal_report(report, output_dir / "daily_signal_report.csv")
+
+    payload = {
+        "provider": config.data_sources.provider,
+        "as_of_date": args.as_of.isoformat(),
+        "equity": current_equity,
+        "current_drawdown": float(args.current_drawdown),
+        "universe_count": len(universe_members),
+        "signal_count": len(assessed_candidates),
+        "approved_order_count": len(batch.orders),
+        "rejected_signal_count": sum(not candidate.approved for candidate in assessed_candidates),
+        "no_signal_count": len(no_signal_symbols),
+        "order_symbols": [order.symbol for order in batch.orders],
+        "outputs": {
+            "manual_order_sheet": str(order_sheet_path),
+            "daily_signal_report_json": str(signal_report_json_path),
+            "daily_signal_report_csv": str(signal_report_csv_path),
+        },
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
 def _handle_render_orders(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     orders = load_orders_from_csv(args.input_path)
@@ -438,8 +643,8 @@ def _handle_backtest(args: argparse.Namespace) -> int:
         equity_curve_path = output_dir / "equity_curve.csv"
         summary_path = output_dir / f"summary.{args.format}"
 
-        result.trade_log.to_csv(trade_log_path, index=False, date_format="%Y-%m-%d")
-        result.equity_curve.to_csv(equity_curve_path, index=False, date_format="%Y-%m-%d")
+        write_trade_log_report(result.trade_log, trade_log_path)
+        write_equity_curve_report(result.equity_curve, equity_curve_path)
         if args.format == "json":
             summary_path.write_text(
                 json.dumps(metrics_to_serializable_dict(result.summary_metrics), indent=2, sort_keys=True),
@@ -476,6 +681,23 @@ def _handle_backtest(args: argparse.Namespace) -> int:
 def _default_order_output_path(project_root: Path, as_of_date: date) -> Path:
     output_dir = project_root / "data" / "processed" / "orders"
     return output_dir / f"{as_of_date.isoformat()}_manual_orders.csv"
+
+
+def _default_daily_output_dir(project_root: Path, as_of_date: date) -> Path:
+    return project_root / "data" / "processed" / "daily" / as_of_date.isoformat()
+
+
+def _strategy_warmup_start(
+    as_of_date: date,
+    settings: BreakoutMomentumSettings,
+) -> date:
+    largest_window = max(
+        settings.breakout_lookback + 1,
+        settings.atr_window,
+        settings.resolved_relative_volume_window + 1,
+        settings.benchmark_sma_slow if settings.enable_regime_filter else 1,
+    )
+    return as_of_date - timedelta(days=max(largest_window * 3, 30))
 
 
 def _print_structured(payload: dict[str, object], *, output_format: str) -> None:

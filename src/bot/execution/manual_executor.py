@@ -5,8 +5,12 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+from bot.execution.interface import CandidateExecutor, ExecutionBatch, ExecutionOrder
+from bot.risk.portfolio_rules import RiskAssessedCandidate
 
 
 class ManualOrderError(ValueError):
@@ -27,6 +31,23 @@ OUTPUT_COLUMNS = (
     "time_in_force",
     "strategy_name",
     "thesis",
+)
+EXECUTION_SHEET_COLUMNS = (
+    "date",
+    "generated_at_utc",
+    "symbol",
+    "action",
+    "quantity",
+    "intended_order_type",
+    "entry_price_hint",
+    "stop_level",
+    "time_in_force",
+    "strategy_name",
+    "rationale",
+    "risk_budget",
+    "per_share_risk",
+    "notional_value",
+    "metadata_json",
 )
 
 
@@ -148,6 +169,162 @@ def write_manual_order_sheet(
     return resolved_output_path
 
 
+class ManualExecutor(CandidateExecutor):
+    """Manual executor that renders approved candidates into a daily order sheet."""
+
+    executor_name = "manual"
+
+    def __init__(
+        self,
+        *,
+        intended_order_type: str = "MARKET",
+        time_in_force: str = "DAY",
+    ) -> None:
+        normalized_order_type = intended_order_type.strip().upper()
+        if normalized_order_type not in VALID_ORDER_TYPES:
+            expected = ", ".join(sorted(VALID_ORDER_TYPES))
+            raise ManualOrderError(
+                f"Unsupported intended_order_type '{intended_order_type}'. Expected one of: {expected}."
+            )
+        self.intended_order_type = normalized_order_type
+        self.time_in_force = time_in_force.strip().upper() or "DAY"
+
+    def build_execution_batch(
+        self,
+        candidates: Sequence[RiskAssessedCandidate],
+        *,
+        as_of_date: date,
+    ) -> ExecutionBatch:
+        """Render approved risk candidates into a manual execution batch."""
+
+        generated_at_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        orders = tuple(
+            _candidate_to_execution_order(
+                candidate,
+                as_of_date=as_of_date,
+                generated_at_utc=generated_at_utc,
+                intended_order_type=self.intended_order_type,
+                time_in_force=self.time_in_force,
+            )
+            for candidate in candidates
+            if candidate.approved and candidate.sizing.shares > 0
+        )
+        return ExecutionBatch(
+            executor_name=self.executor_name,
+            as_of_date=as_of_date,
+            generated_at_utc=generated_at_utc,
+            orders=orders,
+        )
+
+
+def write_execution_batch(
+    batch: ExecutionBatch,
+    output_path: Path,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Write an execution batch to CSV or JSON."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_format = _resolve_output_format(resolved_output_path, output_format)
+
+    if resolved_format == "json":
+        resolved_output_path.write_text(
+            json.dumps(batch.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return resolved_output_path
+
+    with resolved_output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EXECUTION_SHEET_COLUMNS)
+        writer.writeheader()
+        for order in batch.orders:
+            writer.writerow(
+                _execution_order_record(
+                    order,
+                    generated_at_utc=batch.generated_at_utc,
+                )
+            )
+    return resolved_output_path
+
+
+def _candidate_to_execution_order(
+    candidate: RiskAssessedCandidate,
+    *,
+    as_of_date: date,
+    generated_at_utc: str,
+    intended_order_type: str,
+    time_in_force: str,
+) -> ExecutionOrder:
+    return ExecutionOrder(
+        date=as_of_date,
+        symbol=candidate.signal.symbol,
+        action=candidate.signal.side,
+        quantity=candidate.sizing.shares,
+        intended_order_type=intended_order_type,
+        entry_price_hint=candidate.entry_price,
+        stop_level=candidate.stop_price,
+        rationale=_build_rationale(candidate),
+        time_in_force=time_in_force,
+        strategy_name=candidate.signal.strategy_name,
+        metadata={
+            "signal_date": candidate.signal.date.isoformat(),
+            "generated_at_utc": generated_at_utc,
+            "adjusted_risk_per_trade": candidate.adjusted_risk_per_trade,
+            "risk_budget": candidate.sizing.risk_budget,
+            "per_share_risk": candidate.sizing.per_share_risk,
+            "notional_value": candidate.sizing.notional_value,
+            "capped_by_notional": candidate.sizing.capped_by_notional,
+            "signal_metadata": dict(candidate.signal.metadata),
+        },
+    )
+
+
+def _build_rationale(candidate: RiskAssessedCandidate) -> str:
+    entry_reason = candidate.signal.entry_reason.replace("_", " ")
+    parts = [entry_reason]
+
+    prior_high = candidate.signal.metadata.get("prior_high")
+    if isinstance(prior_high, (int, float)):
+        parts.append(f"prior_high={prior_high:.2f}")
+
+    relative_volume = candidate.signal.metadata.get("relative_volume")
+    if isinstance(relative_volume, (int, float)):
+        parts.append(f"relative_volume={relative_volume:.2f}")
+
+    return "; ".join(parts)
+
+
+def _execution_order_record(
+    order: ExecutionOrder,
+    *,
+    generated_at_utc: str,
+) -> dict[str, str]:
+    metadata = dict(order.metadata)
+    risk_budget = metadata.get("risk_budget")
+    per_share_risk = metadata.get("per_share_risk")
+    notional_value = metadata.get("notional_value")
+
+    return {
+        "date": order.date.isoformat(),
+        "generated_at_utc": generated_at_utc,
+        "symbol": order.symbol,
+        "action": order.action,
+        "quantity": str(order.quantity),
+        "intended_order_type": order.intended_order_type,
+        "entry_price_hint": _format_optional_float(order.entry_price_hint),
+        "stop_level": _format_optional_float(order.stop_level),
+        "time_in_force": order.time_in_force,
+        "strategy_name": order.strategy_name or "",
+        "rationale": order.rationale,
+        "risk_budget": _format_optional_float(_optional_float(risk_budget)),
+        "per_share_risk": _format_optional_float(_optional_float(per_share_risk)),
+        "notional_value": _format_optional_float(_optional_float(notional_value)),
+        "metadata_json": json.dumps(metadata, sort_keys=True),
+    }
+
+
 def _required_text(data: Mapping[str, Any], key: str, row_number: int) -> str:
     value = data.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -225,3 +402,23 @@ def _format_optional_float(value: float | None) -> str:
     if value is None:
         return ""
     return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_output_format(output_path: Path, output_format: str | None) -> str:
+    if output_format is not None:
+        normalized = output_format.strip().lower()
+    else:
+        normalized = output_path.suffix.lower().lstrip(".") or "csv"
+
+    if normalized not in {"csv", "json"}:
+        raise ManualOrderError("output_format must be either 'csv' or 'json'.")
+    return normalized

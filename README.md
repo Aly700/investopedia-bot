@@ -101,6 +101,24 @@ Universe filtering uses the thresholds already defined in `config/strategy.yaml`
 - `universe.min_avg_dollar_volume`
 - `universe.max_symbols`
 
+### Generate a manual daily order sheet
+
+```bash
+investopedia-bot generate-orders data/raw/candidate_symbols.txt --as-of 2026-03-17
+investopedia-bot generate-orders data/raw/candidate_symbols.txt --as-of 2026-03-17 --equity 125000 --current-drawdown 0.08
+investopedia-bot generate-orders data/raw/candidate_symbols.csv --as-of 2026-03-17 --require-relative-volume --output-dir data/processed/daily/2026-03-17
+```
+
+This command:
+
+- screens the configured universe using the candidate list and the universe thresholds in `config/strategy.yaml`
+- fetches enough warmup history to evaluate the breakout, ATR, relative-volume, and regime conditions without look-ahead
+- generates current breakout signals on the latest available daily bar
+- runs each signal through the existing risk sizing and portfolio checks
+- writes a human-readable `manual_order_sheet.csv` plus `daily_signal_report.json` and `daily_signal_report.csv`
+
+The manual workflow currently assumes no existing open positions are supplied to the CLI. It uses the provided `--equity` and optional `--current-drawdown` for sizing and drawdown-aware risk reduction.
+
 ### Render manual orders from offline signals
 
 ```bash
@@ -158,6 +176,7 @@ The backtest command:
 - Daily-bar assumptions are first-class. The repo is meant for end-of-day research and next-session decision support, not intraday automation.
 - Simulator-specific rules live in config, not in strategy logic. That keeps backtests and manual order prep aligned.
 - The backtest engine uses decision-on-close and fill-on-next-open semantics to avoid look-ahead bias. Trailing stops only update after the close and become active on the following session.
+- The manual execution layer is intentionally report-first. It produces human-readable orders and research artifacts, but it does not submit anything to Investopedia yet.
 - Browser automation and any live web executor are intentionally out of scope for this baseline.
 
 ## Development
