@@ -15,6 +15,13 @@ import yaml
 
 from bot.backtest.engine import DailyBarBacktestEngine
 from bot.backtest.metrics import metrics_to_serializable_dict
+from bot.backtest.walkforward import (
+    generate_walkforward_folds,
+    parameter_grid_from_config,
+    run_breakout_walkforward,
+    walkforward_fetch_start,
+    write_walkforward_reports,
+)
 from bot.config import (
     ConfigError,
     default_config_dir,
@@ -319,6 +326,127 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass local cache and force provider fetches.",
     )
     backtest_parser.set_defaults(handler=_handle_backtest)
+
+    walkforward_parser = subparsers.add_parser(
+        "walkforward",
+        help="Run rolling or expanding walk-forward validation with parameter sweeps.",
+    )
+    walkforward_parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    walkforward_parser.add_argument(
+        "--start",
+        type=_parse_iso_date,
+        required=True,
+        help="Inclusive walk-forward start date in YYYY-MM-DD format.",
+    )
+    walkforward_parser.add_argument(
+        "--end",
+        type=_parse_iso_date,
+        required=True,
+        help="Inclusive walk-forward end date in YYYY-MM-DD format.",
+    )
+    walkforward_parser.add_argument(
+        "--train-days",
+        type=int,
+        required=True,
+        help="Number of calendar days in each training window.",
+    )
+    walkforward_parser.add_argument(
+        "--test-days",
+        type=int,
+        required=True,
+        help="Number of calendar days in each validation/test window.",
+    )
+    walkforward_parser.add_argument(
+        "--expanding-train",
+        action="store_true",
+        help="Use expanding training windows instead of rolling windows.",
+    )
+    walkforward_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter.",
+    )
+    walkforward_parser.add_argument(
+        "--require-relative-volume",
+        action="store_true",
+        help="Require relative-volume confirmation for breakout entries.",
+    )
+    walkforward_parser.add_argument(
+        "--disable-regime-filter",
+        action="store_true",
+        help="Disable the benchmark-based regime filter.",
+    )
+    walkforward_parser.add_argument(
+        "--breakout-lookbacks",
+        default=None,
+        help="Comma-separated breakout lookback values to sweep.",
+    )
+    walkforward_parser.add_argument(
+        "--relative-volume-thresholds",
+        default=None,
+        help="Comma-separated relative-volume thresholds to sweep.",
+    )
+    walkforward_parser.add_argument(
+        "--initial-stop-atrs",
+        default=None,
+        help="Comma-separated initial ATR stop multiples to sweep.",
+    )
+    walkforward_parser.add_argument(
+        "--trailing-stop-atrs",
+        default=None,
+        help="Comma-separated trailing ATR stop multiples to sweep.",
+    )
+    walkforward_parser.add_argument(
+        "--risk-per-trade-values",
+        default=None,
+        help="Comma-separated per-trade risk values to sweep.",
+    )
+    walkforward_parser.add_argument(
+        "--objective",
+        choices=(
+            "starting_equity",
+            "ending_equity",
+            "total_return",
+            "cagr",
+            "max_drawdown",
+            "sharpe_ratio",
+            "trade_count",
+            "win_rate",
+            "average_win",
+            "average_loss",
+            "expectancy",
+        ),
+        default="sharpe_ratio",
+        help="Objective used to rank parameter sets.",
+    )
+    walkforward_parser.add_argument(
+        "--top-n",
+        type=int,
+        default=5,
+        help="Number of top aggregate parameter sets to include in the summary.",
+    )
+    walkforward_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for walk-forward CSV and JSON outputs.",
+    )
+    walkforward_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    walkforward_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    walkforward_parser.set_defaults(handler=_handle_walkforward)
 
     return parser
 
@@ -678,6 +806,119 @@ def _handle_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_walkforward(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    parameter_sets = parameter_grid_from_config(
+        config,
+        breakout_lookbacks=_parse_int_list(args.breakout_lookbacks),
+        relative_volume_thresholds=_parse_float_list(args.relative_volume_thresholds),
+        initial_stop_atrs=_parse_float_list(args.initial_stop_atrs),
+        trailing_stop_atrs=_parse_float_list(args.trailing_stop_atrs),
+        risk_per_trade_values=_parse_float_list(args.risk_per_trade_values),
+    )
+    folds = generate_walkforward_folds(
+        start_date=args.start,
+        end_date=args.end,
+        train_window_days=args.train_days,
+        test_window_days=args.test_days,
+        expanding_train=args.expanding_train,
+    )
+    if not folds:
+        raise ValueError("No walk-forward folds could be generated for the requested date range.")
+
+    symbols = load_candidate_symbols(args.candidate_path)
+    if not symbols:
+        raise ValueError(f"No symbols were found in {args.candidate_path.resolve()}.")
+
+    fetch_start = walkforward_fetch_start(
+        initial_start_date=folds[0].train_start,
+        parameter_sets=parameter_sets,
+        atr_window=config.strategy.risk.atr_length,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        enable_regime_filter=not args.disable_regime_filter,
+    )
+
+    symbol_frames: dict[str, object] = {}
+    for symbol in symbols:
+        try:
+            bars = provider.fetch_daily_bars(
+                symbol,
+                fetch_start,
+                args.end,
+                refresh_cache=args.refresh_cache,
+            )
+        except DataProviderError as exc:
+            LOGGER.warning("Skipping %s due to provider error: %s", symbol, exc)
+            continue
+
+        if bars.empty:
+            LOGGER.warning("Skipping %s because no bars were returned in the requested range.", symbol)
+            continue
+        symbol_frames[symbol] = bars
+
+    if not symbol_frames:
+        raise ValueError("No symbol data was available for the requested walk-forward analysis.")
+
+    benchmark_frame = None
+    if not args.disable_regime_filter:
+        benchmark_symbol = (
+            args.benchmark_symbol.strip().upper()
+            if args.benchmark_symbol
+            else config.strategy.signals.benchmark_symbol
+        )
+        if benchmark_symbol in symbol_frames:
+            benchmark_frame = symbol_frames[benchmark_symbol]
+        else:
+            benchmark_frame = provider.fetch_daily_bars(
+                benchmark_symbol,
+                fetch_start,
+                args.end,
+                refresh_cache=args.refresh_cache,
+            )
+        if benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
+            )
+
+    result = run_breakout_walkforward(
+        config=config,
+        symbol_frames=symbol_frames,
+        benchmark_frame=benchmark_frame,
+        folds=folds,
+        parameter_sets=parameter_sets,
+        objective=args.objective,
+        top_n=args.top_n,
+        benchmark_symbol_override=args.benchmark_symbol,
+        require_relative_volume_confirmation=args.require_relative_volume,
+        enable_regime_filter=not args.disable_regime_filter,
+    )
+
+    output_dir = (
+        args.output_dir
+        or (config.project_root / "data" / "processed" / "walkforward" / f"{args.start.isoformat()}_{args.end.isoformat()}")
+    ).resolve()
+    outputs = write_walkforward_reports(result, output_dir)
+
+    payload = {
+        "provider": config.data_sources.provider,
+        "start_date": args.start.isoformat(),
+        "end_date": args.end.isoformat(),
+        "train_days": args.train_days,
+        "test_days": args.test_days,
+        "expanding_train": bool(args.expanding_train),
+        "fold_count": len(result.folds),
+        "parameter_set_count": len(result.parameter_sets),
+        "objective": args.objective,
+        "symbols_requested": len(symbols),
+        "symbols_tested": len(symbol_frames),
+        "top_parameter_sets": _dataframe_records(result.best_parameter_sets),
+        "outputs": outputs,
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
 def _default_order_output_path(project_root: Path, as_of_date: date) -> Path:
     output_dir = project_root / "data" / "processed" / "orders"
     return output_dir / f"{as_of_date.isoformat()}_manual_orders.csv"
@@ -714,6 +955,41 @@ def _parse_iso_date(raw_value: str) -> date:
         raise argparse.ArgumentTypeError(
             f"Invalid date '{raw_value}'. Expected YYYY-MM-DD."
         ) from exc
+
+
+def _parse_int_list(raw_value: str | None) -> tuple[int, ...] | None:
+    if raw_value is None:
+        return None
+    cleaned_values = [part.strip() for part in raw_value.split(",") if part.strip()]
+    if not cleaned_values:
+        raise ValueError("Parameter lists cannot be empty.")
+    return tuple(int(value) for value in cleaned_values)
+
+
+def _parse_float_list(raw_value: str | None) -> tuple[float, ...] | None:
+    if raw_value is None:
+        return None
+    cleaned_values = [part.strip() for part in raw_value.split(",") if part.strip()]
+    if not cleaned_values:
+        raise ValueError("Parameter lists cannot be empty.")
+    return tuple(float(value) for value in cleaned_values)
+
+
+def _dataframe_records(frame: object) -> list[dict[str, object]]:
+    if not hasattr(frame, "empty") or not hasattr(frame, "to_dict"):
+        return []
+    if frame.empty:
+        return []
+    records: list[dict[str, object]] = []
+    for record in frame.to_dict(orient="records"):
+        normalized: dict[str, object] = {}
+        for key, value in record.items():
+            if hasattr(value, "isoformat"):
+                normalized[key] = value.isoformat()
+            else:
+                normalized[key] = value
+        records.append(normalized)
+    return records
 
 
 if __name__ == "__main__":

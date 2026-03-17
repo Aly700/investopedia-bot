@@ -168,6 +168,23 @@ The backtest command:
 - manages ATR-based initial and trailing stops
 - optionally writes `trade_log.csv`, `equity_curve.csv`, and a summary file to the requested output directory
 
+### Run walk-forward validation
+
+```bash
+investopedia-bot walkforward data/raw/candidate_symbols.txt --start 2024-01-01 --end 2025-12-31 --train-days 252 --test-days 63
+investopedia-bot walkforward data/raw/candidate_symbols.txt --start 2024-01-01 --end 2025-12-31 --train-days 252 --test-days 63 --expanding-train --breakout-lookbacks 20,40 --initial-stop-atrs 2.0,2.5 --trailing-stop-atrs 2.5,3.0 --risk-per-trade-values 0.005,0.01
+investopedia-bot walkforward data/raw/candidate_symbols.csv --start 2024-01-01 --end 2025-12-31 --train-days 252 --test-days 63 --objective sharpe_ratio --output-dir data/processed/walkforward/two_year_review
+```
+
+This command:
+
+- generates rolling or expanding train/test folds over the requested date range
+- sweeps the requested breakout and risk parameter combinations
+- records train and out-of-sample test metrics for every fold and parameter set
+- writes `fold_metrics`, `aggregate_metrics`, `selected_fold_metrics`, and `best_parameter_sets` in both CSV and JSON formats
+
+If sweep arguments are omitted, the command uses the current single values from `config/strategy.yaml`.
+
 ## Architecture Notes
 
 - Signal generation should stay separate from execution. Research code can emit candidate trades, while execution modules only format or route orders.
@@ -177,6 +194,7 @@ The backtest command:
 - Simulator-specific rules live in config, not in strategy logic. That keeps backtests and manual order prep aligned.
 - The backtest engine uses decision-on-close and fill-on-next-open semantics to avoid look-ahead bias. Trailing stops only update after the close and become active on the following session.
 - The manual execution layer is intentionally report-first. It produces human-readable orders and research artifacts, but it does not submit anything to Investopedia yet.
+- Walk-forward tooling is the main robustness check. Prefer parameter sets that remain acceptable across many test folds over ones that win one in-sample run.
 - Browser automation and any live web executor are intentionally out of scope for this baseline.
 
 ## Development
