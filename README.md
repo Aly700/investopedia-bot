@@ -134,6 +134,22 @@ MSFT,SELL,5,LIMIT,420.00,,DAY,rebalance,Trim exposure after earnings gap
 
 The CLI writes a normalized manual order blotter to `data/processed/orders/` by default.
 
+### Run a daily-bar backtest
+
+```bash
+investopedia-bot backtest data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31
+investopedia-bot backtest data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --require-relative-volume --output-dir data/processed/backtests/q1_2025
+investopedia-bot backtest data/raw/candidate_symbols.csv --start 2025-01-01 --end 2025-03-31 --disable-regime-filter --format json
+```
+
+The backtest command:
+
+- fetches a warmup window before the requested start date so breakout, ATR, and benchmark moving averages can initialize cleanly
+- generates signals on the close and fills approved entries on the next bar open
+- applies configured commissions and slippage from `config/game_rules.yaml`
+- manages ATR-based initial and trailing stops
+- optionally writes `trade_log.csv`, `equity_curve.csv`, and a summary file to the requested output directory
+
 ## Architecture Notes
 
 - Signal generation should stay separate from execution. Research code can emit candidate trades, while execution modules only format or route orders.
@@ -141,6 +157,7 @@ The CLI writes a normalized manual order blotter to `data/processed/orders/` by 
 - Cache files are plain CSVs so they are easy to inspect, delete, or regenerate.
 - Daily-bar assumptions are first-class. The repo is meant for end-of-day research and next-session decision support, not intraday automation.
 - Simulator-specific rules live in config, not in strategy logic. That keeps backtests and manual order prep aligned.
+- The backtest engine uses decision-on-close and fill-on-next-open semantics to avoid look-ahead bias. Trailing stops only update after the close and become active on the following session.
 - Browser automation and any live web executor are intentionally out of scope for this baseline.
 
 ## Development

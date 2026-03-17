@@ -11,6 +11,8 @@ from typing import Sequence
 
 import yaml
 
+from bot.backtest.engine import DailyBarBacktestEngine
+from bot.backtest.metrics import metrics_to_serializable_dict
 from bot.config import (
     ConfigError,
     default_config_dir,
@@ -19,7 +21,7 @@ from bot.config import (
     validate_environment,
 )
 from bot.data.providers import DataProviderConfigurationError, DataProviderError, create_daily_bar_provider
-from bot.data.universe import UniverseBuilder
+from bot.data.universe import UniverseBuilder, load_candidate_symbols
 from bot.execution.manual_executor import (
     ManualOrderError,
     load_orders_from_csv,
@@ -182,6 +184,66 @@ def build_parser() -> argparse.ArgumentParser:
     )
     render_orders_parser.set_defaults(handler=_handle_render_orders)
 
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help="Run a deterministic daily-bar backtest over a symbol list.",
+    )
+    backtest_parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    backtest_parser.add_argument(
+        "--start",
+        type=_parse_iso_date,
+        required=True,
+        help="Inclusive backtest start date in YYYY-MM-DD format.",
+    )
+    backtest_parser.add_argument(
+        "--end",
+        type=_parse_iso_date,
+        required=True,
+        help="Inclusive backtest end date in YYYY-MM-DD format.",
+    )
+    backtest_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter.",
+    )
+    backtest_parser.add_argument(
+        "--require-relative-volume",
+        action="store_true",
+        help="Require relative-volume confirmation for breakout entries.",
+    )
+    backtest_parser.add_argument(
+        "--disable-regime-filter",
+        action="store_true",
+        help="Disable the benchmark-based regime filter.",
+    )
+    backtest_parser.add_argument(
+        "--no-end-of-data-closeout",
+        action="store_true",
+        help="Leave positions open instead of force-closing them on the final bar.",
+    )
+    backtest_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for trade log, equity curve, and summary output files.",
+    )
+    backtest_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Summary output format.",
+    )
+    backtest_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    backtest_parser.set_defaults(handler=_handle_backtest)
+
     return parser
 
 
@@ -303,6 +365,111 @@ def _handle_render_orders(args: argparse.Namespace) -> int:
         written_path,
     )
     print(written_path)
+    return 0
+
+
+def _handle_backtest(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    engine = DailyBarBacktestEngine.from_config(
+        config,
+        benchmark_symbol_override=args.benchmark_symbol,
+        require_relative_volume_confirmation=args.require_relative_volume,
+        enable_regime_filter=not args.disable_regime_filter,
+        close_positions_at_end=not args.no_end_of_data_closeout,
+    )
+
+    symbols = load_candidate_symbols(args.candidate_path)
+    if not symbols:
+        raise ValueError(f"No symbols were found in {args.candidate_path.resolve()}.")
+
+    fetch_start = engine.warmup_start(args.start)
+    symbol_frames: dict[str, object] = {}
+    for symbol in symbols:
+        try:
+            bars = provider.fetch_daily_bars(
+                symbol,
+                fetch_start,
+                args.end,
+                refresh_cache=args.refresh_cache,
+            )
+        except DataProviderError as exc:
+            LOGGER.warning("Skipping %s due to provider error: %s", symbol, exc)
+            continue
+
+        if bars.empty:
+            LOGGER.warning("Skipping %s because no bars were returned in the requested range.", symbol)
+            continue
+        symbol_frames[symbol] = bars
+
+    if not symbol_frames:
+        raise ValueError("No symbol data was available for the requested backtest.")
+
+    benchmark_frame = None
+    if engine.strategy_settings.enable_regime_filter:
+        benchmark_symbol = engine.strategy_settings.benchmark_symbol
+        if benchmark_symbol in symbol_frames:
+            benchmark_frame = symbol_frames[benchmark_symbol]
+        else:
+            benchmark_frame = provider.fetch_daily_bars(
+                benchmark_symbol,
+                fetch_start,
+                args.end,
+                refresh_cache=args.refresh_cache,
+            )
+        if benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
+            )
+
+    result = engine.run(
+        symbol_frames=symbol_frames,
+        benchmark_frame=benchmark_frame,
+        start_date=args.start,
+        end_date=args.end,
+    )
+
+    written_files: dict[str, str] = {}
+    if args.output_dir is not None:
+        output_dir = args.output_dir.resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        trade_log_path = output_dir / "trade_log.csv"
+        equity_curve_path = output_dir / "equity_curve.csv"
+        summary_path = output_dir / f"summary.{args.format}"
+
+        result.trade_log.to_csv(trade_log_path, index=False, date_format="%Y-%m-%d")
+        result.equity_curve.to_csv(equity_curve_path, index=False, date_format="%Y-%m-%d")
+        if args.format == "json":
+            summary_path.write_text(
+                json.dumps(metrics_to_serializable_dict(result.summary_metrics), indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        else:
+            summary_path.write_text(
+                yaml.safe_dump(metrics_to_serializable_dict(result.summary_metrics), sort_keys=False),
+                encoding="utf-8",
+            )
+        written_files = {
+            "trade_log": str(trade_log_path),
+            "equity_curve": str(equity_curve_path),
+            "summary": str(summary_path),
+        }
+
+    payload = {
+        "symbols_requested": len(symbols),
+        "symbols_tested": len(symbol_frames),
+        "benchmark_symbol": engine.strategy_settings.benchmark_symbol
+        if engine.strategy_settings.enable_regime_filter
+        else None,
+        "start_date": args.start.isoformat(),
+        "end_date": args.end.isoformat(),
+        "trade_log_rows": int(len(result.trade_log)),
+        "equity_curve_rows": int(len(result.equity_curve)),
+        "metrics": metrics_to_serializable_dict(result.summary_metrics),
+        "outputs": written_files,
+    }
+    _print_structured(payload, output_format=args.format)
     return 0
 
 
