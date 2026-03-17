@@ -1,0 +1,119 @@
+# Investopedia Bot
+
+`investopedia-bot` is a Python repo for daily-bar research, backtesting, and manual order output for an Investopedia simulator workflow.
+
+Current scope:
+
+- Research and backtesting only
+- Configuration-driven workflows
+- Manual order sheet generation from offline signals
+- No browser automation
+- No live web execution
+
+Python requirement: 3.9+
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Optional environment variables live in `.env`. A starter file is provided in `.env.example`.
+
+## Repo Layout
+
+```text
+config/                  YAML configuration for strategy, data sources, and simulator rules
+data/                    Local research inputs, caches, processed outputs, and logs
+notebooks/               Ad hoc research notebooks
+src/bot/backtest/        Backtest engine, metrics, slippage, and walk-forward modules
+src/bot/data/            Universe, provider, and normalization modules
+src/bot/execution/       Manual execution helpers and future executor interfaces
+src/bot/indicators/      Indicator library for daily-bar signals
+src/bot/reporting/       Equity curves, trade logs, and daily summaries
+src/bot/risk/            Position sizing, stops, and portfolio guardrails
+src/bot/strategy/        Signal and regime models
+src/bot/config.py        Typed config loader for the repo
+src/bot/logging_utils.py Logging bootstrap for CLI and batch jobs
+src/bot/main.py          CLI entrypoint
+tests/                   Test suite
+```
+
+## Configuration
+
+The repo uses three YAML files under `config/`:
+
+- `strategy.yaml`: universe filters, signal parameters, and per-trade risk settings
+- `data_sources.yaml`: active research data provider and the environment variable name for each API key
+- `game_rules.yaml`: simulator cash, commissions, fill assumptions, and account-level constraints
+
+The CLI loads and validates these files through `src/bot/config.py`. Config is kept separate from execution so strategy research, backtests, and order generation can share the same baseline assumptions.
+
+## CLI Usage
+
+After installation, use either the console script or `python -m bot.main`.
+
+### Show merged config
+
+```bash
+investopedia-bot show-config
+investopedia-bot show-config --format json
+```
+
+### Validate environment variables for the active data provider
+
+```bash
+investopedia-bot check-env
+```
+
+This checks the provider selected in `config/data_sources.yaml` and verifies that the required API key environment variable exists in `.env` or the shell environment.
+
+### Render manual orders from offline signals
+
+```bash
+investopedia-bot render-orders signals/orders.csv
+investopedia-bot render-orders signals/orders.csv --as-of 2026-03-17
+investopedia-bot render-orders signals/orders.csv --output data/processed/orders/today.csv
+```
+
+The input CSV is intentionally execution-agnostic. Required columns:
+
+- `symbol`
+- `side`
+- `quantity`
+
+Optional columns:
+
+- `order_type` (`MARKET`, `LIMIT`, or `STOP_LIMIT`)
+- `limit_price`
+- `stop_price`
+- `time_in_force`
+- `strategy_name`
+- `thesis`
+
+Example:
+
+```csv
+symbol,side,quantity,order_type,limit_price,stop_price,time_in_force,strategy_name,thesis
+NVDA,BUY,10,MARKET,,,DAY,breakout_momentum,20-day breakout with strong volume
+MSFT,SELL,5,LIMIT,420.00,,DAY,rebalance,Trim exposure after earnings gap
+```
+
+The CLI writes a normalized manual order blotter to `data/processed/orders/` by default.
+
+## Architecture Notes
+
+- Signal generation should stay separate from execution. Research code can emit candidate trades, while execution modules only format or route orders.
+- Daily-bar assumptions are first-class. The repo is meant for end-of-day research and next-session decision support, not intraday automation.
+- Simulator-specific rules live in config, not in strategy logic. That keeps backtests and manual order prep aligned.
+- Browser automation and any live web executor are intentionally out of scope for this baseline.
+
+## Development
+
+```bash
+pytest
+ruff check .
+mypy src
+```

@@ -1,0 +1,20 @@
+strategy_name: breakout_momentum
+
+universe:
+  min_price: 10
+  min_avg_dollar_volume: 20000000
+  max_symbols: 100
+
+signals:
+  breakout_lookback: 20
+  benchmark_symbol: SPY
+  benchmark_sma_fast: 50
+  benchmark_sma_slow: 200
+  relative_volume_threshold: 1.5
+
+risk:
+  risk_per_trade: 0.01
+  atr_length: 14
+  initial_stop_atr: 2.5
+  trailing_stop_atr: 3.0
+  drawdown_risk_reduction_threshold: 0.15
