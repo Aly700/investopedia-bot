@@ -18,6 +18,8 @@ from bot.config import (
     load_app_config,
     validate_environment,
 )
+from bot.data.providers import DataProviderConfigurationError, DataProviderError, create_daily_bar_provider
+from bot.data.universe import UniverseBuilder
 from bot.execution.manual_executor import (
     ManualOrderError,
     load_orders_from_csv,
@@ -87,6 +89,76 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check_env_parser.set_defaults(handler=_handle_check_env)
 
+    fetch_data_parser = subparsers.add_parser(
+        "fetch-data",
+        help="Fetch normalized daily bars for one symbol using the configured provider.",
+    )
+    fetch_data_parser.add_argument("symbol", help="Ticker symbol to fetch.")
+    fetch_data_parser.add_argument(
+        "--start",
+        type=_parse_iso_date,
+        required=True,
+        help="Inclusive start date in YYYY-MM-DD format.",
+    )
+    fetch_data_parser.add_argument(
+        "--end",
+        type=_parse_iso_date,
+        required=True,
+        help="Inclusive end date in YYYY-MM-DD format.",
+    )
+    fetch_data_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional path to save the normalized daily bars as CSV.",
+    )
+    fetch_data_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Summary output format.",
+    )
+    fetch_data_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force a provider fetch.",
+    )
+    fetch_data_parser.set_defaults(handler=_handle_fetch_data)
+
+    build_universe_parser = subparsers.add_parser(
+        "build-universe",
+        help="Build a filtered trading universe from a candidate symbol list.",
+    )
+    build_universe_parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    build_universe_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Date used as the right edge of the screening window.",
+    )
+    build_universe_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=20,
+        help="Number of recent daily bars to use when computing average dollar volume.",
+    )
+    build_universe_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format for the selected universe.",
+    )
+    build_universe_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    build_universe_parser.set_defaults(handler=_handle_build_universe)
+
     render_orders_parser = subparsers.add_parser(
         "render-orders",
         help="Render offline signal output into a manual order blotter CSV.",
@@ -122,7 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return int(args.handler(args))
-    except (ConfigError, ManualOrderError, ValueError) as exc:
+    except (ConfigError, DataProviderConfigurationError, DataProviderError, ManualOrderError, ValueError) as exc:
         LOGGER.error("%s", exc)
         return 1
 
@@ -157,6 +229,63 @@ def _handle_check_env(args: argparse.Namespace) -> int:
     return 1
 
 
+def _handle_fetch_data(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    bars = provider.fetch_daily_bars(
+        args.symbol,
+        args.start,
+        args.end,
+        refresh_cache=args.refresh_cache,
+    )
+
+    if args.output is not None:
+        output_path = args.output.resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        bars.to_csv(output_path, index=False, date_format="%Y-%m-%d")
+        LOGGER.info("Saved %s rows to %s", len(bars), output_path)
+
+    summary = {
+        "provider": config.data_sources.provider,
+        "symbol": args.symbol.upper(),
+        "rows": int(len(bars)),
+        "start_date": args.start.isoformat(),
+        "end_date": args.end.isoformat(),
+        "first_bar": bars["date"].iloc[0].date().isoformat() if not bars.empty else None,
+        "last_bar": bars["date"].iloc[-1].date().isoformat() if not bars.empty else None,
+    }
+    _print_structured(summary, output_format=args.format)
+    return 0
+
+
+def _handle_build_universe(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    builder = UniverseBuilder(provider, config.strategy.universe)
+    members = builder.screen_candidates(
+        args.candidate_path,
+        as_of_date=args.as_of,
+        lookback_days=args.lookback_days,
+        refresh_cache=args.refresh_cache,
+    )
+
+    if args.format == "json":
+        payload = {
+            "provider": config.data_sources.provider,
+            "as_of_date": args.as_of.isoformat(),
+            "lookback_days": args.lookback_days,
+            "count": len(members),
+            "symbols": [member.symbol for member in members],
+            "members": [member.to_dict() for member in members],
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    for member in members:
+        print(member.symbol)
+    return 0
+
+
 def _handle_render_orders(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     orders = load_orders_from_csv(args.input_path)
@@ -180,6 +309,13 @@ def _handle_render_orders(args: argparse.Namespace) -> int:
 def _default_order_output_path(project_root: Path, as_of_date: date) -> Path:
     output_dir = project_root / "data" / "processed" / "orders"
     return output_dir / f"{as_of_date.isoformat()}_manual_orders.csv"
+
+
+def _print_structured(payload: dict[str, object], *, output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    print(yaml.safe_dump(payload, sort_keys=False))
 
 
 def _parse_iso_date(raw_value: str) -> date:

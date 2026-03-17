@@ -5,6 +5,7 @@
 Current scope:
 
 - Research and backtesting only
+- Historical daily-bar ingestion, normalization, caching, and universe construction
 - Configuration-driven workflows
 - Manual order sheet generation from offline signals
 - No browser automation
@@ -51,6 +52,8 @@ The repo uses three YAML files under `config/`:
 
 The CLI loads and validates these files through `src/bot/config.py`. Config is kept separate from execution so strategy research, backtests, and order generation can share the same baseline assumptions.
 
+Historical daily-bar data is selected by `config/data_sources.yaml`. Local cache files are written under `data/cache/daily_bars/<provider>/`.
+
 ## CLI Usage
 
 After installation, use either the console script or `python -m bot.main`.
@@ -69,6 +72,34 @@ investopedia-bot check-env
 ```
 
 This checks the provider selected in `config/data_sources.yaml` and verifies that the required API key environment variable exists in `.env` or the shell environment.
+
+### Fetch normalized daily bars
+
+```bash
+investopedia-bot fetch-data AAPL --start 2025-01-01 --end 2025-03-31
+investopedia-bot fetch-data AAPL --start 2025-01-01 --end 2025-03-31 --output data/processed/aapl_daily.csv
+investopedia-bot fetch-data AAPL --start 2025-01-01 --end 2025-03-31 --refresh-cache --format json
+```
+
+This uses the configured provider, normalizes the response to the canonical daily-bar schema, and caches the requested range locally.
+
+### Build a filtered universe
+
+```bash
+investopedia-bot build-universe data/raw/candidate_symbols.txt --as-of 2026-03-17
+investopedia-bot build-universe data/raw/candidate_symbols.csv --as-of 2026-03-17 --lookback-days 20 --format json
+```
+
+Candidate lists can be either:
+
+- text files with one symbol per line or comma-separated symbols
+- CSV files with a `symbol` column
+
+Universe filtering uses the thresholds already defined in `config/strategy.yaml`:
+
+- `universe.min_price`
+- `universe.min_avg_dollar_volume`
+- `universe.max_symbols`
 
 ### Render manual orders from offline signals
 
@@ -106,6 +137,8 @@ The CLI writes a normalized manual order blotter to `data/processed/orders/` by 
 ## Architecture Notes
 
 - Signal generation should stay separate from execution. Research code can emit candidate trades, while execution modules only format or route orders.
+- The data layer normalizes every provider into one daily-bar schema before strategy or backtest code sees it.
+- Cache files are plain CSVs so they are easy to inspect, delete, or regenerate.
 - Daily-bar assumptions are first-class. The repo is meant for end-of-day research and next-session decision support, not intraday automation.
 - Simulator-specific rules live in config, not in strategy logic. That keeps backtests and manual order prep aligned.
 - Browser automation and any live web executor are intentionally out of scope for this baseline.
