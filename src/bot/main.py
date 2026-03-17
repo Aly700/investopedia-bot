@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from dataclasses import replace
 from datetime import date
 from datetime import timedelta
@@ -47,7 +48,15 @@ from bot.execution.manual_executor import (
     write_manual_order_sheet,
 )
 from bot.logging_utils import get_logger, setup_logging
-from bot.reporting.daily_report import build_daily_signal_report, write_daily_signal_report
+from bot.reporting.daily_report import (
+    PresetCandidateEvaluation,
+    build_daily_research_summary,
+    build_daily_signal_report,
+    rank_preset_candidate_evaluations,
+    write_daily_preset_summary,
+    write_daily_research_summary,
+    write_daily_signal_report,
+)
 from bot.reporting.equity_curve import write_equity_curve_report
 from bot.reporting.trade_log import write_trade_log_report
 from bot.risk.portfolio_rules import PortfolioConstraints, assess_signal_candidate
@@ -530,6 +539,84 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass local cache and force provider fetches.",
     )
     compare_parser.set_defaults(handler=_handle_compare_strategies)
+
+    daily_summary_parser = subparsers.add_parser(
+        "daily-summary",
+        help="Generate a consolidated daily preset summary and suggested order sheet.",
+    )
+    daily_summary_parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    daily_summary_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Right edge of the signal evaluation window.",
+    )
+    daily_summary_parser.add_argument(
+        "--preset-names",
+        default=None,
+        help="Comma-separated preset names to evaluate. Defaults to standard_breakout unless comparison results are provided.",
+    )
+    daily_summary_parser.add_argument(
+        "--comparison-results",
+        type=Path,
+        default=None,
+        help="Optional ranked preset output from compare-strategies. When provided, the top preset is included automatically.",
+    )
+    daily_summary_parser.add_argument(
+        "--equity",
+        type=float,
+        default=None,
+        help="Current account equity used for position sizing. Defaults to config starting_cash.",
+    )
+    daily_summary_parser.add_argument(
+        "--current-drawdown",
+        type=float,
+        default=0.0,
+        help="Current portfolio drawdown as a decimal fraction for drawdown-aware risk reduction.",
+    )
+    daily_summary_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=20,
+        help="Lookback window used for universe liquidity screening.",
+    )
+    daily_summary_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter.",
+    )
+    daily_summary_parser.add_argument(
+        "--require-relative-volume",
+        action="store_true",
+        help="Require relative-volume confirmation for breakout entries.",
+    )
+    daily_summary_parser.add_argument(
+        "--disable-regime-filter",
+        action="store_true",
+        help="Disable the benchmark-based regime filter.",
+    )
+    daily_summary_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for the daily summary reports and suggested order sheet.",
+    )
+    daily_summary_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    daily_summary_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    daily_summary_parser.set_defaults(handler=_handle_daily_summary)
 
     return parser
 
@@ -1118,6 +1205,199 @@ def _handle_compare_strategies(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_daily_summary(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    presets, preset_selection_source = _resolve_daily_summary_presets(args, config)
+
+    current_equity = (
+        config.game_rules.starting_cash if args.equity is None else float(args.equity)
+    )
+    if current_equity <= 0:
+        raise ValueError("equity must be greater than zero.")
+    if args.current_drawdown < 0:
+        raise ValueError("current_drawdown must be non-negative.")
+
+    builder = UniverseBuilder(provider, config.strategy.universe)
+    universe_members = builder.screen_candidates(
+        args.candidate_path,
+        as_of_date=args.as_of,
+        lookback_days=args.lookback_days,
+        refresh_cache=args.refresh_cache,
+    )
+
+    fetch_start = _comparison_warmup_start(
+        start_date=args.as_of,
+        atr_window=config.strategy.risk.atr_length,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        presets=presets,
+        enable_regime_filter=not args.disable_regime_filter,
+    )
+
+    symbol_frames: dict[str, pd.DataFrame] = {}
+    for member in universe_members:
+        try:
+            bars = provider.fetch_daily_bars(
+                member.symbol,
+                fetch_start,
+                args.as_of,
+                refresh_cache=args.refresh_cache,
+            )
+        except DataProviderError as exc:
+            LOGGER.warning("Skipping %s due to provider error: %s", member.symbol, exc)
+            continue
+        if bars.empty:
+            LOGGER.warning("Skipping %s because no bars were returned in the requested range.", member.symbol)
+            continue
+        symbol_frames[member.symbol] = bars
+
+    benchmark_frame = None
+    benchmark_symbol = None
+    if not args.disable_regime_filter and universe_members:
+        benchmark_symbol = (
+            args.benchmark_symbol.strip().upper()
+            if args.benchmark_symbol
+            else config.strategy.signals.benchmark_symbol
+        )
+        if benchmark_symbol in symbol_frames:
+            benchmark_frame = symbol_frames[benchmark_symbol]
+        else:
+            benchmark_frame = provider.fetch_daily_bars(
+                benchmark_symbol,
+                fetch_start,
+                args.as_of,
+                refresh_cache=args.refresh_cache,
+            )
+        if benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
+            )
+
+    constraints = PortfolioConstraints.from_configs(
+        config.strategy.risk,
+        config.game_rules.rules,
+    )
+    evaluations: list[PresetCandidateEvaluation] = []
+    no_signal_symbols_by_preset: dict[str, list[str]] = {
+        preset.name: []
+        for preset in presets
+    }
+
+    for preset in presets:
+        strategy_settings = BreakoutMomentumSettings.from_configs(
+            config.strategy.signals,
+            config.strategy.risk,
+            require_relative_volume_confirmation=args.require_relative_volume,
+            enable_regime_filter=not args.disable_regime_filter,
+        )
+        strategy_settings = preset.apply_to_settings(strategy_settings)
+        if args.benchmark_symbol:
+            strategy_settings = replace(
+                strategy_settings,
+                benchmark_symbol=args.benchmark_symbol.strip().upper(),
+            )
+
+        for member in universe_members:
+            bars = symbol_frames.get(member.symbol)
+            if bars is None or bars.empty:
+                no_signal_symbols_by_preset[preset.name].append(member.symbol)
+                continue
+
+            signal = generate_breakout_signal(
+                bars,
+                settings=strategy_settings,
+                benchmark_frame=benchmark_frame,
+                has_open_position=False,
+                symbol=member.symbol,
+            )
+            if signal is None:
+                no_signal_symbols_by_preset[preset.name].append(member.symbol)
+                continue
+
+            signal_metadata = dict(signal.metadata)
+            signal_metadata["preset_name"] = preset.name
+            signal_metadata["parameter_id"] = preset.parameter_id
+            signal = replace(
+                signal,
+                strategy_name=f"{signal.strategy_name}:{preset.name}",
+                metadata=signal_metadata,
+            )
+            evaluations.append(
+                PresetCandidateEvaluation(
+                    preset_name=preset.name,
+                    parameter_id=preset.parameter_id,
+                    candidate=assess_signal_candidate(
+                        signal,
+                        current_equity=current_equity,
+                        base_risk_per_trade=preset.risk_per_trade,
+                        constraints=constraints,
+                        current_positions=(),
+                        current_drawdown=float(args.current_drawdown),
+                    ),
+                )
+            )
+
+    ranked_evaluations = rank_preset_candidate_evaluations(
+        evaluations,
+        current_equity=current_equity,
+    )
+    executor = ManualExecutor()
+    execution_batch = executor.build_execution_batch(
+        [evaluation.candidate for evaluation in ranked_evaluations],
+        as_of_date=args.as_of,
+    )
+    summary = build_daily_research_summary(
+        as_of_date=args.as_of,
+        execution_batch=execution_batch,
+        evaluations=evaluations,
+        selected_presets=presets,
+        universe_symbols=[member.symbol for member in universe_members],
+        current_equity=current_equity,
+        no_signal_symbols_by_preset=no_signal_symbols_by_preset,
+        benchmark_symbol=benchmark_symbol,
+        preset_selection_source=preset_selection_source,
+    )
+
+    output_dir = (
+        args.output_dir
+        or (config.project_root / "data" / "processed" / "daily_summary" / args.as_of.isoformat())
+    ).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_json_path = write_daily_research_summary(summary, output_dir / "daily_summary.json")
+    opportunities_csv_path = write_daily_research_summary(summary, output_dir / "ranked_opportunities.csv")
+    preset_csv_path = write_daily_preset_summary(summary, output_dir / "preset_rankings.csv")
+    preset_json_path = write_daily_preset_summary(summary, output_dir / "preset_rankings.json")
+    orders_csv_path = write_execution_batch(execution_batch, output_dir / "suggested_order_sheet.csv")
+    orders_json_path = write_execution_batch(execution_batch, output_dir / "suggested_order_sheet.json")
+
+    payload = {
+        "provider": config.data_sources.provider,
+        "as_of_date": args.as_of.isoformat(),
+        "preset_names": [preset.name for preset in presets],
+        "preset_selection_source": preset_selection_source,
+        "recommended_preset": summary.recommended_preset,
+        "equity": current_equity,
+        "current_drawdown": float(args.current_drawdown),
+        "universe_count": len(universe_members),
+        "candidate_count": len(summary.rows),
+        "approved_count": sum(row.status == "approved" for row in summary.rows),
+        "rejected_count": sum(row.status == "rejected" for row in summary.rows),
+        "order_count": len(execution_batch.orders),
+        "top_opportunities": [row.to_dict() for row in summary.rows[:5]],
+        "outputs": {
+            "daily_summary_json": str(summary_json_path),
+            "ranked_opportunities_csv": str(opportunities_csv_path),
+            "preset_rankings_csv": str(preset_csv_path),
+            "preset_rankings_json": str(preset_json_path),
+            "suggested_order_sheet_csv": str(orders_csv_path),
+            "suggested_order_sheet_json": str(orders_json_path),
+        },
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
 def _default_order_output_path(project_root: Path, as_of_date: date) -> Path:
     output_dir = project_root / "data" / "processed" / "orders"
     return output_dir / f"{as_of_date.isoformat()}_manual_orders.csv"
@@ -1270,6 +1550,80 @@ def _load_strategy_comparison_presets(config_dir: Path) -> dict[str, object]:
     if not isinstance(configured_presets, dict):
         raise ValueError("comparison_presets in strategy.yaml must be a mapping when provided.")
     return dict(configured_presets)
+
+
+def _resolve_daily_summary_presets(
+    args: argparse.Namespace,
+    config: AppConfig,
+) -> tuple[list[BreakoutStrategyPreset], str]:
+    configured_presets = _load_strategy_comparison_presets(args.config_dir)
+    requested_names = list(_parse_text_list(args.preset_names) or ())
+    selection_source = "named_presets" if requested_names else "default_standard_breakout"
+
+    if args.comparison_results is not None:
+        top_preset_name = _load_top_preset_name_from_results(args.comparison_results)
+        if top_preset_name not in requested_names:
+            requested_names.append(top_preset_name)
+        selection_source = f"comparison_results:{args.comparison_results.resolve()}"
+
+    if not requested_names:
+        requested_names = ["standard_breakout"]
+
+    presets = resolve_breakout_strategy_presets(
+        config.strategy.signals,
+        config.strategy.risk,
+        configured_presets=configured_presets,
+        preset_names=tuple(requested_names),
+    )
+    return presets, selection_source
+
+
+def _load_top_preset_name_from_results(results_path: Path) -> str:
+    resolved_path = results_path.resolve()
+    if not resolved_path.exists():
+        raise ValueError(f"Comparison results file does not exist: {resolved_path}")
+
+    suffix = resolved_path.suffix.lower()
+    if suffix == ".csv":
+        with resolved_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            first_row = next(reader, None)
+        if first_row is None:
+            raise ValueError(f"Comparison results CSV is empty: {resolved_path}")
+        preset_name = first_row.get("preset_name")
+        if not isinstance(preset_name, str) or not preset_name.strip():
+            raise ValueError(
+                f"Comparison results CSV does not contain a usable preset_name column: {resolved_path}"
+            )
+        return preset_name.strip()
+
+    if suffix == ".json":
+        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+        records: list[object]
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict):
+            top_presets = payload.get("top_presets")
+            if isinstance(top_presets, list):
+                records = top_presets
+            else:
+                records = [payload]
+        else:
+            raise ValueError(f"Unsupported JSON payload for comparison results: {resolved_path}")
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            preset_name = record.get("preset_name")
+            if isinstance(preset_name, str) and preset_name.strip():
+                return preset_name.strip()
+        raise ValueError(
+            f"Comparison results JSON does not contain a usable preset_name: {resolved_path}"
+        )
+
+    raise ValueError(
+        f"Unsupported comparison results format '{resolved_path.suffix}'. Expected CSV or JSON."
+    )
 
 
 def _print_structured(payload: dict[str, object], *, output_format: str) -> None:

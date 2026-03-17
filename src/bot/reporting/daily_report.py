@@ -1,4 +1,4 @@
-"""Daily signal and order report helpers for manual workflows."""
+"""Daily signal, order, and research summary report helpers."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ from dataclasses import dataclass, field
 from datetime import date
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from bot.execution.interface import ExecutionBatch, ExecutionOrder
 from bot.risk.portfolio_rules import RiskAssessedCandidate
+from bot.strategy.breakout_momentum import BreakoutStrategyPreset
 
 
 DAILY_REPORT_COLUMNS = (
@@ -28,6 +29,279 @@ DAILY_REPORT_COLUMNS = (
     "rejection_reasons",
     "metadata_json",
 )
+DAILY_RESEARCH_COLUMNS = (
+    "rank",
+    "date",
+    "signal_date",
+    "preset_name",
+    "parameter_id",
+    "symbol",
+    "status",
+    "action",
+    "quantity",
+    "intended_order_type",
+    "entry_price_hint",
+    "stop_level",
+    "strategy_name",
+    "rationale",
+    "score",
+    "breakout_pct",
+    "relative_volume_ratio",
+    "position_pct_equity",
+    "adjusted_risk_per_trade",
+    "risk_budget",
+    "per_share_risk",
+    "notional_value",
+    "rejection_reasons",
+    "metadata_json",
+)
+DAILY_PRESET_SUMMARY_COLUMNS = (
+    "preset_rank",
+    "preset_name",
+    "parameter_id",
+    "candidate_count",
+    "approved_count",
+    "rejected_count",
+    "no_signal_count",
+    "order_count",
+    "average_score",
+    "top_score",
+    "top_symbol",
+    "approved_symbols",
+    "rejected_symbols",
+)
+
+
+@dataclass(frozen=True)
+class PresetCandidateEvaluation:
+    """A risk-assessed candidate paired with its preset identity."""
+
+    preset_name: str
+    parameter_id: str
+    candidate: RiskAssessedCandidate
+
+    def __post_init__(self) -> None:
+        if not self.preset_name.strip():
+            raise ValueError("preset_name cannot be empty.")
+        if not self.parameter_id.strip():
+            raise ValueError("parameter_id cannot be empty.")
+
+
+@dataclass(frozen=True)
+class DailyResearchOpportunityRow:
+    """A ranked daily opportunity row for preset review and manual execution."""
+
+    rank: int
+    date: date
+    signal_date: date
+    preset_name: str
+    parameter_id: str
+    symbol: str
+    status: str
+    action: str
+    quantity: int
+    intended_order_type: str | None
+    entry_price_hint: float | None
+    stop_level: float | None
+    strategy_name: str | None
+    rationale: str
+    score: float
+    breakout_pct: float
+    relative_volume_ratio: float
+    position_pct_equity: float
+    adjusted_risk_per_trade: float
+    risk_budget: float
+    per_share_risk: float
+    notional_value: float
+    rejection_reasons: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation of the opportunity row."""
+
+        return {
+            "rank": self.rank,
+            "date": self.date.isoformat(),
+            "signal_date": self.signal_date.isoformat(),
+            "preset_name": self.preset_name,
+            "parameter_id": self.parameter_id,
+            "symbol": self.symbol,
+            "status": self.status,
+            "action": self.action,
+            "quantity": self.quantity,
+            "intended_order_type": self.intended_order_type,
+            "entry_price_hint": self.entry_price_hint,
+            "stop_level": self.stop_level,
+            "strategy_name": self.strategy_name,
+            "rationale": self.rationale,
+            "score": self.score,
+            "breakout_pct": self.breakout_pct,
+            "relative_volume_ratio": self.relative_volume_ratio,
+            "position_pct_equity": self.position_pct_equity,
+            "adjusted_risk_per_trade": self.adjusted_risk_per_trade,
+            "risk_budget": self.risk_budget,
+            "per_share_risk": self.per_share_risk,
+            "notional_value": self.notional_value,
+            "rejection_reasons": list(self.rejection_reasons),
+            "metadata": dict(self.metadata),
+        }
+
+    def to_record(self) -> dict[str, str]:
+        """Return a CSV-friendly representation of the opportunity row."""
+
+        return {
+            "rank": str(self.rank),
+            "date": self.date.isoformat(),
+            "signal_date": self.signal_date.isoformat(),
+            "preset_name": self.preset_name,
+            "parameter_id": self.parameter_id,
+            "symbol": self.symbol,
+            "status": self.status,
+            "action": self.action,
+            "quantity": str(self.quantity),
+            "intended_order_type": self.intended_order_type or "",
+            "entry_price_hint": _format_optional_float(self.entry_price_hint),
+            "stop_level": _format_optional_float(self.stop_level),
+            "strategy_name": self.strategy_name or "",
+            "rationale": self.rationale,
+            "score": _format_optional_float(self.score),
+            "breakout_pct": _format_optional_float(self.breakout_pct),
+            "relative_volume_ratio": _format_optional_float(self.relative_volume_ratio),
+            "position_pct_equity": _format_optional_float(self.position_pct_equity),
+            "adjusted_risk_per_trade": _format_optional_float(self.adjusted_risk_per_trade),
+            "risk_budget": _format_optional_float(self.risk_budget),
+            "per_share_risk": _format_optional_float(self.per_share_risk),
+            "notional_value": _format_optional_float(self.notional_value),
+            "rejection_reasons": " | ".join(self.rejection_reasons),
+            "metadata_json": json.dumps(self.metadata, sort_keys=True),
+        }
+
+
+@dataclass(frozen=True)
+class DailyPresetSummaryRow:
+    """Aggregate summary for one evaluated preset on the current day."""
+
+    preset_rank: int
+    preset_name: str
+    parameter_id: str
+    candidate_count: int
+    approved_count: int
+    rejected_count: int
+    no_signal_count: int
+    order_count: int
+    average_score: float
+    top_score: float
+    top_symbol: str | None
+    approved_symbols: tuple[str, ...] = ()
+    rejected_symbols: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation of the preset summary."""
+
+        return {
+            "preset_rank": self.preset_rank,
+            "preset_name": self.preset_name,
+            "parameter_id": self.parameter_id,
+            "candidate_count": self.candidate_count,
+            "approved_count": self.approved_count,
+            "rejected_count": self.rejected_count,
+            "no_signal_count": self.no_signal_count,
+            "order_count": self.order_count,
+            "average_score": self.average_score,
+            "top_score": self.top_score,
+            "top_symbol": self.top_symbol,
+            "approved_symbols": list(self.approved_symbols),
+            "rejected_symbols": list(self.rejected_symbols),
+        }
+
+    def to_record(self) -> dict[str, str]:
+        """Return a CSV-friendly representation of the preset summary."""
+
+        return {
+            "preset_rank": str(self.preset_rank),
+            "preset_name": self.preset_name,
+            "parameter_id": self.parameter_id,
+            "candidate_count": str(self.candidate_count),
+            "approved_count": str(self.approved_count),
+            "rejected_count": str(self.rejected_count),
+            "no_signal_count": str(self.no_signal_count),
+            "order_count": str(self.order_count),
+            "average_score": _format_optional_float(self.average_score),
+            "top_score": _format_optional_float(self.top_score),
+            "top_symbol": self.top_symbol or "",
+            "approved_symbols": " | ".join(self.approved_symbols),
+            "rejected_symbols": " | ".join(self.rejected_symbols),
+        }
+
+
+@dataclass(frozen=True)
+class DailyResearchSummary:
+    """Consolidated daily summary for preset selection and trade review."""
+
+    as_of_date: date
+    generated_at_utc: str
+    executor_name: str
+    selected_presets: tuple[BreakoutStrategyPreset, ...]
+    preset_selection_source: str | None
+    benchmark_symbol: str | None
+    universe_symbols: tuple[str, ...]
+    no_signal_symbols_by_preset: dict[str, tuple[str, ...]]
+    preset_summaries: tuple[DailyPresetSummaryRow, ...]
+    rows: tuple[DailyResearchOpportunityRow, ...]
+    execution_batch: ExecutionBatch
+
+    @property
+    def recommended_preset(self) -> str | None:
+        """Return today's top-ranked preset, if any."""
+
+        if not self.preset_summaries:
+            return None
+        top_summary = self.preset_summaries[0]
+        if top_summary.candidate_count == 0:
+            return None
+        return top_summary.preset_name
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly summary payload."""
+
+        approved_rows = [row for row in self.rows if row.status == "approved"]
+        rejected_rows = [row for row in self.rows if row.status == "rejected"]
+        unique_no_signal_symbols = sorted(
+            {
+                symbol
+                for symbols in self.no_signal_symbols_by_preset.values()
+                for symbol in symbols
+            }
+        )
+        return {
+            "as_of_date": self.as_of_date.isoformat(),
+            "generated_at_utc": self.generated_at_utc,
+            "executor_name": self.executor_name,
+            "benchmark_symbol": self.benchmark_symbol,
+            "preset_selection_source": self.preset_selection_source,
+            "selected_presets": [preset.to_dict() for preset in self.selected_presets],
+            "recommended_preset": self.recommended_preset,
+            "universe_count": len(self.universe_symbols),
+            "candidate_count": len(self.rows),
+            "approved_count": len(approved_rows),
+            "rejected_count": len(rejected_rows),
+            "order_count": len(self.execution_batch.orders),
+            "unique_no_signal_symbol_count": len(unique_no_signal_symbols),
+            "total_preset_no_signal_count": sum(
+                len(symbols) for symbols in self.no_signal_symbols_by_preset.values()
+            ),
+            "universe_symbols": list(self.universe_symbols),
+            "unique_no_signal_symbols": unique_no_signal_symbols,
+            "no_signal_symbols_by_preset": {
+                preset_name: list(symbols)
+                for preset_name, symbols in self.no_signal_symbols_by_preset.items()
+            },
+            "preset_summaries": [summary.to_dict() for summary in self.preset_summaries],
+            "approved_candidates": [row.to_dict() for row in approved_rows],
+            "rejected_candidates": [row.to_dict() for row in rejected_rows],
+            "ranked_opportunities": [row.to_dict() for row in self.rows],
+            "suggested_order_sheet": self.execution_batch.to_dict(),
+        }
 
 
 @dataclass(frozen=True)
@@ -181,6 +455,190 @@ def write_daily_signal_report(
     return resolved_output_path
 
 
+def score_risk_candidate_opportunity(
+    candidate: RiskAssessedCandidate,
+    *,
+    current_equity: float,
+) -> tuple[float, dict[str, float]]:
+    """Return a deterministic score and its components for a risk candidate."""
+
+    prior_high = _optional_float(candidate.signal.metadata.get("prior_high"))
+    relative_volume = _optional_float(candidate.signal.metadata.get("relative_volume"))
+    relative_volume_threshold = _optional_float(candidate.signal.metadata.get("relative_volume_threshold"))
+
+    breakout_pct = 0.0
+    if prior_high is not None and prior_high > 0 and candidate.entry_price > 0:
+        breakout_pct = max((candidate.entry_price - prior_high) / prior_high, 0.0)
+
+    relative_volume_ratio = 0.0
+    if relative_volume is not None:
+        if relative_volume_threshold is not None and relative_volume_threshold > 0:
+            relative_volume_ratio = max(relative_volume / relative_volume_threshold, 0.0)
+        else:
+            relative_volume_ratio = max(relative_volume, 0.0)
+
+    position_pct_equity = (
+        max(candidate.sizing.notional_value / current_equity, 0.0)
+        if current_equity > 0
+        else 0.0
+    )
+    score = (
+        breakout_pct * 1000.0
+        + relative_volume_ratio * 100.0
+        + position_pct_equity * 25.0
+    )
+    return score, {
+        "breakout_pct": breakout_pct,
+        "relative_volume_ratio": relative_volume_ratio,
+        "position_pct_equity": position_pct_equity,
+    }
+
+
+def rank_preset_candidate_evaluations(
+    evaluations: Sequence[PresetCandidateEvaluation],
+    *,
+    current_equity: float,
+) -> list[PresetCandidateEvaluation]:
+    """Return evaluations sorted by approval status and deterministic opportunity score."""
+
+    def sort_key(evaluation: PresetCandidateEvaluation) -> tuple[int, float, str, str]:
+        score, _components = score_risk_candidate_opportunity(
+            evaluation.candidate,
+            current_equity=current_equity,
+        )
+        approval_rank = 1 if evaluation.candidate.approved else 0
+        return (
+            -approval_rank,
+            -score,
+            evaluation.preset_name,
+            evaluation.candidate.signal.symbol,
+        )
+
+    return sorted(evaluations, key=sort_key)
+
+
+def build_daily_research_summary(
+    *,
+    as_of_date: date,
+    execution_batch: ExecutionBatch,
+    evaluations: Sequence[PresetCandidateEvaluation],
+    selected_presets: Sequence[BreakoutStrategyPreset],
+    universe_symbols: Sequence[str],
+    current_equity: float,
+    no_signal_symbols_by_preset: Mapping[str, Sequence[str]] | None = None,
+    benchmark_symbol: str | None = None,
+    preset_selection_source: str | None = None,
+) -> DailyResearchSummary:
+    """Build a consolidated daily preset summary from evaluated candidates."""
+
+    normalized_no_signal_symbols = {
+        preset_name: tuple(symbols)
+        for preset_name, symbols in (no_signal_symbols_by_preset or {}).items()
+    }
+    ranked_evaluations = rank_preset_candidate_evaluations(
+        evaluations,
+        current_equity=current_equity,
+    )
+    orders_by_key = {
+        (order.symbol, order.strategy_name or ""): order
+        for order in execution_batch.orders
+    }
+
+    rows = tuple(
+        _daily_research_row_from_evaluation(
+            evaluation,
+            rank=index,
+            as_of_date=as_of_date,
+            current_equity=current_equity,
+            order=orders_by_key.get(
+                (
+                    evaluation.candidate.signal.symbol,
+                    evaluation.candidate.signal.strategy_name or "",
+                )
+            ),
+        )
+        for index, evaluation in enumerate(ranked_evaluations, start=1)
+    )
+    preset_summaries = _build_daily_preset_summaries(
+        rows=rows,
+        selected_presets=selected_presets,
+        no_signal_symbols_by_preset=normalized_no_signal_symbols,
+        execution_batch=execution_batch,
+    )
+
+    return DailyResearchSummary(
+        as_of_date=as_of_date,
+        generated_at_utc=execution_batch.generated_at_utc,
+        executor_name=execution_batch.executor_name,
+        selected_presets=tuple(selected_presets),
+        preset_selection_source=preset_selection_source,
+        benchmark_symbol=benchmark_symbol,
+        universe_symbols=tuple(universe_symbols),
+        no_signal_symbols_by_preset=normalized_no_signal_symbols,
+        preset_summaries=preset_summaries,
+        rows=rows,
+        execution_batch=execution_batch,
+    )
+
+
+def write_daily_research_summary(
+    summary: DailyResearchSummary,
+    output_path: Path,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Write the daily research summary as JSON or ranked-opportunity CSV."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_format = _resolve_output_format(resolved_output_path, output_format)
+
+    if resolved_format == "json":
+        resolved_output_path.write_text(
+            json.dumps(summary.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return resolved_output_path
+
+    with resolved_output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=DAILY_RESEARCH_COLUMNS)
+        writer.writeheader()
+        for row in summary.rows:
+            writer.writerow(row.to_record())
+    return resolved_output_path
+
+
+def write_daily_preset_summary(
+    summary: DailyResearchSummary,
+    output_path: Path,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Write preset-level daily summary rows as CSV or JSON."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_format = _resolve_output_format(resolved_output_path, output_format)
+
+    if resolved_format == "json":
+        resolved_output_path.write_text(
+            json.dumps(
+                [row.to_dict() for row in summary.preset_summaries],
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return resolved_output_path
+
+    with resolved_output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=DAILY_PRESET_SUMMARY_COLUMNS)
+        writer.writeheader()
+        for row in summary.preset_summaries:
+            writer.writerow(row.to_record())
+    return resolved_output_path
+
+
 def _row_from_candidate(
     candidate: RiskAssessedCandidate,
     *,
@@ -216,10 +674,162 @@ def _row_from_candidate(
     )
 
 
+def _daily_research_row_from_evaluation(
+    evaluation: PresetCandidateEvaluation,
+    *,
+    rank: int,
+    as_of_date: date,
+    current_equity: float,
+    order: ExecutionOrder | None,
+) -> DailyResearchOpportunityRow:
+    candidate = evaluation.candidate
+    score, score_components = score_risk_candidate_opportunity(
+        candidate,
+        current_equity=current_equity,
+    )
+    metadata = {
+        "score_components": dict(score_components),
+        "adjusted_risk_per_trade": candidate.adjusted_risk_per_trade,
+        "risk_budget": candidate.sizing.risk_budget,
+        "per_share_risk": candidate.sizing.per_share_risk,
+        "notional_value": candidate.sizing.notional_value,
+        "signal_metadata": dict(candidate.signal.metadata),
+    }
+    if order is not None:
+        metadata["execution_metadata"] = dict(order.metadata)
+
+    rationale = order.rationale if order is not None else candidate.signal.entry_reason.replace("_", " ")
+    return DailyResearchOpportunityRow(
+        rank=rank,
+        date=as_of_date,
+        signal_date=candidate.signal.date,
+        preset_name=evaluation.preset_name,
+        parameter_id=evaluation.parameter_id,
+        symbol=candidate.signal.symbol,
+        status="approved" if candidate.approved else "rejected",
+        action=candidate.signal.side,
+        quantity=order.quantity if order is not None else 0,
+        intended_order_type=order.intended_order_type if order is not None else None,
+        entry_price_hint=candidate.entry_price,
+        stop_level=candidate.stop_price,
+        strategy_name=candidate.signal.strategy_name,
+        rationale=rationale,
+        score=score,
+        breakout_pct=score_components["breakout_pct"],
+        relative_volume_ratio=score_components["relative_volume_ratio"],
+        position_pct_equity=score_components["position_pct_equity"],
+        adjusted_risk_per_trade=candidate.adjusted_risk_per_trade,
+        risk_budget=candidate.sizing.risk_budget,
+        per_share_risk=candidate.sizing.per_share_risk,
+        notional_value=candidate.sizing.notional_value,
+        rejection_reasons=candidate.rejection_reasons,
+        metadata=metadata,
+    )
+
+
+def _build_daily_preset_summaries(
+    *,
+    rows: Sequence[DailyResearchOpportunityRow],
+    selected_presets: Sequence[BreakoutStrategyPreset],
+    no_signal_symbols_by_preset: Mapping[str, Sequence[str]],
+    execution_batch: ExecutionBatch,
+) -> tuple[DailyPresetSummaryRow, ...]:
+    orders_by_preset: dict[str, int] = {}
+    for order in execution_batch.orders:
+        preset_name = _extract_preset_name(order.metadata)
+        if preset_name is None:
+            continue
+        orders_by_preset[preset_name] = orders_by_preset.get(preset_name, 0) + 1
+
+    summary_rows: list[DailyPresetSummaryRow] = []
+    rows_by_preset: dict[str, list[DailyResearchOpportunityRow]] = {}
+    for row in rows:
+        rows_by_preset.setdefault(row.preset_name, []).append(row)
+
+    for preset in selected_presets:
+        preset_rows = rows_by_preset.get(preset.name, [])
+        approved_symbols = tuple(row.symbol for row in preset_rows if row.status == "approved")
+        rejected_symbols = tuple(row.symbol for row in preset_rows if row.status == "rejected")
+        scoring_rows = [row for row in preset_rows if row.status == "approved"] or list(preset_rows)
+        top_score = max((row.score for row in scoring_rows), default=0.0)
+        top_symbol = next((row.symbol for row in scoring_rows if row.score == top_score), None)
+        average_score = (
+            sum(row.score for row in scoring_rows) / len(scoring_rows)
+            if scoring_rows
+            else 0.0
+        )
+        summary_rows.append(
+            DailyPresetSummaryRow(
+                preset_rank=0,
+                preset_name=preset.name,
+                parameter_id=preset.parameter_id,
+                candidate_count=len(preset_rows),
+                approved_count=len(approved_symbols),
+                rejected_count=len(rejected_symbols),
+                no_signal_count=len(tuple(no_signal_symbols_by_preset.get(preset.name, ()))),
+                order_count=orders_by_preset.get(preset.name, 0),
+                average_score=average_score,
+                top_score=top_score,
+                top_symbol=top_symbol,
+                approved_symbols=approved_symbols,
+                rejected_symbols=rejected_symbols,
+            )
+        )
+
+    sorted_summaries = sorted(
+        summary_rows,
+        key=lambda row: (
+            -row.approved_count,
+            -row.top_score,
+            -row.average_score,
+            -row.candidate_count,
+            row.preset_name,
+        ),
+    )
+    return tuple(
+        DailyPresetSummaryRow(
+            preset_rank=index,
+            preset_name=row.preset_name,
+            parameter_id=row.parameter_id,
+            candidate_count=row.candidate_count,
+            approved_count=row.approved_count,
+            rejected_count=row.rejected_count,
+            no_signal_count=row.no_signal_count,
+            order_count=row.order_count,
+            average_score=row.average_score,
+            top_score=row.top_score,
+            top_symbol=row.top_symbol,
+            approved_symbols=row.approved_symbols,
+            rejected_symbols=row.rejected_symbols,
+        )
+        for index, row in enumerate(sorted_summaries, start=1)
+    )
+
+
 def _format_optional_float(value: float | None) -> str:
     if value is None:
         return ""
     return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _extract_preset_name(metadata: Mapping[str, Any]) -> str | None:
+    signal_metadata = metadata.get("signal_metadata")
+    if isinstance(signal_metadata, Mapping):
+        preset_name = signal_metadata.get("preset_name")
+        if isinstance(preset_name, str) and preset_name.strip():
+            return preset_name.strip()
+    preset_name = metadata.get("preset_name")
+    if isinstance(preset_name, str) and preset_name.strip():
+        return preset_name.strip()
+    return None
 
 
 def _resolve_output_format(output_path: Path, output_format: str | None) -> str:

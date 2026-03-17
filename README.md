@@ -212,6 +212,22 @@ comparison_presets:
     risk_per_trade: 0.008
 ```
 
+### Generate a daily research summary
+
+```bash
+investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17
+investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --preset-names standard_breakout,aggressive_breakout
+investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --comparison-results data/processed/strategy_comparison/2025-01-01_2025-03-31/ranked_presets.csv
+```
+
+This command:
+
+- screens the universe, evaluates one or more presets, and applies the existing risk checks
+- ranks approved and rejected opportunities with a deterministic score built from breakout strength, relative-volume confirmation, and position size as a percent of equity
+- writes a consolidated `daily_summary.json`, row-level `ranked_opportunities.csv`, preset-level `preset_rankings.csv/json`, and a `suggested_order_sheet.csv/json`
+
+If no preset selection is supplied, the command defaults to `standard_breakout`. If `--comparison-results` is supplied, the top preset from that file is included automatically.
+
 ## Architecture Notes
 
 - Signal generation should stay separate from execution. Research code can emit candidate trades, while execution modules only format or route orders.
@@ -223,6 +239,7 @@ comparison_presets:
 - The manual execution layer is intentionally report-first. It produces human-readable orders and research artifacts, but it does not submit anything to Investopedia yet.
 - Walk-forward tooling is the main robustness check. Prefer parameter sets that remain acceptable across many test folds over ones that win one in-sample run.
 - Strategy comparison is a faster preset-level screen. Use it to narrow candidates, then confirm the survivors with walk-forward outputs before trusting a setting.
+- The daily summary is the short-horizon decision layer. Use robust presets from strategy comparison and walk-forward first, then use the daily summary to decide whether today’s setups are worth placing manually.
 - Browser automation and any live web executor are intentionally out of scope for this baseline.
 
 ## Development
