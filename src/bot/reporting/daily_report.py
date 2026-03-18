@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from bot.execution.interface import ExecutionBatch, ExecutionOrder
-from bot.risk.portfolio_rules import RiskAssessedCandidate
+from bot.risk.portfolio_rules import ExistingPosition, RiskAssessedCandidate
 from bot.strategy.breakout_momentum import BreakoutStrategyPreset, build_breakout_rationale
 
 
@@ -245,10 +245,12 @@ class DailyResearchSummary:
     preset_selection_source: str | None
     benchmark_symbol: str | None
     universe_symbols: tuple[str, ...]
+    current_positions: tuple[ExistingPosition, ...]
     no_signal_symbols_by_preset: dict[str, tuple[str, ...]]
     preset_summaries: tuple[DailyPresetSummaryRow, ...]
     rows: tuple[DailyResearchOpportunityRow, ...]
     execution_batch: ExecutionBatch
+    force_require_relative_volume_confirmation: bool = False
 
     @property
     def recommended_preset(self) -> str | None:
@@ -260,6 +262,50 @@ class DailyResearchSummary:
         if top_summary.candidate_count == 0:
             return None
         return top_summary.preset_name
+
+    @property
+    def relative_volume_policy(self) -> str:
+        """Return the effective RV policy across the selected presets."""
+
+        if self.force_require_relative_volume_confirmation:
+            return "required"
+
+        selected_policies = {
+            bool(preset.require_relative_volume_confirmation)
+            for preset in self.selected_presets
+        }
+        if not selected_policies or selected_policies == {False}:
+            return "optional"
+        if selected_policies == {True}:
+            return "required"
+        return "mixed"
+
+    @property
+    def relative_volume_confirmation_required(self) -> bool | None:
+        """Return the effective RV hard-gate status when it is not mixed."""
+
+        policy = self.relative_volume_policy
+        if policy == "mixed":
+            return None
+        return policy == "required"
+
+    @property
+    def relative_volume_policy_by_preset(self) -> dict[str, str]:
+        """Return RV policy labels for each selected preset."""
+
+        policy = "required" if self.force_require_relative_volume_confirmation else None
+        return {
+            preset.name: (
+                policy
+                if policy is not None
+                else (
+                    "required"
+                    if preset.require_relative_volume_confirmation
+                    else "optional"
+                )
+            )
+            for preset in self.selected_presets
+        }
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly summary payload."""
@@ -280,8 +326,14 @@ class DailyResearchSummary:
             "benchmark_symbol": self.benchmark_symbol,
             "preset_selection_source": self.preset_selection_source,
             "selected_presets": [preset.to_dict() for preset in self.selected_presets],
+            "relative_volume_confirmation_required": self.relative_volume_confirmation_required,
+            "relative_volume_policy": self.relative_volume_policy,
+            "relative_volume_policy_by_preset": self.relative_volume_policy_by_preset,
             "recommended_preset": self.recommended_preset,
             "universe_count": len(self.universe_symbols),
+            "current_position_count": len(self.current_positions),
+            "current_position_symbols": [position.symbol for position in self.current_positions],
+            "current_positions": [position.to_dict() for position in self.current_positions],
             "candidate_count": len(self.rows),
             "approved_count": len(approved_rows),
             "rejected_count": len(rejected_rows),
@@ -369,6 +421,7 @@ class DailySignalReport:
     generated_at_utc: str
     executor_name: str
     universe_symbols: tuple[str, ...]
+    current_positions: tuple[ExistingPosition, ...]
     no_signal_symbols: tuple[str, ...]
     benchmark_symbol: str | None
     rows: tuple[DailySignalReportRow, ...]
@@ -384,6 +437,9 @@ class DailySignalReport:
             "executor_name": self.executor_name,
             "benchmark_symbol": self.benchmark_symbol,
             "universe_count": len(self.universe_symbols),
+            "current_position_count": len(self.current_positions),
+            "current_position_symbols": [position.symbol for position in self.current_positions],
+            "current_positions": [position.to_dict() for position in self.current_positions],
             "signal_count": len(self.rows),
             "approved_count": approved_count,
             "rejected_count": rejected_count,
@@ -400,6 +456,7 @@ def build_daily_signal_report(
     execution_batch: ExecutionBatch,
     assessed_candidates: Sequence[RiskAssessedCandidate],
     universe_symbols: Sequence[str],
+    current_positions: Sequence[ExistingPosition] = (),
     no_signal_symbols: Sequence[str] = (),
     benchmark_symbol: str | None = None,
 ) -> DailySignalReport:
@@ -422,6 +479,7 @@ def build_daily_signal_report(
         generated_at_utc=execution_batch.generated_at_utc,
         executor_name=execution_batch.executor_name,
         universe_symbols=tuple(universe_symbols),
+        current_positions=tuple(current_positions),
         no_signal_symbols=tuple(no_signal_symbols),
         benchmark_symbol=benchmark_symbol,
         rows=rows,
@@ -524,10 +582,12 @@ def build_daily_research_summary(
     evaluations: Sequence[PresetCandidateEvaluation],
     selected_presets: Sequence[BreakoutStrategyPreset],
     universe_symbols: Sequence[str],
+    current_positions: Sequence[ExistingPosition] = (),
     current_equity: float,
     no_signal_symbols_by_preset: Mapping[str, Sequence[str]] | None = None,
     benchmark_symbol: str | None = None,
     preset_selection_source: str | None = None,
+    force_require_relative_volume_confirmation: bool = False,
 ) -> DailyResearchSummary:
     """Build a consolidated daily preset summary from evaluated candidates."""
 
@@ -574,10 +634,12 @@ def build_daily_research_summary(
         preset_selection_source=preset_selection_source,
         benchmark_symbol=benchmark_symbol,
         universe_symbols=tuple(universe_symbols),
+        current_positions=tuple(current_positions),
         no_signal_symbols_by_preset=normalized_no_signal_symbols,
         preset_summaries=preset_summaries,
         rows=rows,
         execution_batch=execution_batch,
+        force_require_relative_volume_confirmation=force_require_relative_volume_confirmation,
     )
 
 
@@ -653,6 +715,8 @@ def _row_from_candidate(
         "notional_value": candidate.sizing.notional_value,
         "signal_metadata": dict(candidate.signal.metadata),
     }
+    if candidate.existing_position is not None:
+        metadata["existing_position"] = candidate.existing_position.to_dict()
     if order is not None:
         metadata["execution_metadata"] = dict(order.metadata)
 
@@ -695,6 +759,8 @@ def _daily_research_row_from_evaluation(
         "notional_value": candidate.sizing.notional_value,
         "signal_metadata": dict(candidate.signal.metadata),
     }
+    if candidate.existing_position is not None:
+        metadata["existing_position"] = candidate.existing_position.to_dict()
     if order is not None:
         metadata["execution_metadata"] = dict(order.metadata)
 

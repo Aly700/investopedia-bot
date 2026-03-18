@@ -106,6 +106,7 @@ Universe filtering uses the thresholds already defined in `config/strategy.yaml`
 ```bash
 investopedia-bot generate-orders data/raw/candidate_symbols.txt --as-of 2026-03-17
 investopedia-bot generate-orders data/raw/candidate_symbols.txt --as-of 2026-03-17 --equity 125000 --current-drawdown 0.08
+investopedia-bot generate-orders data/raw/candidate_symbols.txt --as-of 2026-03-17 --portfolio-file data/processed/portfolio/current_positions.csv
 investopedia-bot generate-orders data/raw/candidate_symbols.csv --as-of 2026-03-17 --require-relative-volume --output-dir data/processed/daily/2026-03-17
 ```
 
@@ -117,8 +118,45 @@ This command:
 - runs each signal through the existing risk sizing and portfolio checks
 - writes a human-readable `manual_order_sheet.csv` plus `daily_signal_report.json` and `daily_signal_report.csv`
 
-The manual workflow currently assumes no existing open positions are supplied to the CLI. It uses the provided `--equity` and optional `--current-drawdown` for sizing and drawdown-aware risk reduction.
+If `--portfolio-file` is supplied, the workflow treats those holdings as currently open positions when enforcing max positions, duplicate-entry blocking, and no-averaging-down checks. If no portfolio file is supplied, the behavior stays the same as before and the CLI assumes there are no current holdings.
 Relative-volume confirmation is optional by default. Use `--require-relative-volume` to make it a hard entry gate; the generated reports and order sheet label whether RV was `optional` or `required` for each candidate.
+
+The portfolio snapshot can be CSV or JSON and should include at least:
+
+- `symbol`
+- `quantity`
+- `average_entry_price`
+
+Optional fields:
+
+- `current_stop`
+- `preset_name`
+- `source`
+- `metadata_json` for CSV or `metadata` for JSON
+
+Example CSV:
+
+```csv
+symbol,quantity,average_entry_price,current_stop,preset_name,source
+MU,50,96.25,90.00,confirmed_breakout,investopedia
+```
+
+Example JSON:
+
+```json
+{
+  "positions": [
+    {
+      "symbol": "MU",
+      "quantity": 50,
+      "average_entry_price": 96.25,
+      "current_stop": 90.0,
+      "preset_name": "confirmed_breakout",
+      "source": "investopedia"
+    }
+  ]
+}
+```
 
 ### Render manual orders from offline signals
 
@@ -190,7 +228,7 @@ If sweep arguments are omitted, the command uses the current single values from 
 
 ```bash
 investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31
-investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset-names standard_breakout,confirmed_breakout,aggressive_breakout --objective sharpe_ratio
+investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset-names conservative_breakout,confirmed_conservative_breakout,confirmed_breakout --objective sharpe_ratio
 investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset "name=research_fast,breakout_lookback=15,relative_volume_threshold=1.2,initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.012,require_relative_volume_confirmation=true"
 ```
 
@@ -200,7 +238,8 @@ This command:
 - reuses the deterministic backtest engine and the existing summary metric logic
 - writes `comparison_results`, `ranked_presets`, and `summary.json` in machine-readable formats
 
-Built-in presets are `conservative_breakout`, `standard_breakout`, `confirmed_breakout`, and `aggressive_breakout`.
+Built-in presets are `conservative_breakout`, `confirmed_conservative_breakout`, `standard_breakout`, `confirmed_breakout`, and `aggressive_breakout`.
+`confirmed_conservative_breakout` matches `conservative_breakout` except that relative-volume confirmation is a hard entry gate.
 `confirmed_breakout` matches `standard_breakout` except that relative-volume confirmation is a hard entry gate.
 You can also add repo-local presets in `config/strategy.yaml` with an optional `comparison_presets` section:
 
@@ -219,7 +258,8 @@ comparison_presets:
 
 ```bash
 investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17
-investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --preset-names standard_breakout,confirmed_breakout
+investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --preset-names conservative_breakout,confirmed_conservative_breakout
+investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --preset-names conservative_breakout,confirmed_conservative_breakout --portfolio-file data/processed/portfolio/current_positions.json
 investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --comparison-results data/processed/strategy_comparison/2025-01-01_2025-03-31/ranked_presets.csv
 ```
 
@@ -230,7 +270,7 @@ This command:
 - writes a consolidated `daily_summary.json`, row-level `ranked_opportunities.csv`, preset-level `preset_rankings.csv/json`, and a `suggested_order_sheet.csv/json`
 
 If no preset selection is supplied, the command defaults to `standard_breakout`. If `--comparison-results` is supplied, the top preset from that file is included automatically.
-Like `generate-orders`, relative-volume confirmation is optional unless `--require-relative-volume` is enabled, and the ranked outputs preserve that policy in their rationale text and metadata.
+Like `generate-orders`, relative-volume confirmation is optional unless `--require-relative-volume` is enabled, and the ranked outputs preserve that policy in their rationale text and metadata. When `--portfolio-file` is provided, the summary also includes current holdings context and rejection reasons for duplicate entries or averaging-down attempts.
 
 ## Architecture Notes
 

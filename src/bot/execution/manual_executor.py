@@ -278,6 +278,11 @@ def _candidate_to_execution_order(
             "notional_value": candidate.sizing.notional_value,
             "capped_by_notional": candidate.sizing.capped_by_notional,
             "signal_metadata": dict(candidate.signal.metadata),
+            "existing_position": (
+                candidate.existing_position.to_dict()
+                if candidate.existing_position is not None
+                else None
+            ),
         },
     )
 

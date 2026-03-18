@@ -59,7 +59,13 @@ from bot.reporting.daily_report import (
 )
 from bot.reporting.equity_curve import write_equity_curve_report
 from bot.reporting.trade_log import write_trade_log_report
-from bot.risk.portfolio_rules import PortfolioConstraints, assess_signal_candidate
+from bot.risk.portfolio_rules import (
+    ExistingPosition,
+    PortfolioConstraints,
+    PortfolioInputError,
+    assess_signal_candidate,
+    load_existing_positions,
+)
 from bot.strategy.breakout_momentum import (
     BreakoutMomentumSettings,
     BreakoutStrategyPreset,
@@ -225,6 +231,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Current portfolio drawdown as a decimal fraction for drawdown-aware risk reduction.",
+    )
+    generate_orders_parser.add_argument(
+        "--portfolio-file",
+        type=Path,
+        default=None,
+        help="Optional CSV or JSON file describing currently open holdings.",
     )
     generate_orders_parser.add_argument(
         "--lookback-days",
@@ -580,6 +592,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Current portfolio drawdown as a decimal fraction for drawdown-aware risk reduction.",
     )
     daily_summary_parser.add_argument(
+        "--portfolio-file",
+        type=Path,
+        default=None,
+        help="Optional CSV or JSON file describing currently open holdings.",
+    )
+    daily_summary_parser.add_argument(
         "--lookback-days",
         type=int,
         default=20,
@@ -726,6 +744,7 @@ def _handle_build_universe(args: argparse.Namespace) -> int:
 def _handle_generate_orders(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     provider = create_daily_bar_provider(config, env_file=args.env_file)
+    current_positions = _load_current_positions(args.portfolio_file)
     builder = UniverseBuilder(provider, config.strategy.universe)
     universe_members = builder.screen_candidates(
         args.candidate_path,
@@ -809,7 +828,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
                 current_equity=current_equity,
                 base_risk_per_trade=config.strategy.risk.risk_per_trade,
                 constraints=constraints,
-                current_positions=(),
+                current_positions=current_positions,
                 current_drawdown=float(args.current_drawdown),
             )
         )
@@ -821,6 +840,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         execution_batch=batch,
         assessed_candidates=assessed_candidates,
         universe_symbols=[member.symbol for member in universe_members],
+        current_positions=current_positions,
         no_signal_symbols=no_signal_symbols,
         benchmark_symbol=strategy_settings.benchmark_symbol if strategy_settings.enable_regime_filter else None,
     )
@@ -836,6 +856,9 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         "as_of_date": args.as_of.isoformat(),
         "equity": current_equity,
         "current_drawdown": float(args.current_drawdown),
+        "portfolio_file": str(args.portfolio_file.resolve()) if args.portfolio_file else None,
+        "current_position_count": len(current_positions),
+        "current_position_symbols": [position.symbol for position in current_positions],
         "relative_volume_confirmation_required": (
             strategy_settings.require_relative_volume_confirmation
         ),
@@ -1218,6 +1241,7 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     provider = create_daily_bar_provider(config, env_file=args.env_file)
     presets, preset_selection_source = _resolve_daily_summary_presets(args, config)
+    current_positions = _load_current_positions(args.portfolio_file)
 
     current_equity = (
         config.game_rules.starting_cash if args.equity is None else float(args.equity)
@@ -1345,7 +1369,7 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
                         current_equity=current_equity,
                         base_risk_per_trade=preset.risk_per_trade,
                         constraints=constraints,
-                        current_positions=(),
+                        current_positions=current_positions,
                         current_drawdown=float(args.current_drawdown),
                     ),
                 )
@@ -1366,10 +1390,12 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         evaluations=evaluations,
         selected_presets=presets,
         universe_symbols=[member.symbol for member in universe_members],
+        current_positions=current_positions,
         current_equity=current_equity,
         no_signal_symbols_by_preset=no_signal_symbols_by_preset,
         benchmark_symbol=benchmark_symbol,
         preset_selection_source=preset_selection_source,
+        force_require_relative_volume_confirmation=bool(args.require_relative_volume),
     )
 
     output_dir = (
@@ -1390,10 +1416,12 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         "as_of_date": args.as_of.isoformat(),
         "preset_names": [preset.name for preset in presets],
         "preset_selection_source": preset_selection_source,
-        "relative_volume_confirmation_required": bool(args.require_relative_volume),
-        "relative_volume_policy": (
-            "required" if args.require_relative_volume else "optional"
-        ),
+        "portfolio_file": str(args.portfolio_file.resolve()) if args.portfolio_file else None,
+        "current_position_count": len(current_positions),
+        "current_position_symbols": [position.symbol for position in current_positions],
+        "relative_volume_confirmation_required": summary.relative_volume_confirmation_required,
+        "relative_volume_policy": summary.relative_volume_policy,
+        "relative_volume_policy_by_preset": summary.relative_volume_policy_by_preset,
         "recommended_preset": summary.recommended_preset,
         "equity": current_equity,
         "current_drawdown": float(args.current_drawdown),
@@ -1423,6 +1451,15 @@ def _default_order_output_path(project_root: Path, as_of_date: date) -> Path:
 
 def _default_daily_output_dir(project_root: Path, as_of_date: date) -> Path:
     return project_root / "data" / "processed" / "daily" / as_of_date.isoformat()
+
+
+def _load_current_positions(portfolio_file: Path | None) -> list[ExistingPosition]:
+    if portfolio_file is None:
+        return []
+    try:
+        return load_existing_positions(portfolio_file)
+    except PortfolioInputError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _strategy_warmup_start(

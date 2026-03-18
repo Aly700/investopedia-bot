@@ -13,7 +13,7 @@ from bot.main import build_parser
 from bot.reporting.daily_report import build_daily_signal_report, write_daily_signal_report
 from bot.reporting.equity_curve import write_equity_curve_report
 from bot.reporting.trade_log import write_trade_log_report
-from bot.risk.portfolio_rules import RiskAssessedCandidate
+from bot.risk.portfolio_rules import ExistingPosition, RiskAssessedCandidate
 from bot.risk.position_sizing import PositionSizingResult
 from bot.strategy.signal_models import StrategySignal
 
@@ -129,14 +129,23 @@ def test_reporting_exports_trade_log_and_equity_curve(tmp_path: Path) -> None:
 
 def test_daily_signal_report_exports_rejections_and_no_signal_summary(tmp_path: Path) -> None:
     approved = _candidate(symbol="AAA", approved=True, shares=25, rejection_reasons=())
+    existing_position = ExistingPosition(
+        symbol="BBB",
+        shares=20,
+        average_entry_price=105.0,
+        current_stop=95.0,
+        preset_name="standard_breakout",
+        source="portfolio.csv",
+    )
     rejected = _candidate(
         symbol="BBB",
         approved=False,
         shares=0,
-        rejection_reasons=("Max concurrent positions reached.",),
+        rejection_reasons=("Existing long position already open for symbol; duplicate entries are not allowed.",),
         relative_volume=1.2,
         relative_volume_confirmed=False,
         relative_volume_required=False,
+        existing_position=existing_position,
     )
     batch = ManualExecutor().build_execution_batch([approved, rejected], as_of_date=date(2024, 1, 5))
     report = build_daily_signal_report(
@@ -144,6 +153,7 @@ def test_daily_signal_report_exports_rejections_and_no_signal_summary(tmp_path: 
         execution_batch=batch,
         assessed_candidates=[approved, rejected],
         universe_symbols=["AAA", "BBB", "CCC"],
+        current_positions=[existing_position],
         no_signal_symbols=["CCC"],
         benchmark_symbol="SPY",
     )
@@ -158,10 +168,14 @@ def test_daily_signal_report_exports_rejections_and_no_signal_summary(tmp_path: 
     assert payload["approved_count"] == 1
     assert payload["rejected_count"] == 1
     assert payload["no_signal_count"] == 1
+    assert payload["current_position_count"] == 1
     assert payload["benchmark_symbol"] == "SPY"
     assert [row["status"] for row in rows] == ["approved", "rejected"]
     assert "relative_volume=1.20 (optional; threshold=1.50; not confirmed)" in rows[1]["rationale"]
-    assert rows[1]["rejection_reasons"] == "Max concurrent positions reached."
+    assert rows[1]["rejection_reasons"] == (
+        "Existing long position already open for symbol; duplicate entries are not allowed."
+    )
+    assert payload["rows"][1]["metadata"]["existing_position"]["average_entry_price"] == 105.0
 
 
 def test_cli_parser_exposes_generate_orders_command() -> None:
@@ -172,11 +186,14 @@ def test_cli_parser_exposes_generate_orders_command() -> None:
             "data/raw/candidate_symbols.txt",
             "--as-of",
             "2024-01-05",
+            "--portfolio-file",
+            "data/processed/portfolio.json",
         ]
     )
 
     assert args.command == "generate-orders"
     assert args.as_of == date(2024, 1, 5)
+    assert args.portfolio_file == Path("data/processed/portfolio.json")
 
 
 def _candidate(
@@ -188,6 +205,7 @@ def _candidate(
     relative_volume: float = 1.8,
     relative_volume_confirmed: bool | None = None,
     relative_volume_required: bool = False,
+    existing_position: ExistingPosition | None = None,
 ) -> RiskAssessedCandidate:
     relative_volume_threshold = 1.5
     confirmed = (
@@ -234,4 +252,5 @@ def _candidate(
         sizing=sizing,
         approved=approved,
         rejection_reasons=rejection_reasons,
+        existing_position=existing_position,
     )

@@ -13,7 +13,7 @@ from bot.reporting.daily_report import (
     write_daily_preset_summary,
     write_daily_research_summary,
 )
-from bot.risk.portfolio_rules import RiskAssessedCandidate
+from bot.risk.portfolio_rules import ExistingPosition, RiskAssessedCandidate
 from bot.risk.position_sizing import PositionSizingResult
 from bot.strategy.breakout_momentum import BreakoutStrategyPreset, build_default_breakout_presets
 from bot.strategy.signal_models import StrategySignal
@@ -140,9 +140,56 @@ def test_daily_research_summary_handles_empty_no_signal_days(tmp_path: Path) -> 
     assert payload["candidate_count"] == 0
     assert payload["approved_candidates"] == []
     assert payload["rejected_candidates"] == []
+    assert payload["current_position_count"] == 0
     assert payload["recommended_preset"] is None
     assert opportunity_rows == []
     assert preset_rows[0]["no_signal_count"] == "2"
+
+
+def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:
+    preset = _selected_presets("confirmed_breakout")[0]
+    execution_batch = ManualExecutor().build_execution_batch([], as_of_date=date(2024, 1, 5))
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[],
+        selected_presets=[preset],
+        universe_symbols=["MU"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"confirmed_breakout": ("MU",)},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+    payload = summary.to_dict()
+
+    assert payload["relative_volume_confirmation_required"] is True
+    assert payload["relative_volume_policy"] == "required"
+    assert payload["relative_volume_policy_by_preset"] == {"confirmed_breakout": "required"}
+    assert payload["candidate_count"] == 0
+
+
+def test_daily_research_summary_reports_confirmed_conservative_breakout_rv_policy_in_header() -> None:
+    preset = _selected_presets("confirmed_conservative_breakout")[0]
+    execution_batch = ManualExecutor().build_execution_batch([], as_of_date=date(2024, 1, 5))
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[],
+        selected_presets=[preset],
+        universe_symbols=["MU"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"confirmed_conservative_breakout": ("MU",)},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+    payload = summary.to_dict()
+
+    assert payload["relative_volume_confirmation_required"] is True
+    assert payload["relative_volume_policy"] == "required"
+    assert payload["relative_volume_policy_by_preset"] == {
+        "confirmed_conservative_breakout": "required"
+    }
+    assert payload["selected_presets"][0]["preset_name"] == "confirmed_conservative_breakout"
 
 
 def test_daily_research_summary_exports_ranked_rows_and_preset_summaries(tmp_path: Path) -> None:
@@ -184,6 +231,44 @@ def test_daily_research_summary_exports_ranked_rows_and_preset_summaries(tmp_pat
     assert ranked_rows[0]["preset_name"] == "standard_breakout"
     assert ranked_rows[0]["status"] == "approved"
     assert ranked_rows[1]["rejection_reasons"] == "No averaging down is allowed for existing long positions."
+
+
+def test_daily_research_summary_includes_current_holdings_context_for_rejections() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    existing_position = ExistingPosition(
+        symbol="AAA",
+        shares=15,
+        average_entry_price=110.0,
+        current_stop=100.0,
+        preset_name="standard_breakout",
+        source="portfolio.csv",
+    )
+    rejected = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=False,
+        shares=0,
+        rejection_reasons=("No averaging down is allowed for existing long positions.",),
+        existing_position=existing_position,
+    )
+
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=ManualExecutor().build_execution_batch([], as_of_date=date(2024, 1, 5)),
+        evaluations=[rejected],
+        selected_presets=[preset],
+        universe_symbols=["AAA"],
+        current_positions=[existing_position],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+    payload = summary.to_dict()
+
+    assert payload["current_position_count"] == 1
+    assert payload["current_positions"][0]["symbol"] == "AAA"
+    assert payload["rejected_candidates"][0]["metadata"]["existing_position"]["current_stop"] == 100.0
 
 
 def test_daily_research_summary_labels_relative_volume_policy_in_rationale() -> None:
@@ -290,12 +375,15 @@ def test_cli_parser_exposes_daily_summary_command() -> None:
             "2024-01-05",
             "--preset-names",
             "standard_breakout,aggressive_breakout",
+            "--portfolio-file",
+            "data/processed/portfolio.csv",
         ]
     )
 
     assert args.command == "daily-summary"
     assert args.as_of == date(2024, 1, 5)
     assert args.preset_names == "standard_breakout,aggressive_breakout"
+    assert args.portfolio_file == Path("data/processed/portfolio.csv")
 
 
 def _evaluation(
@@ -310,6 +398,7 @@ def _evaluation(
     relative_volume_confirmed: bool | None = None,
     relative_volume_required: bool | None = None,
     rejection_reasons: tuple[str, ...] = (),
+    existing_position: ExistingPosition | None = None,
 ) -> PresetCandidateEvaluation:
     relative_volume_threshold = preset.relative_volume_threshold
     required = (
@@ -367,6 +456,7 @@ def _evaluation(
             sizing=sizing,
             approved=approved,
             rejection_reasons=rejection_reasons,
+            existing_position=existing_position,
         ),
     )
 
