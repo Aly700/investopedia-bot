@@ -131,8 +131,6 @@ def test_portfolio_rules_enforce_max_positions() -> None:
     result = evaluate_portfolio_rules(
         signal,
         current_positions=positions,
-        current_equity=100_000.0,
-        proposed_notional=10_000.0,
         constraints=constraints,
     )
 
@@ -152,8 +150,6 @@ def test_portfolio_rules_block_averaging_down() -> None:
     result = evaluate_portfolio_rules(
         signal,
         current_positions=positions,
-        current_equity=100_000.0,
-        proposed_notional=9_500.0,
         constraints=constraints,
     )
 
@@ -173,8 +169,6 @@ def test_portfolio_rules_block_duplicate_existing_holding() -> None:
     result = evaluate_portfolio_rules(
         signal,
         current_positions=positions,
-        current_equity=100_000.0,
-        proposed_notional=10_500.0,
         constraints=constraints,
     )
 
@@ -193,6 +187,30 @@ def test_drawdown_risk_adjustment_reduces_risk_budget() -> None:
     )
 
     assert adjusted_risk == pytest.approx(0.005)
+
+
+def test_drawdown_risk_adjustment_triggers_at_exact_threshold() -> None:
+    # The condition is current_drawdown >= threshold, so equality must trigger reduction.
+    adjusted_risk = apply_drawdown_risk_adjustment(
+        0.01,
+        current_drawdown=0.15,
+        threshold=0.15,
+        reduction_factor=0.5,
+    )
+
+    assert adjusted_risk == pytest.approx(0.005)
+
+
+def test_drawdown_risk_adjustment_does_not_trigger_just_below_threshold() -> None:
+    # One basis-point below threshold must leave risk unchanged.
+    adjusted_risk = apply_drawdown_risk_adjustment(
+        0.01,
+        current_drawdown=0.1499,
+        threshold=0.15,
+        reduction_factor=0.5,
+    )
+
+    assert adjusted_risk == pytest.approx(0.01)
 
 
 def test_assess_signal_candidate_combines_sizing_and_rules() -> None:

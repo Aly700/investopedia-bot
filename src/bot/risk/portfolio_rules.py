@@ -285,11 +285,15 @@ def evaluate_portfolio_rules(
     signal: StrategySignal,
     *,
     current_positions: Sequence[ExistingPosition],
-    current_equity: float,
-    proposed_notional: float,
     constraints: PortfolioConstraints,
 ) -> PortfolioRuleResult:
-    """Evaluate deterministic portfolio rules for a candidate position."""
+    """Evaluate deterministic portfolio rules for a candidate position.
+
+    Checks covered here: concurrent-position cap, no-averaging-down, and
+    duplicate-entry blocking.  The notional/position-size cap is enforced
+    upstream by ``size_position`` before this function is ever called, so it
+    is not re-checked here.
+    """
 
     reasons: list[str] = []
     existing_position = _find_existing_position(current_positions, signal.symbol)
@@ -297,11 +301,6 @@ def evaluate_portfolio_rules(
     is_new_symbol = existing_position is None
     if is_new_symbol and len(current_positions) >= constraints.max_concurrent_positions:
         reasons.append("Max concurrent positions reached.")
-
-    if constraints.max_position_pct_equity is not None:
-        notional_cap = current_equity * constraints.max_position_pct_equity
-        if proposed_notional > notional_cap:
-            reasons.append("Proposed position exceeds max position percent of equity.")
 
     if existing_position is not None and signal.side == "BUY":
         if (
@@ -375,8 +374,6 @@ def assess_signal_candidate(
         rule_result = evaluate_portfolio_rules(
             signal,
             current_positions=current_positions,
-            current_equity=current_equity,
-            proposed_notional=sizing.notional_value,
             constraints=constraints,
         )
         rejection_reasons.extend(rule_result.reasons)

@@ -357,6 +357,10 @@ def compute_breakout_features(
     ).shift(1)
     feature_frame["breakout"] = feature_frame["close"] > feature_frame["prior_high"]
     feature_frame["atr"] = atr(feature_frame, window=settings.atr_window)
+    # lag_average=1 shifts the rolling-average baseline back one bar before
+    # dividing, so today's volume is compared against the average of the N bars
+    # ending *yesterday*.  This keeps today's own volume out of its own
+    # baseline and prevents any look-ahead bias in the RV reading.
     feature_frame["relative_volume"] = relative_volume(
         feature_frame,
         settings.resolved_relative_volume_window,
