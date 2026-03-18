@@ -18,6 +18,17 @@ class PortfolioInputError(ValueError):
     """Raised when a portfolio input file is missing or malformed."""
 
 
+PORTFOLIO_SNAPSHOT_COLUMNS = (
+    "symbol",
+    "quantity",
+    "average_entry_price",
+    "current_stop",
+    "preset_name",
+    "source",
+    "metadata_json",
+)
+
+
 @dataclass(frozen=True)
 class ExistingPosition:
     """Minimal existing-position snapshot used by portfolio rules."""
@@ -167,6 +178,86 @@ def load_existing_positions(portfolio_path: Path) -> list[ExistingPosition]:
 
     _validate_unique_position_symbols(positions, source=resolved_path)
     return positions
+
+
+def initialize_portfolio_snapshot(
+    output_path: Path,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Create an empty portfolio snapshot in CSV or JSON format."""
+
+    return write_existing_positions_snapshot(
+        (),
+        output_path,
+        output_format=output_format,
+    )
+
+
+def write_existing_positions_snapshot(
+    positions: Sequence[ExistingPosition],
+    output_path: Path,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Write a portfolio snapshot in the same format consumed by ``--portfolio-file``."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_format = _resolve_snapshot_format(resolved_output_path, output_format)
+
+    ordered_positions = sorted(positions, key=lambda position: position.symbol)
+    _validate_unique_position_symbols(ordered_positions, source=resolved_output_path)
+
+    if resolved_format == "json":
+        resolved_output_path.write_text(
+            json.dumps(
+                {"positions": [position.to_dict() for position in ordered_positions]},
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return resolved_output_path
+
+    with resolved_output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_SNAPSHOT_COLUMNS)
+        writer.writeheader()
+        for position in ordered_positions:
+            writer.writerow(_position_record(position))
+    return resolved_output_path
+
+
+def upsert_existing_position_snapshot(
+    output_path: Path,
+    position: ExistingPosition,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Append a new holding or update an existing symbol in a portfolio snapshot."""
+
+    resolved_output_path = output_path.resolve()
+    if resolved_output_path.exists():
+        positions = load_existing_positions(resolved_output_path)
+    else:
+        positions = []
+
+    updated_positions: list[ExistingPosition] = []
+    replaced = False
+    for existing_position in positions:
+        if existing_position.symbol == position.symbol:
+            updated_positions.append(position)
+            replaced = True
+        else:
+            updated_positions.append(existing_position)
+    if not replaced:
+        updated_positions.append(position)
+
+    return write_existing_positions_snapshot(
+        updated_positions,
+        resolved_output_path,
+        output_format=output_format,
+    )
 
 
 def apply_drawdown_risk_adjustment(
@@ -477,3 +568,46 @@ def _extract_position_metadata(data: Mapping[str, Any]) -> dict[str, Any]:
             metadata.setdefault(key, value)
 
     return metadata
+
+
+def _position_record(position: ExistingPosition) -> dict[str, str]:
+    metadata_json = (
+        json.dumps(position.metadata, sort_keys=True)
+        if position.metadata
+        else ""
+    )
+    return {
+        "symbol": position.symbol,
+        "quantity": str(position.shares),
+        "average_entry_price": _format_optional_float(position.average_entry_price),
+        "current_stop": _format_optional_float(position.current_stop),
+        "preset_name": position.preset_name or "",
+        "source": position.source or "",
+        "metadata_json": metadata_json,
+    }
+
+
+def _resolve_snapshot_format(output_path: Path, output_format: str | None) -> str:
+    suffix_format = output_path.suffix.lower().lstrip(".")
+    normalized_output_format = output_format.strip().lower() if output_format is not None else None
+
+    if normalized_output_format is not None and normalized_output_format not in {"csv", "json"}:
+        raise PortfolioInputError("output_format must be either 'csv' or 'json'.")
+
+    if normalized_output_format is not None:
+        if suffix_format and suffix_format != normalized_output_format:
+            raise PortfolioInputError(
+                "output_format does not match the portfolio snapshot file extension."
+            )
+        return normalized_output_format
+
+    if suffix_format in {"csv", "json"}:
+        return suffix_format
+
+    raise PortfolioInputError("Portfolio snapshot paths must use a .csv or .json extension.")
+
+
+def _format_optional_float(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:.4f}".rstrip("0").rstrip(".")

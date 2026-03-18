@@ -13,7 +13,9 @@ from bot.risk.portfolio_rules import (
     apply_drawdown_risk_adjustment,
     assess_signal_candidate,
     evaluate_portfolio_rules,
+    initialize_portfolio_snapshot,
     load_existing_positions,
+    upsert_existing_position_snapshot,
 )
 from bot.risk.position_sizing import size_position
 from bot.risk.stops import atr_stop_distance, initial_stop_price, stop_distance, trailing_stop_reference
@@ -257,6 +259,71 @@ def test_load_existing_positions_rejects_duplicate_symbols(tmp_path: Path) -> No
 
     with pytest.raises(PortfolioInputError, match="duplicate symbols"):
         load_existing_positions(csv_path)
+
+
+def test_initialize_portfolio_snapshot_creates_empty_csv_and_json(tmp_path: Path) -> None:
+    csv_path = initialize_portfolio_snapshot(tmp_path / "portfolio.csv")
+    json_path = initialize_portfolio_snapshot(tmp_path / "portfolio.json")
+
+    assert load_existing_positions(csv_path) == []
+    assert load_existing_positions(json_path) == []
+    assert "symbol,quantity,average_entry_price" in csv_path.read_text(encoding="utf-8")
+    assert json.loads(json_path.read_text(encoding="utf-8")) == {"positions": []}
+
+
+def test_upsert_existing_position_snapshot_appends_and_updates_csv(tmp_path: Path) -> None:
+    csv_path = tmp_path / "portfolio.csv"
+    initialize_portfolio_snapshot(csv_path)
+
+    upsert_existing_position_snapshot(
+        csv_path,
+        ExistingPosition(
+            symbol="AAPL",
+            shares=10,
+            average_entry_price=150.0,
+            current_stop=145.0,
+            preset_name="standard_breakout",
+            source="manual",
+            metadata={"note": "swing"},
+        ),
+    )
+    upsert_existing_position_snapshot(
+        csv_path,
+        ExistingPosition(
+            symbol="AAPL",
+            shares=12,
+            average_entry_price=151.5,
+            current_stop=146.0,
+            preset_name="confirmed_breakout",
+            source="manual",
+            metadata={"note": "updated"},
+        ),
+    )
+    positions = load_existing_positions(csv_path)
+
+    assert len(positions) == 1
+    assert positions[0].shares == 12
+    assert positions[0].average_entry_price == pytest.approx(151.5)
+    assert positions[0].preset_name == "confirmed_breakout"
+    assert positions[0].metadata == {"note": "updated"}
+
+
+def test_upsert_existing_position_snapshot_appends_json(tmp_path: Path) -> None:
+    json_path = tmp_path / "portfolio.json"
+    initialize_portfolio_snapshot(json_path)
+
+    upsert_existing_position_snapshot(
+        json_path,
+        ExistingPosition(symbol="MSFT", shares=5, average_entry_price=300.0),
+    )
+    upsert_existing_position_snapshot(
+        json_path,
+        ExistingPosition(symbol="NVDA", shares=3, average_entry_price=900.0, current_stop=850.0),
+    )
+    positions = load_existing_positions(json_path)
+
+    assert [position.symbol for position in positions] == ["MSFT", "NVDA"]
+    assert positions[1].current_stop == pytest.approx(850.0)
 
 
 def _signal(*, symbol: str, entry_price: float, stop_price: float | None) -> StrategySignal:

@@ -158,6 +158,16 @@ Example JSON:
 }
 ```
 
+To create and maintain that snapshot locally:
+
+```bash
+investopedia-bot init-portfolio data/processed/portfolio/current_positions.csv
+investopedia-bot upsert-position data/processed/portfolio/current_positions.csv MU --quantity 50 --average-entry-price 96.25 --current-stop 90 --preset-name confirmed_breakout --source investopedia
+investopedia-bot upsert-position data/processed/portfolio/current_positions.json NVDA --quantity 10 --average-entry-price 870 --metadata-json '{"note":"starter"}'
+```
+
+`init-portfolio` creates an empty CSV or JSON snapshot compatible with `--portfolio-file`. `upsert-position` appends a new symbol or replaces the existing row/object for that symbol.
+
 ### Render manual orders from offline signals
 
 ```bash

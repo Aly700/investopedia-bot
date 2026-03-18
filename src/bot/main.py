@@ -64,7 +64,9 @@ from bot.risk.portfolio_rules import (
     PortfolioConstraints,
     PortfolioInputError,
     assess_signal_candidate,
+    initialize_portfolio_snapshot,
     load_existing_positions,
+    upsert_existing_position_snapshot,
 )
 from bot.strategy.breakout_momentum import (
     BreakoutMomentumSettings,
@@ -204,6 +206,89 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass local cache and force provider fetches.",
     )
     build_universe_parser.set_defaults(handler=_handle_build_universe)
+
+    init_portfolio_parser = subparsers.add_parser(
+        "init-portfolio",
+        help="Initialize an empty CSV or JSON portfolio snapshot.",
+    )
+    init_portfolio_parser.add_argument(
+        "output_path",
+        type=Path,
+        help="Path to the portfolio snapshot file to create.",
+    )
+    init_portfolio_parser.add_argument(
+        "--snapshot-format",
+        choices=("csv", "json"),
+        default=None,
+        help="Optional portfolio snapshot format override. Defaults to the file extension.",
+    )
+    init_portfolio_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    init_portfolio_parser.set_defaults(handler=_handle_init_portfolio)
+
+    upsert_position_parser = subparsers.add_parser(
+        "upsert-position",
+        help="Append or update one current holding in a CSV or JSON portfolio snapshot.",
+    )
+    upsert_position_parser.add_argument(
+        "portfolio_path",
+        type=Path,
+        help="Path to the portfolio snapshot file to update.",
+    )
+    upsert_position_parser.add_argument(
+        "symbol",
+        help="Ticker symbol for the holding to append or update.",
+    )
+    upsert_position_parser.add_argument(
+        "--quantity",
+        type=int,
+        required=True,
+        help="Current share quantity for the holding.",
+    )
+    upsert_position_parser.add_argument(
+        "--average-entry-price",
+        type=float,
+        required=True,
+        help="Average entry price for the holding.",
+    )
+    upsert_position_parser.add_argument(
+        "--current-stop",
+        type=float,
+        default=None,
+        help="Optional current stop level for the holding.",
+    )
+    upsert_position_parser.add_argument(
+        "--preset-name",
+        default=None,
+        help="Optional preset name associated with the position.",
+    )
+    upsert_position_parser.add_argument(
+        "--source",
+        default=None,
+        help="Optional source label for the position snapshot.",
+    )
+    upsert_position_parser.add_argument(
+        "--metadata-json",
+        default=None,
+        help="Optional JSON object string to store as position metadata.",
+    )
+    upsert_position_parser.add_argument(
+        "--snapshot-format",
+        choices=("csv", "json"),
+        default=None,
+        help="Optional portfolio snapshot format override. Defaults to the file extension.",
+    )
+    upsert_position_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    upsert_position_parser.set_defaults(handler=_handle_upsert_position)
 
     generate_orders_parser = subparsers.add_parser(
         "generate-orders",
@@ -738,6 +823,47 @@ def _handle_build_universe(args: argparse.Namespace) -> int:
 
     for member in members:
         print(member.symbol)
+    return 0
+
+
+def _handle_init_portfolio(args: argparse.Namespace) -> int:
+    written_path = initialize_portfolio_snapshot(
+        args.output_path,
+        output_format=args.snapshot_format,
+    )
+    payload = {
+        "portfolio_path": str(written_path),
+        "snapshot_format": written_path.suffix.lower().lstrip("."),
+        "position_count": 0,
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_upsert_position(args: argparse.Namespace) -> int:
+    position = ExistingPosition(
+        symbol=args.symbol.strip().upper(),
+        shares=int(args.quantity),
+        average_entry_price=float(args.average_entry_price),
+        current_stop=(None if args.current_stop is None else float(args.current_stop)),
+        preset_name=(args.preset_name.strip() if isinstance(args.preset_name, str) and args.preset_name.strip() else None),
+        source=(args.source.strip() if isinstance(args.source, str) and args.source.strip() else None),
+        metadata=_parse_metadata_json(args.metadata_json),
+    )
+    written_path = upsert_existing_position_snapshot(
+        args.portfolio_path,
+        position,
+        output_format=args.snapshot_format,
+    )
+    current_positions = load_existing_positions(written_path)
+    payload = {
+        "portfolio_path": str(written_path),
+        "snapshot_format": written_path.suffix.lower().lstrip("."),
+        "updated_symbol": position.symbol,
+        "position_count": len(current_positions),
+        "current_position_symbols": [current_position.symbol for current_position in current_positions],
+    }
+    _print_structured(payload, output_format=args.format)
     return 0
 
 
@@ -1727,6 +1853,18 @@ def _parse_text_list(raw_value: str | None) -> tuple[str, ...] | None:
     if not cleaned_values:
         raise ValueError("Text lists cannot be empty.")
     return cleaned_values
+
+
+def _parse_metadata_json(raw_value: str | None) -> dict[str, object]:
+    if raw_value is None or not raw_value.strip():
+        return {}
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--metadata-json must contain valid JSON.") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("--metadata-json must decode to a JSON object.")
+    return dict(payload)
 
 
 def _dataframe_records(frame: object) -> list[dict[str, object]]:

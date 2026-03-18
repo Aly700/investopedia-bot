@@ -386,6 +386,43 @@ def test_cli_parser_exposes_daily_summary_command() -> None:
     assert args.portfolio_file == Path("data/processed/portfolio.csv")
 
 
+def test_cli_parser_exposes_portfolio_snapshot_commands() -> None:
+    parser = build_parser()
+
+    init_args = parser.parse_args(
+        [
+            "init-portfolio",
+            "data/processed/portfolio/current_positions.json",
+            "--snapshot-format",
+            "json",
+        ]
+    )
+    upsert_args = parser.parse_args(
+        [
+            "upsert-position",
+            "data/processed/portfolio/current_positions.csv",
+            "AAPL",
+            "--quantity",
+            "10",
+            "--average-entry-price",
+            "150",
+            "--current-stop",
+            "145",
+            "--preset-name",
+            "standard_breakout",
+        ]
+    )
+
+    assert init_args.command == "init-portfolio"
+    assert init_args.output_path == Path("data/processed/portfolio/current_positions.json")
+    assert init_args.snapshot_format == "json"
+    assert upsert_args.command == "upsert-position"
+    assert upsert_args.portfolio_path == Path("data/processed/portfolio/current_positions.csv")
+    assert upsert_args.symbol == "AAPL"
+    assert upsert_args.quantity == 10
+    assert upsert_args.average_entry_price == 150.0
+
+
 def _evaluation(
     preset: BreakoutStrategyPreset,
     *,
