@@ -12,7 +12,12 @@ from bot.config import RiskConfig, SignalConfig
 from bot.indicators.trend import rolling_high
 from bot.indicators.volatility import atr
 from bot.indicators.volume import relative_volume
-from bot.strategy.regime_filter import BenchmarkRegimeSettings, RegimeFilterMode, regime_is_bullish
+from bot.strategy.regime_filter import (
+    VALID_REGIME_FILTER_MODES,
+    BenchmarkRegimeSettings,
+    RegimeFilterMode,
+    regime_is_bullish,
+)
 from bot.strategy.signal_models import StrategySignal
 
 
@@ -72,6 +77,11 @@ class BreakoutMomentumSettings:
             raise ValueError("trailing_stop_atr must be greater than zero.")
         if self.relative_volume_window is not None and self.relative_volume_window <= 0:
             raise ValueError("relative_volume_window must be greater than zero when provided.")
+        if self.regime_filter_mode not in VALID_REGIME_FILTER_MODES:
+            raise ValueError(
+                "regime_filter_mode must be one of "
+                f"{sorted(VALID_REGIME_FILTER_MODES)}, got '{self.regime_filter_mode}'."
+            )
 
     @property
     def resolved_relative_volume_window(self) -> int:
@@ -118,6 +128,11 @@ class BreakoutStrategyPreset:
             raise ValueError("trailing_stop_atr must be greater than zero.")
         if self.risk_per_trade <= 0:
             raise ValueError("risk_per_trade must be greater than zero.")
+        if self.regime_filter_mode not in VALID_REGIME_FILTER_MODES:
+            raise ValueError(
+                "regime_filter_mode must be one of "
+                f"{sorted(VALID_REGIME_FILTER_MODES)}, got '{self.regime_filter_mode}'."
+            )
 
     @classmethod
     def from_mapping(cls, name: str, data: Mapping[str, Any]) -> "BreakoutStrategyPreset":
@@ -276,7 +291,13 @@ def breakout_preset_from_cli_definition(raw_value: str) -> BreakoutStrategyPrese
     """Parse an inline CLI preset definition.
 
     Expected format:
-    ``name=my_preset,breakout_lookback=20,relative_volume_threshold=1.5,initial_stop_atr=2.5,trailing_stop_atr=3.0,risk_per_trade=0.01``
+    ``name=my_preset,breakout_lookback=20,relative_volume_threshold=1.5,initial_stop_atr=2.5,trailing_stop_atr=3.0,risk_per_trade=0.01,regime_filter_mode=fast_above_slow``
+
+    Optional fields:
+    ``require_relative_volume_confirmation=true|false`` and
+    ``regime_filter_mode=close_above_slow|fast_above_slow|either``.
+    Valid ``regime_filter_mode`` values are ``close_above_slow``,
+    ``fast_above_slow``, and ``either``. These values are case-insensitive.
     """
 
     cleaned = raw_value.strip()
@@ -571,17 +592,14 @@ def _mapping_bool(
     raise ValueError(f"Preset field '{key}' must be a boolean.")
 
 
-_VALID_REGIME_MODES: frozenset[str] = frozenset({"close_above_slow", "fast_above_slow", "either"})
-
-
 def _mapping_regime_filter_mode(data: Mapping[str, Any]) -> RegimeFilterMode:
     key = "regime_filter_mode"
     if key not in data:
         return "either"
-    value = str(data[key]).strip()
-    if value not in _VALID_REGIME_MODES:
+    value = str(data[key]).strip().lower()
+    if value not in VALID_REGIME_FILTER_MODES:
         raise ValueError(
-            f"Preset field '{key}' must be one of {sorted(_VALID_REGIME_MODES)}, got '{value}'."
+            f"Preset field '{key}' must be one of {sorted(VALID_REGIME_FILTER_MODES)}, got '{value}'."
         )
     return value  # type: ignore[return-value]
 

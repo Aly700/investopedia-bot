@@ -15,6 +15,7 @@ from bot.main import _parse_text_list, build_parser
 from bot.strategy.breakout_momentum import (
     BreakoutMomentumSettings,
     BreakoutStrategyPreset,
+    breakout_preset_from_cli_definition,
     build_default_breakout_presets,
     resolve_breakout_strategy_presets,
 )
@@ -51,6 +52,28 @@ def test_resolve_breakout_strategy_presets_supports_defaults_config_and_cli() ->
     assert presets[1].require_relative_volume_confirmation is True
     assert presets[2].risk_per_trade == pytest.approx(0.015)
     assert presets[2].require_relative_volume_confirmation is False
+
+
+def test_resolve_breakout_strategy_presets_propagates_configured_regime_filter_mode() -> None:
+    presets = resolve_breakout_strategy_presets(
+        _signal_config(),
+        _risk_config(),
+        configured_presets={
+            "config_regime": {
+                "breakout_lookback": 30,
+                "relative_volume_threshold": 1.7,
+                "initial_stop_atr": 2.7,
+                "trailing_stop_atr": 3.3,
+                "risk_per_trade": 0.008,
+                "regime_filter_mode": "fast_above_slow",
+            }
+        },
+        preset_names=("config_regime",),
+    )
+
+    assert len(presets) == 1
+    assert presets[0].name == "config_regime"
+    assert presets[0].regime_filter_mode == "fast_above_slow"
 
 
 def test_build_default_breakout_presets_exposes_named_variants() -> None:
@@ -150,7 +173,15 @@ def test_build_strategy_comparison_frame_returns_expected_schema() -> None:
 
     assert tuple(frame.columns) == COMPARISON_COLUMNS
     assert frame.iloc[0]["preset_name"] == "standard_breakout"
+    assert frame.iloc[0]["regime_filter_mode"] == "either"
     assert frame.iloc[0]["trade_count"] == 3
+
+
+def test_build_strategy_comparison_frame_preserves_regime_filter_mode() -> None:
+    frame = build_strategy_comparison_frame([_comparison_row("aggressive_breakout")])
+
+    assert "regime_filter_mode" in frame.columns
+    assert frame.iloc[0]["regime_filter_mode"] == "fast_above_slow"
 
 
 def test_rank_strategy_comparisons_handles_no_trade_rows_cleanly() -> None:
@@ -325,6 +356,144 @@ def test_aggressive_breakout_apply_to_settings_sets_fast_above_slow() -> None:
 
     assert applied.regime_filter_mode == "fast_above_slow"
     assert applied.regime_settings.mode == "fast_above_slow"
+
+
+def test_breakout_preset_from_cli_definition_parses_regime_filter_mode() -> None:
+    preset = breakout_preset_from_cli_definition(
+        "name=cli_regime,breakout_lookback=12,relative_volume_threshold=1.2,"
+        "initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.015,"
+        "regime_filter_mode=fast_above_slow"
+    )
+
+    assert preset.name == "cli_regime"
+    assert preset.regime_filter_mode == "fast_above_slow"
+
+
+def test_breakout_preset_from_cli_definition_parses_regime_filter_mode_case_insensitively() -> None:
+    preset = breakout_preset_from_cli_definition(
+        "name=cli_regime_upper,breakout_lookback=12,relative_volume_threshold=1.2,"
+        "initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.015,"
+        "regime_filter_mode=FAST_ABOVE_SLOW"
+    )
+
+    assert preset.regime_filter_mode == "fast_above_slow"
+
+
+def test_breakout_preset_from_cli_definition_defaults_regime_filter_mode_to_either() -> None:
+    preset = breakout_preset_from_cli_definition(
+        "name=cli_default,breakout_lookback=12,relative_volume_threshold=1.2,"
+        "initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.015"
+    )
+
+    assert preset.regime_filter_mode == "either"
+
+
+def test_breakout_preset_from_cli_definition_rejects_invalid_regime_filter_mode() -> None:
+    with pytest.raises(ValueError, match="regime_filter_mode"):
+        breakout_preset_from_cli_definition(
+            "name=cli_invalid,breakout_lookback=12,relative_volume_threshold=1.2,"
+            "initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.015,"
+            "regime_filter_mode=bad_mode"
+        )
+
+
+def test_breakout_strategy_preset_from_mapping_parses_regime_filter_mode() -> None:
+    preset = BreakoutStrategyPreset.from_mapping(
+        "mapped_regime",
+        {
+            "breakout_lookback": 25,
+            "relative_volume_threshold": 1.6,
+            "initial_stop_atr": 2.5,
+            "trailing_stop_atr": 3.0,
+            "risk_per_trade": 0.01,
+            "regime_filter_mode": "close_above_slow",
+        },
+    )
+
+    assert preset.regime_filter_mode == "close_above_slow"
+
+
+def test_breakout_strategy_preset_from_mapping_parses_regime_filter_mode_case_insensitively() -> None:
+    preset = BreakoutStrategyPreset.from_mapping(
+        "mapped_regime_upper",
+        {
+            "breakout_lookback": 25,
+            "relative_volume_threshold": 1.6,
+            "initial_stop_atr": 2.5,
+            "trailing_stop_atr": 3.0,
+            "risk_per_trade": 0.01,
+            "regime_filter_mode": "FAST_ABOVE_SLOW",
+        },
+    )
+
+    assert preset.regime_filter_mode == "fast_above_slow"
+
+
+def test_breakout_strategy_preset_from_mapping_defaults_regime_filter_mode_to_either() -> None:
+    preset = BreakoutStrategyPreset.from_mapping(
+        "mapped_default",
+        {
+            "breakout_lookback": 25,
+            "relative_volume_threshold": 1.6,
+            "initial_stop_atr": 2.5,
+            "trailing_stop_atr": 3.0,
+            "risk_per_trade": 0.01,
+        },
+    )
+
+    assert preset.regime_filter_mode == "either"
+
+
+def test_breakout_strategy_preset_from_mapping_rejects_invalid_regime_filter_mode() -> None:
+    with pytest.raises(ValueError, match="regime_filter_mode"):
+        BreakoutStrategyPreset.from_mapping(
+            "mapped_invalid",
+            {
+                "breakout_lookback": 25,
+                "relative_volume_threshold": 1.6,
+                "initial_stop_atr": 2.5,
+                "trailing_stop_atr": 3.0,
+                "risk_per_trade": 0.01,
+                "regime_filter_mode": "bad_mode",
+            },
+        )
+
+
+def test_breakout_strategy_preset_parameter_id_contains_regime_mode() -> None:
+    preset = BreakoutStrategyPreset(
+        name="regime_id",
+        breakout_lookback=20,
+        relative_volume_threshold=1.5,
+        initial_stop_atr=2.5,
+        trailing_stop_atr=3.0,
+        risk_per_trade=0.01,
+        regime_filter_mode="fast_above_slow",
+    )
+
+    assert "regime=fast_above_slow" in preset.parameter_id
+
+
+def test_breakout_strategy_preset_parameter_id_changes_when_only_regime_mode_differs() -> None:
+    either_preset = BreakoutStrategyPreset(
+        name="regime_either",
+        breakout_lookback=20,
+        relative_volume_threshold=1.5,
+        initial_stop_atr=2.5,
+        trailing_stop_atr=3.0,
+        risk_per_trade=0.01,
+        regime_filter_mode="either",
+    )
+    fast_preset = BreakoutStrategyPreset(
+        name="regime_fast",
+        breakout_lookback=20,
+        relative_volume_threshold=1.5,
+        initial_stop_atr=2.5,
+        trailing_stop_atr=3.0,
+        risk_per_trade=0.01,
+        regime_filter_mode="fast_above_slow",
+    )
+
+    assert either_preset.parameter_id != fast_preset.parameter_id
 
 
 def _signal_config() -> SignalConfig:
