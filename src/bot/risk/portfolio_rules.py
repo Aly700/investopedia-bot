@@ -27,6 +27,12 @@ PORTFOLIO_SNAPSHOT_COLUMNS = (
     "source",
     "metadata_json",
 )
+PORTFOLIO_REVIEW_ACTIONS = (
+    "HOLD",
+    "WATCH CLOSELY",
+    "RAISE STOP",
+    "EXIT CANDIDATE",
+)
 
 
 @dataclass(frozen=True)
@@ -159,6 +165,28 @@ class RiskAssessedCandidate:
     approved: bool
     rejection_reasons: tuple[str, ...] = ()
     existing_position: ExistingPosition | None = None
+
+
+@dataclass(frozen=True)
+class PortfolioReviewDecision:
+    """Deterministic position-management suggestion for one open holding."""
+
+    latest_close: float
+    unrealized_pl_pct: float
+    distance_to_stop_pct: float | None
+    regime_passed: bool | None
+    above_entry: bool
+    suggested_action: str
+    suggested_stop: float | None = None
+    trailing_stop_candidate: float | None = None
+    rationale: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.suggested_action not in PORTFOLIO_REVIEW_ACTIONS:
+            raise ValueError(
+                f"suggested_action must be one of {PORTFOLIO_REVIEW_ACTIONS}, "
+                f"got '{self.suggested_action}'."
+            )
 
 
 def load_existing_positions(portfolio_path: Path) -> list[ExistingPosition]:
@@ -325,6 +353,87 @@ def remove_existing_position_snapshot(
     )
 
 
+def suggest_long_stop_update(
+    *,
+    current_stop: float | None,
+    trailing_stop_candidate: float | None,
+) -> float | None:
+    """Return a higher long stop when the trailing candidate improves it."""
+
+    if trailing_stop_candidate is None:
+        return None
+    _validate_finite_positive(trailing_stop_candidate, name="trailing_stop_candidate")
+    if current_stop is None:
+        return trailing_stop_candidate
+    _validate_finite_positive(current_stop, name="current_stop")
+    if trailing_stop_candidate > current_stop:
+        return trailing_stop_candidate
+    return None
+
+
+def review_existing_long_position(
+    position: ExistingPosition,
+    *,
+    latest_close: float,
+    regime_passed: bool | None,
+    trailing_stop_candidate: float | None = None,
+    watch_distance_pct: float = 0.03,
+) -> PortfolioReviewDecision:
+    """Review one long position and suggest a simple management action."""
+
+    _validate_finite_positive(latest_close, name="latest_close")
+    _validate_finite_non_negative(watch_distance_pct, name="watch_distance_pct")
+
+    unrealized_pl_pct = (latest_close / position.average_entry_price) - 1.0
+    above_entry = latest_close >= position.average_entry_price
+    distance_to_stop_pct: float | None = None
+    if position.current_stop is not None:
+        distance_to_stop_pct = (latest_close - position.current_stop) / latest_close
+
+    suggested_stop = suggest_long_stop_update(
+        current_stop=position.current_stop,
+        trailing_stop_candidate=trailing_stop_candidate,
+    )
+    rationale: list[str] = []
+
+    if position.current_stop is not None and latest_close <= position.current_stop:
+        rationale.append("Latest close is at or below the current stop.")
+        action = "EXIT CANDIDATE"
+    elif regime_passed is False and not above_entry:
+        rationale.append("Benchmark regime is weak and the position is below the average entry price.")
+        action = "EXIT CANDIDATE"
+    elif suggested_stop is not None:
+        rationale.append("Trailing-stop logic supports a higher stop without lowering risk control.")
+        action = "RAISE STOP"
+    elif (
+        (distance_to_stop_pct is not None and distance_to_stop_pct <= watch_distance_pct)
+        or regime_passed is False
+        or not above_entry
+    ):
+        if distance_to_stop_pct is not None and distance_to_stop_pct <= watch_distance_pct:
+            rationale.append("Latest close is close to the current stop.")
+        if regime_passed is False:
+            rationale.append("Benchmark regime filter is not currently passing.")
+        if not above_entry:
+            rationale.append("Position is below the average entry price.")
+        action = "WATCH CLOSELY"
+    else:
+        rationale.append("Position remains above entry and sufficiently above the current stop.")
+        action = "HOLD"
+
+    return PortfolioReviewDecision(
+        latest_close=latest_close,
+        unrealized_pl_pct=unrealized_pl_pct,
+        distance_to_stop_pct=distance_to_stop_pct,
+        regime_passed=regime_passed,
+        above_entry=above_entry,
+        suggested_action=action,
+        suggested_stop=suggested_stop,
+        trailing_stop_candidate=trailing_stop_candidate,
+        rationale=tuple(rationale),
+    )
+
+
 def apply_drawdown_risk_adjustment(
     base_risk_per_trade: float,
     *,
@@ -472,6 +581,13 @@ def _validate_finite_non_negative(value: float, *, name: str) -> None:
         raise ValueError(f"{name} must be finite.")
     if value < 0:
         raise ValueError(f"{name} must be non-negative.")
+
+
+def _validate_finite_positive(value: float, *, name: str) -> None:
+    if not isfinite(value):
+        raise ValueError(f"{name} must be finite.")
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero.")
 
 
 def _load_existing_positions_from_csv(portfolio_path: Path) -> list[ExistingPosition]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass, field
 from datetime import date
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -69,6 +70,23 @@ DAILY_PRESET_SUMMARY_COLUMNS = (
     "top_symbol",
     "approved_symbols",
     "rejected_symbols",
+)
+PORTFOLIO_REVIEW_COLUMNS = (
+    "date",
+    "symbol",
+    "quantity",
+    "average_entry_price",
+    "current_stop",
+    "suggested_stop",
+    "latest_close",
+    "unrealized_pl_pct",
+    "distance_to_stop_pct",
+    "regime_passed",
+    "above_entry",
+    "suggested_action",
+    "preset_name",
+    "rationale",
+    "metadata_json",
 )
 
 
@@ -354,6 +372,144 @@ class DailyResearchSummary:
             "ranked_opportunities": [row.to_dict() for row in self.rows],
             "suggested_order_sheet": self.execution_batch.to_dict(),
         }
+
+
+@dataclass(frozen=True)
+class PortfolioReviewRow:
+    """One portfolio-management review row for an open holding."""
+
+    date: date
+    symbol: str
+    quantity: int
+    average_entry_price: float
+    current_stop: float | None
+    suggested_stop: float | None
+    latest_close: float
+    unrealized_pl_pct: float
+    distance_to_stop_pct: float | None
+    regime_passed: bool | None
+    above_entry: bool
+    suggested_action: str
+    preset_name: str | None
+    rationale: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation of the review row."""
+
+        return {
+            "date": self.date.isoformat(),
+            "symbol": self.symbol,
+            "quantity": self.quantity,
+            "average_entry_price": self.average_entry_price,
+            "current_stop": self.current_stop,
+            "suggested_stop": self.suggested_stop,
+            "latest_close": self.latest_close,
+            "unrealized_pl_pct": self.unrealized_pl_pct,
+            "distance_to_stop_pct": self.distance_to_stop_pct,
+            "regime_passed": self.regime_passed,
+            "above_entry": self.above_entry,
+            "suggested_action": self.suggested_action,
+            "preset_name": self.preset_name,
+            "rationale": self.rationale,
+            "metadata": dict(self.metadata),
+        }
+
+    def to_record(self) -> dict[str, str]:
+        """Return a CSV-friendly representation of the review row."""
+
+        return {
+            "date": self.date.isoformat(),
+            "symbol": self.symbol,
+            "quantity": str(self.quantity),
+            "average_entry_price": _format_optional_float(self.average_entry_price),
+            "current_stop": _format_optional_float(self.current_stop),
+            "suggested_stop": _format_optional_float(self.suggested_stop),
+            "latest_close": _format_optional_float(self.latest_close),
+            "unrealized_pl_pct": _format_optional_float(self.unrealized_pl_pct),
+            "distance_to_stop_pct": _format_optional_float(self.distance_to_stop_pct),
+            "regime_passed": _format_optional_bool(self.regime_passed),
+            "above_entry": _format_optional_bool(self.above_entry),
+            "suggested_action": self.suggested_action,
+            "preset_name": self.preset_name or "",
+            "rationale": self.rationale,
+            "metadata_json": json.dumps(self.metadata, sort_keys=True),
+        }
+
+
+@dataclass(frozen=True)
+class PortfolioReviewReport:
+    """Daily portfolio-management review for currently open holdings."""
+
+    as_of_date: date
+    generated_at_utc: str
+    benchmark_symbol: str | None
+    current_positions: tuple[ExistingPosition, ...]
+    rows: tuple[PortfolioReviewRow, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly review report payload."""
+
+        return {
+            "as_of_date": self.as_of_date.isoformat(),
+            "generated_at_utc": self.generated_at_utc,
+            "benchmark_symbol": self.benchmark_symbol,
+            "position_count": len(self.current_positions),
+            "reviewed_symbol_count": len(self.rows),
+            "reviewed_symbols": [row.symbol for row in self.rows],
+            "current_position_symbols": [position.symbol for position in self.current_positions],
+            "current_positions": [position.to_dict() for position in self.current_positions],
+            "hold_count": sum(row.suggested_action == "HOLD" for row in self.rows),
+            "watch_closely_count": sum(row.suggested_action == "WATCH CLOSELY" for row in self.rows),
+            "raise_stop_count": sum(row.suggested_action == "RAISE STOP" for row in self.rows),
+            "exit_candidate_count": sum(row.suggested_action == "EXIT CANDIDATE" for row in self.rows),
+            "rows": [row.to_dict() for row in self.rows],
+        }
+
+
+def build_portfolio_review_report(
+    *,
+    as_of_date: date,
+    rows: Sequence[PortfolioReviewRow],
+    current_positions: Sequence[ExistingPosition],
+    benchmark_symbol: str | None = None,
+) -> PortfolioReviewReport:
+    """Build a portfolio review report from row-level management suggestions."""
+
+    return PortfolioReviewReport(
+        as_of_date=as_of_date,
+        generated_at_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        benchmark_symbol=benchmark_symbol,
+        current_positions=tuple(current_positions),
+        rows=tuple(rows),
+    )
+
+
+def write_portfolio_review_report(
+    report: PortfolioReviewReport,
+    output_path: Path,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Write a portfolio review report to CSV or JSON."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_format = _resolve_output_format(resolved_output_path, output_format)
+
+    if resolved_format == "json":
+        resolved_output_path.write_text(
+            json.dumps(report.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return resolved_output_path
+
+    with resolved_output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_REVIEW_COLUMNS)
+        writer.writeheader()
+        for row in report.rows:
+            writer.writerow(row.to_record())
+    return resolved_output_path
 
 
 @dataclass(frozen=True)
@@ -883,6 +1039,12 @@ def _format_optional_float(value: float | None) -> str:
     if value is None:
         return ""
     return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def _format_optional_bool(value: bool | None) -> str:
+    if value is None:
+        return ""
+    return "true" if value else "false"
 
 
 def _optional_float(value: Any) -> float | None:

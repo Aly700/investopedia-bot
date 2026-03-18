@@ -10,11 +10,13 @@ from bot.risk.portfolio_rules import (
     ExistingPosition,
     PortfolioConstraints,
     PortfolioInputError,
+    PORTFOLIO_REVIEW_ACTIONS,
     apply_drawdown_risk_adjustment,
     assess_signal_candidate,
     evaluate_portfolio_rules,
     initialize_portfolio_snapshot,
     load_existing_positions,
+    review_existing_long_position,
     remove_existing_position_snapshot,
     update_existing_position_stop_snapshot,
     upsert_existing_position_snapshot,
@@ -470,6 +472,86 @@ def test_remove_existing_position_snapshot_errors_for_missing_symbol(tmp_path: P
 
     with pytest.raises(PortfolioInputError, match="does not exist"):
         remove_existing_position_snapshot(json_path, "AAPL")
+
+
+def test_review_existing_long_position_with_one_holding_returns_hold() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=110.0,
+        regime_passed=True,
+        trailing_stop_candidate=88.0,
+    )
+
+    assert decision.suggested_action == "HOLD"
+    assert decision.suggested_action in PORTFOLIO_REVIEW_ACTIONS
+    assert decision.unrealized_pl_pct == pytest.approx(0.10)
+    assert decision.distance_to_stop_pct == pytest.approx((110.0 - 90.0) / 110.0)
+    assert decision.above_entry is True
+    assert decision.suggested_stop is None
+
+
+def test_review_existing_long_position_suggests_raise_stop() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=112.0,
+        regime_passed=True,
+        trailing_stop_candidate=101.0,
+    )
+
+    assert decision.suggested_action == "RAISE STOP"
+    assert decision.suggested_stop == pytest.approx(101.0)
+
+
+def test_review_existing_long_position_does_not_lower_stop() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=98.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=110.0,
+        regime_passed=True,
+        trailing_stop_candidate=96.0,
+    )
+
+    assert decision.suggested_stop is None
+    assert decision.suggested_action == "HOLD"
+
+
+def test_review_existing_long_position_suggests_exit_candidate() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=96.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=95.0,
+        regime_passed=False,
+        trailing_stop_candidate=97.0,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert "current stop" in " ".join(decision.rationale).lower()
 
 
 def _signal(*, symbol: str, entry_price: float, stop_price: float | None) -> StrategySignal:

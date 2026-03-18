@@ -196,6 +196,23 @@ def test_cli_parser_exposes_generate_orders_command() -> None:
     assert args.portfolio_file == Path("data/processed/portfolio.json")
 
 
+def test_cli_parser_exposes_review_portfolio_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "review-portfolio",
+            "--portfolio-file",
+            "data/processed/portfolio.json",
+            "--as-of",
+            "2024-01-05",
+        ]
+    )
+
+    assert args.command == "review-portfolio"
+    assert args.as_of == date(2024, 1, 5)
+    assert args.portfolio_file == Path("data/processed/portfolio.json")
+
+
 def _candidate(
     *,
     symbol: str,

@@ -9,8 +9,11 @@ from bot.execution.manual_executor import ManualExecutor
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
 from bot.reporting.daily_report import (
     PresetCandidateEvaluation,
+    PortfolioReviewRow,
     build_daily_research_summary,
+    build_portfolio_review_report,
     write_daily_preset_summary,
+    write_portfolio_review_report,
     write_daily_research_summary,
 )
 from bot.risk.portfolio_rules import ExistingPosition, RiskAssessedCandidate
@@ -144,6 +147,53 @@ def test_daily_research_summary_handles_empty_no_signal_days(tmp_path: Path) -> 
     assert payload["recommended_preset"] is None
     assert opportunity_rows == []
     assert preset_rows[0]["no_signal_count"] == "2"
+
+
+def test_portfolio_review_report_exports_one_holding(tmp_path: Path) -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        preset_name="standard_breakout",
+    )
+    row = PortfolioReviewRow(
+        date=date(2024, 1, 5),
+        symbol="AAPL",
+        quantity=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        suggested_stop=101.0,
+        latest_close=110.0,
+        unrealized_pl_pct=0.10,
+        distance_to_stop_pct=(110.0 - 95.0) / 110.0,
+        regime_passed=True,
+        above_entry=True,
+        suggested_action="RAISE STOP",
+        preset_name="standard_breakout",
+        rationale="Trailing-stop logic supports a higher stop.",
+        metadata={"trailing_stop_candidate": 101.0},
+    )
+    report = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        rows=[row],
+        current_positions=[position],
+        benchmark_symbol="SPY",
+    )
+
+    json_path = write_portfolio_review_report(report, tmp_path / "portfolio_review.json")
+    csv_path = write_portfolio_review_report(report, tmp_path / "portfolio_review.csv")
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert payload["position_count"] == 1
+    assert payload["raise_stop_count"] == 1
+    assert payload["reviewed_symbols"] == ["AAPL"]
+    assert payload["rows"][0]["suggested_action"] == "RAISE STOP"
+    assert rows[0]["symbol"] == "AAPL"
+    assert rows[0]["suggested_stop"] == "101"
 
 
 def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:

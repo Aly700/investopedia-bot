@@ -47,13 +47,17 @@ from bot.execution.manual_executor import (
     write_execution_batch,
     write_manual_order_sheet,
 )
+from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
 from bot.reporting.daily_report import (
     PresetCandidateEvaluation,
+    PortfolioReviewRow,
     build_daily_research_summary,
+    build_portfolio_review_report,
     build_daily_signal_report,
     rank_preset_candidate_evaluations,
     write_daily_preset_summary,
+    write_portfolio_review_report,
     write_daily_research_summary,
     write_daily_signal_report,
 )
@@ -67,15 +71,18 @@ from bot.risk.portfolio_rules import (
     initialize_portfolio_snapshot,
     load_existing_positions,
     remove_existing_position_snapshot,
+    review_existing_long_position,
     update_existing_position_stop_snapshot,
     upsert_existing_position_snapshot,
 )
+from bot.risk.stops import trailing_stop_reference
 from bot.strategy.breakout_momentum import (
     BreakoutMomentumSettings,
     BreakoutStrategyPreset,
     generate_breakout_signal,
     resolve_breakout_strategy_presets,
 )
+from bot.strategy.regime_filter import regime_is_bullish
 
 
 LOGGER = get_logger(__name__)
@@ -351,6 +358,46 @@ def build_parser() -> argparse.ArgumentParser:
         help="Console summary output format.",
     )
     remove_position_parser.set_defaults(handler=_handle_remove_position)
+
+    review_portfolio_parser = subparsers.add_parser(
+        "review-portfolio",
+        help="Review current holdings and suggest simple stop/exit management actions.",
+    )
+    review_portfolio_parser.add_argument(
+        "--portfolio-file",
+        type=Path,
+        required=True,
+        help="CSV or JSON portfolio snapshot to review.",
+    )
+    review_portfolio_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Right edge of the portfolio review window.",
+    )
+    review_portfolio_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter review.",
+    )
+    review_portfolio_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for portfolio review CSV and JSON outputs.",
+    )
+    review_portfolio_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    review_portfolio_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    review_portfolio_parser.set_defaults(handler=_handle_review_portfolio)
 
     generate_orders_parser = subparsers.add_parser(
         "generate-orders",
@@ -961,6 +1008,123 @@ def _handle_remove_position(args: argparse.Namespace) -> int:
         "removed_symbol": args.symbol.strip().upper(),
         "position_count": len(current_positions),
         "current_position_symbols": [current_position.symbol for current_position in current_positions],
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_review_portfolio(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    current_positions = _load_current_positions(args.portfolio_file)
+    output_dir = (args.output_dir or _default_daily_output_dir(config.project_root, args.as_of)).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    benchmark_symbol_override = (
+        args.benchmark_symbol.strip().upper()
+        if isinstance(args.benchmark_symbol, str) and args.benchmark_symbol.strip()
+        else None
+    )
+
+    if not current_positions:
+        empty_report = build_portfolio_review_report(
+            as_of_date=args.as_of,
+            rows=[],
+            current_positions=[],
+            benchmark_symbol=benchmark_symbol_override,
+        )
+        review_json_path = write_portfolio_review_report(
+            empty_report,
+            output_dir / "portfolio_review.json",
+        )
+        review_csv_path = write_portfolio_review_report(
+            empty_report,
+            output_dir / "portfolio_review.csv",
+        )
+        payload = {
+            "portfolio_path": str(args.portfolio_file.resolve()),
+            "position_count": 0,
+            "symbols_reviewed": [],
+            "hold_count": 0,
+            "watch_closely_count": 0,
+            "raise_stop_count": 0,
+            "exit_candidate_count": 0,
+            "outputs": {
+                "portfolio_review_json": str(review_json_path),
+                "portfolio_review_csv": str(review_csv_path),
+            },
+        }
+        _print_structured(payload, output_format=args.format)
+        return 0
+
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    preset_catalog = _portfolio_review_preset_catalog(args, config)
+    base_settings = BreakoutMomentumSettings.from_configs(
+        config.strategy.signals,
+        config.strategy.risk,
+    )
+    if benchmark_symbol_override is not None:
+        base_settings = replace(base_settings, benchmark_symbol=benchmark_symbol_override)
+
+    position_plans = [
+        _build_portfolio_review_plan(
+            position,
+            preset_catalog=preset_catalog,
+            base_settings=base_settings,
+            as_of_date=args.as_of,
+        )
+        for position in current_positions
+    ]
+
+    benchmark_symbol = (
+        base_settings.benchmark_symbol
+        if any(plan["settings"].enable_regime_filter for plan in position_plans)
+        else None
+    )
+    benchmark_frame = None
+    if benchmark_symbol is not None:
+        earliest_fetch_start = min(plan["fetch_start"] for plan in position_plans)
+        benchmark_frame = provider.fetch_daily_bars(
+            benchmark_symbol,
+            earliest_fetch_start,
+            args.as_of,
+            refresh_cache=args.refresh_cache,
+        )
+        if benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
+            )
+
+    rows = [
+        _build_portfolio_review_row(
+            plan,
+            provider=provider,
+            as_of_date=args.as_of,
+            benchmark_frame=benchmark_frame,
+            refresh_cache=args.refresh_cache,
+        )
+        for plan in position_plans
+    ]
+    report = build_portfolio_review_report(
+        as_of_date=args.as_of,
+        rows=rows,
+        current_positions=current_positions,
+        benchmark_symbol=benchmark_symbol,
+    )
+    review_json_path = write_portfolio_review_report(report, output_dir / "portfolio_review.json")
+    review_csv_path = write_portfolio_review_report(report, output_dir / "portfolio_review.csv")
+    report_payload = report.to_dict()
+    payload = {
+        "portfolio_path": str(args.portfolio_file.resolve()),
+        "position_count": len(current_positions),
+        "symbols_reviewed": report_payload["reviewed_symbols"],
+        "hold_count": report_payload["hold_count"],
+        "watch_closely_count": report_payload["watch_closely_count"],
+        "raise_stop_count": report_payload["raise_stop_count"],
+        "exit_candidate_count": report_payload["exit_candidate_count"],
+        "outputs": {
+            "portfolio_review_json": str(review_json_path),
+            "portfolio_review_csv": str(review_csv_path),
+        },
     }
     _print_structured(payload, output_format=args.format)
     return 0
@@ -1676,6 +1840,203 @@ def _default_order_output_path(project_root: Path, as_of_date: date) -> Path:
 
 def _default_daily_output_dir(project_root: Path, as_of_date: date) -> Path:
     return project_root / "data" / "processed" / "daily" / as_of_date.isoformat()
+
+
+def _portfolio_review_preset_catalog(
+    args: argparse.Namespace,
+    config: AppConfig,
+) -> dict[str, BreakoutStrategyPreset]:
+    configured_presets = _load_strategy_comparison_presets(args.config_dir)
+    presets = resolve_breakout_strategy_presets(
+        config.strategy.signals,
+        config.strategy.risk,
+        configured_presets=configured_presets,
+    )
+    return {preset.name: preset for preset in presets}
+
+
+def _resolve_portfolio_review_preset(
+    position: ExistingPosition,
+    preset_catalog: dict[str, BreakoutStrategyPreset],
+) -> tuple[BreakoutStrategyPreset, str]:
+    default_preset = preset_catalog.get("standard_breakout")
+    if default_preset is None:
+        default_preset = next(iter(preset_catalog.values()))
+
+    requested_name = (
+        position.preset_name.strip()
+        if isinstance(position.preset_name, str) and position.preset_name.strip()
+        else None
+    )
+    if requested_name is None:
+        return default_preset, "default_standard_breakout"
+
+    preset = preset_catalog.get(requested_name)
+    if preset is None:
+        return default_preset, f"fallback_default_standard_breakout:{requested_name}"
+    return preset, "portfolio_snapshot"
+
+
+def _build_portfolio_review_plan(
+    position: ExistingPosition,
+    *,
+    preset_catalog: dict[str, BreakoutStrategyPreset],
+    base_settings: BreakoutMomentumSettings,
+    as_of_date: date,
+) -> dict[str, object]:
+    preset, preset_resolution = _resolve_portfolio_review_preset(position, preset_catalog)
+    settings = preset.apply_to_settings(base_settings)
+    return {
+        "position": position,
+        "preset": preset,
+        "preset_resolution": preset_resolution,
+        "settings": settings,
+        "fetch_start": _strategy_warmup_start(as_of_date, settings),
+    }
+
+
+def _build_portfolio_review_row(
+    plan: dict[str, object],
+    *,
+    provider: object,
+    as_of_date: date,
+    benchmark_frame: pd.DataFrame | None,
+    refresh_cache: bool,
+) -> PortfolioReviewRow:
+    position = plan["position"]
+    preset = plan["preset"]
+    preset_resolution = plan["preset_resolution"]
+    settings = plan["settings"]
+    fetch_start = plan["fetch_start"]
+    if not isinstance(position, ExistingPosition):
+        raise TypeError("plan['position'] must be an ExistingPosition.")
+    if not isinstance(preset, BreakoutStrategyPreset):
+        raise TypeError("plan['preset'] must be a BreakoutStrategyPreset.")
+    if not isinstance(preset_resolution, str):
+        raise TypeError("plan['preset_resolution'] must be a string.")
+    if not isinstance(settings, BreakoutMomentumSettings):
+        raise TypeError("plan['settings'] must be BreakoutMomentumSettings.")
+    if not isinstance(fetch_start, date):
+        raise TypeError("plan['fetch_start'] must be a date.")
+
+    bars = provider.fetch_daily_bars(
+        position.symbol,
+        fetch_start,
+        as_of_date,
+        refresh_cache=refresh_cache,
+    )
+    if bars.empty:
+        raise ValueError(f"No daily bars were available for held symbol '{position.symbol}'.")
+
+    prepared_bars = bars.sort_values("date", kind="stable").reset_index(drop=True)
+    latest_close = _latest_close_from_bars(prepared_bars, symbol=position.symbol)
+    trailing_stop_candidate = _portfolio_review_trailing_stop_candidate(
+        prepared_bars,
+        position=position,
+        settings=settings,
+    )
+    regime_passed: bool | None = None
+    if settings.enable_regime_filter:
+        if benchmark_frame is None or benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{settings.benchmark_symbol}'."
+            )
+        regime_passed = regime_is_bullish(benchmark_frame, settings.regime_settings)
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=latest_close,
+        regime_passed=regime_passed,
+        trailing_stop_candidate=trailing_stop_candidate,
+    )
+    return PortfolioReviewRow(
+        date=as_of_date,
+        symbol=position.symbol,
+        quantity=position.shares,
+        average_entry_price=position.average_entry_price,
+        current_stop=position.current_stop,
+        suggested_stop=decision.suggested_stop,
+        latest_close=decision.latest_close,
+        unrealized_pl_pct=decision.unrealized_pl_pct,
+        distance_to_stop_pct=decision.distance_to_stop_pct,
+        regime_passed=decision.regime_passed,
+        above_entry=decision.above_entry,
+        suggested_action=decision.suggested_action,
+        preset_name=preset.name,
+        rationale=" | ".join(decision.rationale),
+        metadata={
+            "preset_resolution": preset_resolution,
+            "position_source": position.source,
+            "position_metadata": dict(position.metadata),
+            "trailing_stop_candidate": trailing_stop_candidate,
+            "regime_filter_enabled": settings.enable_regime_filter,
+            "regime_filter_mode": settings.regime_filter_mode,
+            "benchmark_symbol": settings.benchmark_symbol if settings.enable_regime_filter else None,
+            "entry_date_used": _position_entry_date(position),
+        },
+    )
+
+
+def _latest_close_from_bars(price_frame: pd.DataFrame, *, symbol: str) -> float:
+    close_series = pd.to_numeric(price_frame["close"], errors="coerce").dropna()
+    if close_series.empty:
+        raise ValueError(f"No usable close prices were available for held symbol '{symbol}'.")
+    return float(close_series.iloc[-1])
+
+
+def _portfolio_review_trailing_stop_candidate(
+    price_frame: pd.DataFrame,
+    *,
+    position: ExistingPosition,
+    settings: BreakoutMomentumSettings,
+) -> float | None:
+    atr_series = pd.to_numeric(atr(price_frame, window=settings.atr_window), errors="coerce").dropna()
+    if atr_series.empty:
+        return None
+
+    reference_close = _portfolio_review_reference_close(price_frame, position=position)
+    if reference_close is None:
+        return None
+    return trailing_stop_reference(
+        reference_close,
+        float(atr_series.iloc[-1]),
+        settings.trailing_stop_atr,
+    )
+
+
+def _portfolio_review_reference_close(
+    price_frame: pd.DataFrame,
+    *,
+    position: ExistingPosition,
+) -> float | None:
+    prepared = price_frame.copy()
+    prepared["close"] = pd.to_numeric(prepared["close"], errors="coerce")
+    prepared["date"] = pd.to_datetime(prepared["date"], errors="coerce")
+    prepared = prepared.dropna(subset=["close", "date"])
+    if prepared.empty:
+        return None
+
+    entry_date = _position_entry_date(position)
+    if entry_date is not None:
+        entry_mask = prepared["date"].dt.date >= entry_date
+        if bool(entry_mask.any()):
+            prepared = prepared.loc[entry_mask]
+
+    if prepared.empty:
+        return None
+    return float(prepared["close"].max())
+
+
+def _position_entry_date(position: ExistingPosition) -> str | None:
+    for key in ("entry_date", "entry_datetime", "opened_at"):
+        raw_value = position.metadata.get(key)
+        if raw_value is None:
+            continue
+        parsed_value = pd.to_datetime(raw_value, errors="coerce")
+        if pd.isna(parsed_value):
+            continue
+        return parsed_value.date().isoformat()
+    return None
 
 
 def _load_current_positions(portfolio_file: Path | None) -> list[ExistingPosition]:

@@ -170,6 +170,26 @@ investopedia-bot remove-position data/processed/portfolio/current_positions.csv 
 
 `init-portfolio` creates an empty CSV or JSON snapshot compatible with `--portfolio-file`. `upsert-position` appends a new symbol or replaces the existing row/object for that symbol. `update-stop` changes `current_stop` for an existing symbol, and `remove-position` deletes a symbol from the snapshot after an exit. Both commands fail clearly if the symbol is missing.
 
+### Review existing holdings
+
+```bash
+investopedia-bot review-portfolio --portfolio-file data/processed/portfolio/current_positions.csv --as-of 2026-03-17
+investopedia-bot review-portfolio --portfolio-file data/processed/portfolio/current_positions.json --as-of 2026-03-17 --benchmark-symbol SPY
+```
+
+This command:
+
+- loads the current portfolio snapshot and fetches fresh daily bars for each open position
+- computes latest close, unrealized P/L percent, distance to the current stop, and regime-filter status
+- checks whether the current ATR trailing-stop logic would justify a higher stop without ever suggesting a lower one
+- writes `portfolio_review.json` and `portfolio_review.csv` with management suggestions such as `HOLD`, `WATCH CLOSELY`, `RAISE STOP`, or `EXIT CANDIDATE`
+
+The intended daily workflow is:
+
+1. update the portfolio snapshot after fills, stop changes, or exits
+2. run `review-portfolio` to manage existing holdings
+3. run `daily-summary` or `generate-orders` to evaluate fresh entries against the same snapshot
+
 ### Render manual orders from offline signals
 
 ```bash
