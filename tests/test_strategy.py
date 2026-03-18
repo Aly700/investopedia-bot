@@ -214,6 +214,33 @@ def test_regime_filter_supports_configured_modes() -> None:
     assert regime_is_bullish(benchmark_frame, close_only) is True
 
 
+def test_benchmark_regime_settings_rejects_non_positive_windows() -> None:
+    with pytest.raises(ValueError, match="greater than zero"):
+        BenchmarkRegimeSettings("SPY", fast_window=0, slow_window=200, mode="either")
+    with pytest.raises(ValueError, match="greater than zero"):
+        BenchmarkRegimeSettings("SPY", fast_window=50, slow_window=0, mode="either")
+    with pytest.raises(ValueError, match="greater than zero"):
+        BenchmarkRegimeSettings("SPY", fast_window=-1, slow_window=200, mode="either")
+
+
+def test_benchmark_regime_settings_rejects_equal_windows() -> None:
+    with pytest.raises(ValueError, match="fast_window.*slow_window|slow_window.*fast_window"):
+        BenchmarkRegimeSettings("SPY", fast_window=50, slow_window=50, mode="either")
+
+
+def test_benchmark_regime_settings_rejects_inverted_windows() -> None:
+    with pytest.raises(ValueError, match="fast_window.*slow_window|slow_window.*fast_window"):
+        BenchmarkRegimeSettings("SPY", fast_window=200, slow_window=50, mode="either")
+
+
+def test_benchmark_regime_settings_accepts_valid_windows() -> None:
+    # Should not raise for any valid window ordering or mode.
+    for mode in ("close_above_slow", "fast_above_slow", "either"):
+        settings = BenchmarkRegimeSettings("SPY", fast_window=50, slow_window=200, mode=mode)
+        assert settings.fast_window == 50
+        assert settings.slow_window == 200
+
+
 def _settings(
     *,
     require_relative_volume_confirmation: bool = False,

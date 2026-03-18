@@ -45,6 +45,11 @@ class BenchmarkRegimeSettings:
     def __post_init__(self) -> None:
         if self.fast_window <= 0 or self.slow_window <= 0:
             raise ValueError("Benchmark moving-average windows must be greater than zero.")
+        if self.fast_window >= self.slow_window:
+            raise ValueError(
+                f"fast_window ({self.fast_window}) must be strictly less than "
+                f"slow_window ({self.slow_window})."
+            )
         if self.mode not in ("close_above_slow", "fast_above_slow", "either"):
             raise ValueError(f"Unsupported regime filter mode: {self.mode}")
 
