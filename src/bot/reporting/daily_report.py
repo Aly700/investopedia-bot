@@ -117,14 +117,32 @@ MARKET_MONITOR_CATEGORIES = (
 MARKET_MONITOR_CATEGORY_PRIORITY = {
     category: priority for priority, category in enumerate(MARKET_MONITOR_CATEGORIES)
 }
-_MISSING_PORTFOLIO_REVIEW_CATEGORIES = sorted(
-    set(PORTFOLIO_REVIEW_ACTIONS) - set(MARKET_MONITOR_CATEGORIES)
+
+
+def market_monitor_flat_count_key(category: str) -> str:
+    """Return the flat ``*_count`` field name for a market-monitor category."""
+
+    return f"{category.lower().replace(' ', '_')}_count"
+
+
+def ensure_market_monitor_categories_cover_portfolio_actions(
+    market_monitor_categories: Sequence[str],
+    portfolio_review_actions: Sequence[str],
+) -> None:
+    """Raise when portfolio-review actions are not representable as monitor categories."""
+
+    missing_categories = sorted(set(portfolio_review_actions) - set(market_monitor_categories))
+    if missing_categories:
+        raise RuntimeError(
+            "Portfolio review actions must also be valid market monitor categories. "
+            f"Missing categories: {missing_categories}"
+        )
+
+
+ensure_market_monitor_categories_cover_portfolio_actions(
+    MARKET_MONITOR_CATEGORIES,
+    PORTFOLIO_REVIEW_ACTIONS,
 )
-if _MISSING_PORTFOLIO_REVIEW_CATEGORIES:
-    raise RuntimeError(
-        "Portfolio review actions must also be valid market monitor categories. "
-        f"Missing categories: {_MISSING_PORTFOLIO_REVIEW_CATEGORIES}"
-    )
 
 
 @dataclass(frozen=True)
@@ -598,6 +616,10 @@ class MarketMonitorReport:
         """Return a JSON-friendly market-monitor payload."""
 
         category_counts = self.category_counts
+        flat_count_fields = {
+            market_monitor_flat_count_key(category): category_counts[category]
+            for category in MARKET_MONITOR_CATEGORIES
+        }
         return {
             "as_of_date": self.as_of_date.isoformat(),
             "generated_at_utc": self.generated_at_utc,
@@ -606,12 +628,7 @@ class MarketMonitorReport:
             "benchmark_symbol": self.benchmark_symbol,
             "alert_count": len(self.alerts),
             "category_counts": dict(category_counts),
-            "buy_candidate_count": category_counts["BUY CANDIDATE"],
-            "hold_count": category_counts["HOLD"],
-            "watch_closely_count": category_counts["WATCH CLOSELY"],
-            "raise_stop_count": category_counts["RAISE STOP"],
-            "exit_candidate_count": category_counts["EXIT CANDIDATE"],
-            "no_action_count": category_counts["NO ACTION"],
+            **flat_count_fields,
             "alerts": [alert.to_dict() for alert in self.alerts],
         }
 

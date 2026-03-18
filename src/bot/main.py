@@ -56,6 +56,7 @@ from bot.reporting.daily_report import (
     build_market_monitor_report,
     build_portfolio_review_report,
     build_daily_signal_report,
+    market_monitor_flat_count_key,
     rank_preset_candidate_evaluations,
     write_market_monitor_report,
     write_market_monitor_text_summary,
@@ -1176,17 +1177,21 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         output_dir / "market_monitor.txt",
     )
     report_payload = monitor_report.to_dict()
+    summary_payload = summary.to_dict()
+    category_counts = report_payload["category_counts"]
+    flat_category_counts = {
+        market_monitor_flat_count_key(category): count
+        for category, count in category_counts.items()
+    }
     payload = {
         "as_of_date": args.as_of.isoformat(),
         "portfolio_file": str(args.portfolio_file.resolve()) if args.portfolio_file else None,
         "preset_names": list(report_payload["preset_names"]),
+        "universe_count": summary_payload["universe_count"],
+        "approved_count": summary_payload["approved_count"],
+        "rejected_count": summary_payload["rejected_count"],
         "alert_count": report_payload["alert_count"],
-        "buy_candidate_count": report_payload["buy_candidate_count"],
-        "hold_count": report_payload["hold_count"],
-        "watch_closely_count": report_payload["watch_closely_count"],
-        "raise_stop_count": report_payload["raise_stop_count"],
-        "exit_candidate_count": report_payload["exit_candidate_count"],
-        "no_action_count": report_payload["no_action_count"],
+        **flat_category_counts,
         "outputs": {
             "market_monitor_json": str(alert_json_path),
             "market_monitor_csv": str(alert_csv_path),

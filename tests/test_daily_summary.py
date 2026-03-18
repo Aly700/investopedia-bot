@@ -12,11 +12,14 @@ import bot.main as main_module
 from bot.execution.manual_executor import ManualExecutor
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
 from bot.reporting.daily_report import (
+    MARKET_MONITOR_CATEGORIES,
     PresetCandidateEvaluation,
     PortfolioReviewRow,
     build_daily_research_summary,
     build_market_monitor_report,
     build_portfolio_review_report,
+    ensure_market_monitor_categories_cover_portfolio_actions,
+    market_monitor_flat_count_key,
     write_market_monitor_report,
     write_market_monitor_text_summary,
     write_daily_preset_summary,
@@ -301,6 +304,14 @@ def test_market_monitor_report_handles_no_alert_day(tmp_path: Path) -> None:
     assert "NO ACTION: 1" in text
 
 
+def test_market_monitor_report_flat_count_keys_match_category_counts() -> None:
+    report = build_market_monitor_report(as_of_date=date(2024, 1, 5))
+    payload = report.to_dict()
+
+    for category in MARKET_MONITOR_CATEGORIES:
+        assert payload[market_monitor_flat_count_key(category)] == payload["category_counts"][category]
+
+
 def test_market_monitor_report_handles_no_action_when_inputs_are_absent() -> None:
     report = build_market_monitor_report(as_of_date=date(2024, 1, 5))
 
@@ -376,6 +387,21 @@ def test_market_monitor_report_includes_portfolio_review_alert() -> None:
     assert report.category_counts["RAISE STOP"] == 1
     assert report.alerts[0].category == "RAISE STOP"
     assert report.alerts[0].symbol == "AAPL"
+
+
+def test_market_monitor_category_guard_accepts_current_action_coverage() -> None:
+    ensure_market_monitor_categories_cover_portfolio_actions(
+        MARKET_MONITOR_CATEGORIES,
+        PORTFOLIO_REVIEW_ACTIONS,
+    )
+
+
+def test_market_monitor_category_guard_rejects_missing_portfolio_action_categories() -> None:
+    with pytest.raises(RuntimeError, match="Missing categories: \\['HOLD'\\]"):
+        ensure_market_monitor_categories_cover_portfolio_actions(
+            tuple(category for category in MARKET_MONITOR_CATEGORIES if category != "HOLD"),
+            PORTFOLIO_REVIEW_ACTIONS,
+        )
 
 
 def test_market_monitor_report_includes_review_preset_names_without_daily_summary() -> None:
@@ -518,13 +544,36 @@ def test_market_monitor_report_orders_multiple_alert_categories_by_priority() ->
         benchmark_symbol="SPY",
         preset_selection_source="named_presets",
     )
-    position = ExistingPosition(
-        symbol="AAPL",
-        shares=10,
-        average_entry_price=100.0,
-        current_stop=95.0,
-        preset_name="standard_breakout",
-    )
+    current_positions = [
+        ExistingPosition(
+            symbol="TSLA",
+            shares=5,
+            average_entry_price=200.0,
+            current_stop=195.0,
+            preset_name="standard_breakout",
+        ),
+        ExistingPosition(
+            symbol="AAPL",
+            shares=10,
+            average_entry_price=100.0,
+            current_stop=95.0,
+            preset_name="standard_breakout",
+        ),
+        ExistingPosition(
+            symbol="AMD",
+            shares=10,
+            average_entry_price=150.0,
+            current_stop=145.0,
+            preset_name="standard_breakout",
+        ),
+        ExistingPosition(
+            symbol="GOOG",
+            shares=8,
+            average_entry_price=120.0,
+            current_stop=110.0,
+            preset_name="standard_breakout",
+        ),
+    ]
     review = build_portfolio_review_report(
         as_of_date=date(2024, 1, 5),
         rows=[
@@ -597,7 +646,7 @@ def test_market_monitor_report_orders_multiple_alert_categories_by_priority() ->
                 metadata={},
             ),
         ],
-        current_positions=[position],
+        current_positions=current_positions,
         benchmark_symbol="SPY",
     )
 
@@ -678,6 +727,7 @@ def test_handle_monitor_market_payload_includes_daily_summary_status_counts(
     assert result == 0
     assert payload["approved_count"] == 1
     assert payload["rejected_count"] == 1
+    assert payload["approved_count"] == payload["buy_candidate_count"]
     assert payload["universe_count"] == 3
     assert payload["buy_candidate_count"] == 1
     assert Path(payload["outputs"]["market_monitor_json"]).exists()
