@@ -91,13 +91,14 @@ def test_provider_cache_avoids_duplicate_remote_fetches(tmp_path: Path) -> None:
 
 def test_create_provider_uses_configured_provider() -> None:
     config = load_app_config()
+    api_key_env = config.data_sources.active_provider().api_key_env
     provider = create_daily_bar_provider(
         config,
-        environment={"ALPHAVANTAGE_API_KEY": "demo-key"},
+        environment={api_key_env: "demo-key"},
         cache_dir=Path("/tmp/investopedia-provider-cache"),
     )
 
-    assert provider.provider_name == "alphavantage"
+    assert provider.provider_name == config.data_sources.provider.lower()
 
 
 def test_load_candidate_symbols_supports_text_and_csv(tmp_path: Path) -> None:
