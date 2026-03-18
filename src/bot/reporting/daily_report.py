@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 
 from bot.execution.interface import ExecutionBatch, ExecutionOrder
 from bot.risk.portfolio_rules import RiskAssessedCandidate
-from bot.strategy.breakout_momentum import BreakoutStrategyPreset
+from bot.strategy.breakout_momentum import BreakoutStrategyPreset, build_breakout_rationale
 
 
 DAILY_REPORT_COLUMNS = (
@@ -656,7 +656,7 @@ def _row_from_candidate(
     if order is not None:
         metadata["execution_metadata"] = dict(order.metadata)
 
-    rationale = order.rationale if order is not None else candidate.signal.entry_reason.replace("_", " ")
+    rationale = order.rationale if order is not None else _candidate_rationale(candidate)
     return DailySignalReportRow(
         date=as_of_date,
         signal_date=candidate.signal.date,
@@ -698,7 +698,7 @@ def _daily_research_row_from_evaluation(
     if order is not None:
         metadata["execution_metadata"] = dict(order.metadata)
 
-    rationale = order.rationale if order is not None else candidate.signal.entry_reason.replace("_", " ")
+    rationale = order.rationale if order is not None else _candidate_rationale(candidate)
     return DailyResearchOpportunityRow(
         rank=rank,
         date=as_of_date,
@@ -724,6 +724,13 @@ def _daily_research_row_from_evaluation(
         notional_value=candidate.sizing.notional_value,
         rejection_reasons=candidate.rejection_reasons,
         metadata=metadata,
+    )
+
+
+def _candidate_rationale(candidate: RiskAssessedCandidate) -> str:
+    return build_breakout_rationale(
+        candidate.signal.entry_reason,
+        candidate.signal.metadata,
     )
 
 

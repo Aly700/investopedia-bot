@@ -86,6 +86,11 @@ def test_relative_volume_confirmation_can_block_or_allow_signal() -> None:
 
     assert blocked_signal is None
     assert allowed_signal is not None
+    assert allowed_signal.metadata["relative_volume"] == pytest.approx(1.2)
+    assert allowed_signal.metadata["relative_volume_confirmed"] is False
+    assert allowed_signal.metadata["relative_volume_required"] is False
+    assert allowed_signal.metadata["relative_volume_policy"] == "optional"
+    assert allowed_signal.metadata["relative_volume_gate_passed"] is True
 
 
 def test_signal_contents_include_stop_and_metadata() -> None:

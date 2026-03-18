@@ -39,6 +39,44 @@ def test_manual_executor_renders_order_sheet_from_approved_candidate(tmp_path: P
     assert "close above prior 20 day high" in rows[0]["rationale"]
 
 
+def test_manual_executor_labels_optional_relative_volume_in_rationale(tmp_path: Path) -> None:
+    candidate = _candidate(
+        symbol="AAA",
+        approved=True,
+        shares=50,
+        rejection_reasons=(),
+        relative_volume=1.2,
+        relative_volume_confirmed=False,
+        relative_volume_required=False,
+    )
+    batch = ManualExecutor().build_execution_batch([candidate], as_of_date=date(2024, 1, 5))
+    output_path = write_execution_batch(batch, tmp_path / "manual_order_sheet.csv")
+
+    with output_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert "relative_volume=1.20 (optional; threshold=1.50; not confirmed)" in rows[0]["rationale"]
+
+
+def test_manual_executor_labels_required_relative_volume_in_rationale(tmp_path: Path) -> None:
+    candidate = _candidate(
+        symbol="AAA",
+        approved=True,
+        shares=50,
+        rejection_reasons=(),
+        relative_volume=2.0,
+        relative_volume_confirmed=True,
+        relative_volume_required=True,
+    )
+    batch = ManualExecutor().build_execution_batch([candidate], as_of_date=date(2024, 1, 5))
+    output_path = write_execution_batch(batch, tmp_path / "manual_order_sheet.csv")
+
+    with output_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert "relative_volume=2.00 (required; threshold=1.50; confirmed)" in rows[0]["rationale"]
+
+
 def test_write_execution_batch_handles_empty_order_sets(tmp_path: Path) -> None:
     batch = ExecutionBatch(
         executor_name="manual",
@@ -96,6 +134,9 @@ def test_daily_signal_report_exports_rejections_and_no_signal_summary(tmp_path: 
         approved=False,
         shares=0,
         rejection_reasons=("Max concurrent positions reached.",),
+        relative_volume=1.2,
+        relative_volume_confirmed=False,
+        relative_volume_required=False,
     )
     batch = ManualExecutor().build_execution_batch([approved, rejected], as_of_date=date(2024, 1, 5))
     report = build_daily_signal_report(
@@ -119,6 +160,7 @@ def test_daily_signal_report_exports_rejections_and_no_signal_summary(tmp_path: 
     assert payload["no_signal_count"] == 1
     assert payload["benchmark_symbol"] == "SPY"
     assert [row["status"] for row in rows] == ["approved", "rejected"]
+    assert "relative_volume=1.20 (optional; threshold=1.50; not confirmed)" in rows[1]["rationale"]
     assert rows[1]["rejection_reasons"] == "Max concurrent positions reached."
 
 
@@ -143,7 +185,16 @@ def _candidate(
     approved: bool,
     shares: int,
     rejection_reasons: tuple[str, ...],
+    relative_volume: float = 1.8,
+    relative_volume_confirmed: bool | None = None,
+    relative_volume_required: bool = False,
 ) -> RiskAssessedCandidate:
+    relative_volume_threshold = 1.5
+    confirmed = (
+        relative_volume >= relative_volume_threshold
+        if relative_volume_confirmed is None
+        else relative_volume_confirmed
+    )
     signal = StrategySignal(
         strategy_name="breakout_momentum",
         symbol=symbol,
@@ -152,7 +203,17 @@ def _candidate(
         entry_reason="close_above_prior_20_day_high",
         entry_price_hint=100.0,
         stop_hint=95.0,
-        metadata={"prior_high": 99.5, "relative_volume": 1.8},
+        metadata={
+            "prior_high": 99.5,
+            "relative_volume": relative_volume,
+            "relative_volume_threshold": relative_volume_threshold,
+            "relative_volume_confirmed": confirmed,
+            "relative_volume_required": relative_volume_required,
+            "relative_volume_policy": (
+                "required" if relative_volume_required else "optional"
+            ),
+            "relative_volume_gate_passed": confirmed or not relative_volume_required,
+        },
     )
     sizing = PositionSizingResult(
         shares=shares,

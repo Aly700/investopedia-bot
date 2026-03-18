@@ -118,6 +118,7 @@ This command:
 - writes a human-readable `manual_order_sheet.csv` plus `daily_signal_report.json` and `daily_signal_report.csv`
 
 The manual workflow currently assumes no existing open positions are supplied to the CLI. It uses the provided `--equity` and optional `--current-drawdown` for sizing and drawdown-aware risk reduction.
+Relative-volume confirmation is optional by default. Use `--require-relative-volume` to make it a hard entry gate; the generated reports and order sheet label whether RV was `optional` or `required` for each candidate.
 
 ### Render manual orders from offline signals
 
@@ -227,6 +228,7 @@ This command:
 - writes a consolidated `daily_summary.json`, row-level `ranked_opportunities.csv`, preset-level `preset_rankings.csv/json`, and a `suggested_order_sheet.csv/json`
 
 If no preset selection is supplied, the command defaults to `standard_breakout`. If `--comparison-results` is supplied, the top preset from that file is included automatically.
+Like `generate-orders`, relative-volume confirmation is optional unless `--require-relative-volume` is enabled, and the ranked outputs preserve that policy in their rationale text and metadata.
 
 ## Architecture Notes
 

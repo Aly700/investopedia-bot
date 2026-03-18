@@ -371,6 +371,36 @@ def generate_breakout_signal(
     )
 
 
+def build_breakout_rationale(
+    entry_reason: str,
+    metadata: Mapping[str, Any],
+) -> str:
+    """Return a human-readable rationale that matches the actual RV policy."""
+
+    parts = [entry_reason.replace("_", " ")]
+
+    prior_high = _metadata_float(metadata.get("prior_high"))
+    if prior_high is not None:
+        parts.append(f"prior_high={prior_high:.2f}")
+
+    relative_volume = _metadata_float(metadata.get("relative_volume"))
+    if relative_volume is not None:
+        relative_volume_threshold = _metadata_float(metadata.get("relative_volume_threshold"))
+        relative_volume_confirmed = bool(metadata.get("relative_volume_confirmed"))
+        relative_volume_required = bool(metadata.get("relative_volume_required"))
+        rv_status = "confirmed" if relative_volume_confirmed else "not confirmed"
+        rv_policy = "required" if relative_volume_required else "optional"
+        if relative_volume_threshold is not None:
+            parts.append(
+                "relative_volume="
+                f"{relative_volume:.2f} ({rv_policy}; threshold={relative_volume_threshold:.2f}; {rv_status})"
+            )
+        else:
+            parts.append(f"relative_volume={relative_volume:.2f} ({rv_policy}; {rv_status})")
+
+    return "; ".join(parts)
+
+
 def _prepare_price_frame(price_frame: pd.DataFrame) -> pd.DataFrame:
     required_columns = ("date", "high", "low", "close", "volume")
     missing_columns = [column for column in required_columns if column not in price_frame.columns]
@@ -422,6 +452,16 @@ def _build_signal_metadata(
         "relative_volume": _optional_float(latest_row["relative_volume"]),
         "relative_volume_threshold": settings.relative_volume_threshold,
         "relative_volume_confirmed": bool(latest_row["passes_relative_volume"]),
+        "relative_volume_required": settings.require_relative_volume_confirmation,
+        "relative_volume_policy": (
+            "required"
+            if settings.require_relative_volume_confirmation
+            else "optional"
+        ),
+        "relative_volume_gate_passed": (
+            bool(latest_row["passes_relative_volume"])
+            or not settings.require_relative_volume_confirmation
+        ),
         "relative_volume_window": settings.resolved_relative_volume_window,
         "regime_filter_enabled": settings.enable_regime_filter,
         "regime_filter_mode": settings.regime_filter_mode,
@@ -447,3 +487,11 @@ def _mapping_float(data: Mapping[str, Any], key: str) -> float:
         raise ValueError(f"Preset mapping is missing required field '{key}'.") from exc
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Preset field '{key}' must be a float.") from exc
+
+
+def _metadata_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None

@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 
 from bot.execution.interface import CandidateExecutor, ExecutionBatch, ExecutionOrder
 from bot.risk.portfolio_rules import RiskAssessedCandidate
+from bot.strategy.breakout_momentum import build_breakout_rationale
 
 
 class ManualOrderError(ValueError):
@@ -282,18 +283,10 @@ def _candidate_to_execution_order(
 
 
 def _build_rationale(candidate: RiskAssessedCandidate) -> str:
-    entry_reason = candidate.signal.entry_reason.replace("_", " ")
-    parts = [entry_reason]
-
-    prior_high = candidate.signal.metadata.get("prior_high")
-    if isinstance(prior_high, (int, float)):
-        parts.append(f"prior_high={prior_high:.2f}")
-
-    relative_volume = candidate.signal.metadata.get("relative_volume")
-    if isinstance(relative_volume, (int, float)):
-        parts.append(f"relative_volume={relative_volume:.2f}")
-
-    return "; ".join(parts)
+    return build_breakout_rationale(
+        candidate.signal.entry_reason,
+        candidate.signal.metadata,
+    )
 
 
 def _execution_order_record(

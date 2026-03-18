@@ -186,6 +186,84 @@ def test_daily_research_summary_exports_ranked_rows_and_preset_summaries(tmp_pat
     assert ranked_rows[1]["rejection_reasons"] == "No averaging down is allowed for existing long positions."
 
 
+def test_daily_research_summary_labels_relative_volume_policy_in_rationale() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=20,
+        relative_volume=1.2,
+        relative_volume_confirmed=False,
+        relative_volume_required=False,
+    )
+    rejected = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=False,
+        shares=0,
+        relative_volume=1.2,
+        relative_volume_confirmed=False,
+        relative_volume_required=False,
+        rejection_reasons=("Calculated share size is zero after risk and notional constraints.",),
+    )
+
+    execution_batch = ManualExecutor().build_execution_batch(
+        [approved.candidate, rejected.candidate],
+        as_of_date=date(2024, 1, 5),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[approved, rejected],
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+
+    approved_row = next(row for row in summary.rows if row.symbol == "AAA")
+    rejected_row = next(row for row in summary.rows if row.symbol == "BBB")
+
+    assert "relative_volume=1.20 (optional; threshold=1.50; not confirmed)" in approved_row.rationale
+    assert "relative_volume=1.20 (optional; threshold=1.50; not confirmed)" in rejected_row.rationale
+    assert approved_row.metadata["signal_metadata"]["relative_volume_policy"] == "optional"
+    assert rejected_row.metadata["signal_metadata"]["relative_volume_gate_passed"] is True
+
+
+def test_daily_research_summary_labels_required_relative_volume_when_enabled() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=20,
+        relative_volume=2.0,
+        relative_volume_confirmed=True,
+        relative_volume_required=True,
+    )
+
+    execution_batch = ManualExecutor().build_execution_batch(
+        [approved.candidate],
+        as_of_date=date(2024, 1, 5),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[approved],
+        selected_presets=[preset],
+        universe_symbols=["AAA"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+
+    assert "relative_volume=2.00 (required; threshold=1.50; confirmed)" in summary.rows[0].rationale
+
+
 def test_load_top_preset_name_from_results_supports_csv_and_json(tmp_path: Path) -> None:
     csv_path = tmp_path / "ranked_presets.csv"
     csv_path.write_text(
@@ -229,8 +307,16 @@ def _evaluation(
     prior_high: float = 98.0,
     entry_price: float = 100.0,
     relative_volume: float = 1.8,
+    relative_volume_confirmed: bool | None = None,
+    relative_volume_required: bool = False,
     rejection_reasons: tuple[str, ...] = (),
 ) -> PresetCandidateEvaluation:
+    relative_volume_threshold = preset.relative_volume_threshold
+    confirmed = (
+        relative_volume >= relative_volume_threshold
+        if relative_volume_confirmed is None
+        else relative_volume_confirmed
+    )
     strategy_name = f"breakout_momentum:{preset.name}"
     signal = StrategySignal(
         strategy_name=strategy_name,
@@ -245,7 +331,13 @@ def _evaluation(
             "parameter_id": preset.parameter_id,
             "prior_high": prior_high,
             "relative_volume": relative_volume,
-            "relative_volume_threshold": preset.relative_volume_threshold,
+            "relative_volume_threshold": relative_volume_threshold,
+            "relative_volume_confirmed": confirmed,
+            "relative_volume_required": relative_volume_required,
+            "relative_volume_policy": (
+                "required" if relative_volume_required else "optional"
+            ),
+            "relative_volume_gate_passed": confirmed or not relative_volume_required,
         },
     )
     sizing = PositionSizingResult(

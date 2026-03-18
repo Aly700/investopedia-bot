@@ -835,6 +835,14 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         "as_of_date": args.as_of.isoformat(),
         "equity": current_equity,
         "current_drawdown": float(args.current_drawdown),
+        "relative_volume_confirmation_required": (
+            strategy_settings.require_relative_volume_confirmation
+        ),
+        "relative_volume_policy": (
+            "required"
+            if strategy_settings.require_relative_volume_confirmation
+            else "optional"
+        ),
         "universe_count": len(universe_members),
         "signal_count": len(assessed_candidates),
         "approved_order_count": len(batch.orders),
@@ -1376,6 +1384,10 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         "as_of_date": args.as_of.isoformat(),
         "preset_names": [preset.name for preset in presets],
         "preset_selection_source": preset_selection_source,
+        "relative_volume_confirmation_required": bool(args.require_relative_volume),
+        "relative_volume_policy": (
+            "required" if args.require_relative_volume else "optional"
+        ),
         "recommended_preset": summary.recommended_preset,
         "equity": current_equity,
         "current_drawdown": float(args.current_drawdown),
