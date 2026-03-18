@@ -103,6 +103,41 @@ def test_backtest_updates_trailing_stop_before_later_exit() -> None:
     assert trade["exit_price"] == pytest.approx(12.0)
 
 
+def test_trailing_stop_atr_from_settings_affects_final_stop() -> None:
+    # Two engines identical except trailing_stop_atr: tight=0.5, wide=5.0.
+    # Price rises then pulls back; tight stop should ratchet higher than wide stop.
+    tight_engine = _engine(slippage_bps=0, market_commission=0.0, stop_commission=0.0, trailing_stop_atr_multiple=0.5)
+    wide_engine = _engine(slippage_bps=0, market_commission=0.0, stop_commission=0.0, trailing_stop_atr_multiple=5.0)
+
+    symbol_frame = _symbol_frame(
+        opens=[9.0, 10.0, 11.0, 12.5, 13.0, 11.8],
+        highs=[10.0, 11.0, 12.0, 13.5, 14.0, 12.0],
+        lows=[8.0, 9.0, 10.0, 11.5, 12.0, 11.7],
+        closes=[9.0, 10.0, 12.0, 13.0, 13.0, 11.8],
+        symbol="AAA",
+    )
+
+    tight_result = tight_engine.run(
+        {"AAA": symbol_frame},
+        benchmark_frame=None,
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 1, 6),
+    )
+    wide_result = wide_engine.run(
+        {"AAA": symbol_frame},
+        benchmark_frame=None,
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 1, 6),
+    )
+
+    assert len(tight_result.trade_log) == 1
+    assert len(wide_result.trade_log) == 1
+    tight_final_stop = float(tight_result.trade_log.iloc[0]["final_stop"])
+    wide_final_stop = float(wide_result.trade_log.iloc[0]["final_stop"])
+    # Tight trailing stop stays closer to price, so its floor is higher.
+    assert tight_final_stop > wide_final_stop
+
+
 def test_backtest_handles_no_trade_runs_cleanly() -> None:
     engine = _engine(slippage_bps=0, market_commission=0.0, stop_commission=0.0)
     symbol_frame = _symbol_frame(
@@ -176,6 +211,7 @@ def _engine(
         relative_volume_threshold=1.0,
         atr_window=2,
         stop_atr_multiple=1.0,
+        trailing_stop_atr=trailing_stop_atr_multiple,
         require_relative_volume_confirmation=False,
         enable_regime_filter=False,
         regime_filter_mode="either",
@@ -195,7 +231,6 @@ def _engine(
             stop_order_commission=stop_commission,
             slippage_bps=slippage_bps,
         ),
-        trailing_stop_atr_multiple=trailing_stop_atr_multiple,
         close_positions_at_end=True,
     )
 

@@ -13,6 +13,8 @@ from bot.backtest.metrics import (
 from bot.config import RiskConfig, SignalConfig
 from bot.main import build_parser
 from bot.strategy.breakout_momentum import (
+    BreakoutMomentumSettings,
+    BreakoutStrategyPreset,
     build_default_breakout_presets,
     resolve_breakout_strategy_presets,
 )
@@ -56,11 +58,34 @@ def test_build_default_breakout_presets_exposes_named_variants() -> None:
 
     assert list(presets) == [
         "conservative_breakout",
+        "confirmed_conservative_breakout",
         "standard_breakout",
         "confirmed_breakout",
         "aggressive_breakout",
     ]
     assert presets["standard_breakout"].breakout_lookback == 20
+    assert (
+        presets["confirmed_conservative_breakout"].breakout_lookback
+        == presets["conservative_breakout"].breakout_lookback
+    )
+    assert (
+        presets["confirmed_conservative_breakout"].relative_volume_threshold
+        == presets["conservative_breakout"].relative_volume_threshold
+    )
+    assert (
+        presets["confirmed_conservative_breakout"].initial_stop_atr
+        == presets["conservative_breakout"].initial_stop_atr
+    )
+    assert (
+        presets["confirmed_conservative_breakout"].trailing_stop_atr
+        == presets["conservative_breakout"].trailing_stop_atr
+    )
+    assert (
+        presets["confirmed_conservative_breakout"].risk_per_trade
+        == presets["conservative_breakout"].risk_per_trade
+    )
+    assert presets["conservative_breakout"].require_relative_volume_confirmation is False
+    assert presets["confirmed_conservative_breakout"].require_relative_volume_confirmation is True
     assert (
         presets["confirmed_breakout"].breakout_lookback
         == presets["standard_breakout"].breakout_lookback
@@ -196,6 +221,42 @@ def _comparison_row(
             resolved_metrics.setdefault(key, value)
     row.update(resolved_metrics)
     return row
+
+
+def test_apply_to_settings_propagates_trailing_stop_atr() -> None:
+    """apply_to_settings must wire trailing_stop_atr from the preset into BreakoutMomentumSettings.
+
+    This test would fail before the fix because BreakoutMomentumSettings had no
+    trailing_stop_atr field, so apply_to_settings silently dropped the preset value.
+    """
+    base_settings = BreakoutMomentumSettings.from_configs(_signal_config(), _risk_config())
+    # _risk_config() has trailing_stop_atr=3.0; use a clearly different preset value.
+    preset = BreakoutStrategyPreset(
+        name="custom_trail",
+        breakout_lookback=15,
+        relative_volume_threshold=1.5,
+        initial_stop_atr=2.5,
+        trailing_stop_atr=1.0,
+        risk_per_trade=0.01,
+    )
+
+    applied = preset.apply_to_settings(base_settings)
+
+    assert applied.trailing_stop_atr == pytest.approx(1.0)
+    assert applied.trailing_stop_atr != base_settings.trailing_stop_atr
+
+
+def test_apply_to_settings_preserves_trailing_stop_atr_across_all_default_presets() -> None:
+    """Every default preset's trailing_stop_atr must survive a round-trip through apply_to_settings."""
+    base_settings = BreakoutMomentumSettings.from_configs(_signal_config(), _risk_config())
+    presets = build_default_breakout_presets(_signal_config(), _risk_config())
+
+    for preset in presets.values():
+        applied = preset.apply_to_settings(base_settings)
+        assert applied.trailing_stop_atr == pytest.approx(preset.trailing_stop_atr), (
+            f"Preset '{preset.name}': trailing_stop_atr not propagated. "
+            f"Expected {preset.trailing_stop_atr}, got {applied.trailing_stop_atr}."
+        )
 
 
 def _signal_config() -> SignalConfig:

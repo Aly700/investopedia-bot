@@ -363,6 +363,7 @@ def run_breakout_walkforward(
             breakout_lookback=parameter_set.breakout_lookback,
             relative_volume_threshold=parameter_set.relative_volume_threshold,
             stop_atr_multiple=parameter_set.initial_stop_atr,
+            trailing_stop_atr=parameter_set.trailing_stop_atr,
         )
         if benchmark_symbol_override is not None and benchmark_symbol_override.strip():
             strategy_settings = replace(
@@ -376,7 +377,6 @@ def run_breakout_walkforward(
             starting_cash=config.game_rules.starting_cash,
             base_risk_per_trade=parameter_set.risk_per_trade,
             cost_model=cost_model,
-            trailing_stop_atr_multiple=parameter_set.trailing_stop_atr,
             close_positions_at_end=close_positions_at_end,
         )
         result = engine.run(

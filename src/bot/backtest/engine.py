@@ -102,22 +102,18 @@ class DailyBarBacktestEngine:
         starting_cash: float,
         base_risk_per_trade: float,
         cost_model: TransactionCostModel,
-        trailing_stop_atr_multiple: float,
         close_positions_at_end: bool = True,
     ) -> None:
         if starting_cash <= 0:
             raise ValueError("starting_cash must be greater than zero.")
         if base_risk_per_trade <= 0:
             raise ValueError("base_risk_per_trade must be greater than zero.")
-        if trailing_stop_atr_multiple <= 0:
-            raise ValueError("trailing_stop_atr_multiple must be greater than zero.")
 
         self.strategy_settings = strategy_settings
         self.portfolio_constraints = portfolio_constraints
         self.starting_cash = float(starting_cash)
         self.base_risk_per_trade = float(base_risk_per_trade)
         self.cost_model = cost_model
-        self.trailing_stop_atr_multiple = float(trailing_stop_atr_multiple)
         self.close_positions_at_end = close_positions_at_end
 
     @classmethod
@@ -166,7 +162,6 @@ class DailyBarBacktestEngine:
             starting_cash=config.game_rules.starting_cash,
             base_risk_per_trade=config.strategy.risk.risk_per_trade,
             cost_model=TransactionCostModel.from_game_rules(config.game_rules),
-            trailing_stop_atr_multiple=config.strategy.risk.trailing_stop_atr,
             close_positions_at_end=close_positions_at_end,
         )
 
@@ -529,7 +524,7 @@ class DailyBarBacktestEngine:
             trailing_stop = trailing_stop_reference(
                 position.highest_close,
                 float(atr_value),
-                self.trailing_stop_atr_multiple,
+                self.strategy_settings.trailing_stop_atr,
             )
             position.stop_price = max(position.stop_price, trailing_stop)
             position.last_close = current_close

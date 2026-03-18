@@ -27,6 +27,7 @@ class BreakoutMomentumSettings:
     relative_volume_threshold: float
     atr_window: int
     stop_atr_multiple: float
+    trailing_stop_atr: float
     require_relative_volume_confirmation: bool = False
     enable_regime_filter: bool = True
     regime_filter_mode: RegimeFilterMode = "either"
@@ -53,6 +54,7 @@ class BreakoutMomentumSettings:
             relative_volume_threshold=signal_config.relative_volume_threshold,
             atr_window=risk_config.atr_length,
             stop_atr_multiple=risk_config.initial_stop_atr,
+            trailing_stop_atr=risk_config.trailing_stop_atr,
             require_relative_volume_confirmation=require_relative_volume_confirmation,
             enable_regime_filter=enable_regime_filter,
             regime_filter_mode=regime_filter_mode,
@@ -66,6 +68,8 @@ class BreakoutMomentumSettings:
             raise ValueError("atr_window must be greater than zero.")
         if self.stop_atr_multiple <= 0:
             raise ValueError("stop_atr_multiple must be greater than zero.")
+        if self.trailing_stop_atr <= 0:
+            raise ValueError("trailing_stop_atr must be greater than zero.")
         if self.relative_volume_window is not None and self.relative_volume_window <= 0:
             raise ValueError("relative_volume_window must be greater than zero when provided.")
 
@@ -163,6 +167,7 @@ class BreakoutStrategyPreset:
             breakout_lookback=self.breakout_lookback,
             relative_volume_threshold=self.relative_volume_threshold,
             stop_atr_multiple=self.initial_stop_atr,
+            trailing_stop_atr=self.trailing_stop_atr,
             require_relative_volume_confirmation=(
                 self.require_relative_volume_confirmation
                 if force_require_relative_volume_confirmation is None
@@ -218,6 +223,15 @@ def build_default_breakout_presets(
         risk_per_trade=max(risk_config.risk_per_trade * 0.5, 0.0025),
         require_relative_volume_confirmation=False,
     )
+    confirmed_conservative = BreakoutStrategyPreset(
+        name="confirmed_conservative_breakout",
+        breakout_lookback=conservative.breakout_lookback,
+        relative_volume_threshold=conservative.relative_volume_threshold,
+        initial_stop_atr=conservative.initial_stop_atr,
+        trailing_stop_atr=conservative.trailing_stop_atr,
+        risk_per_trade=conservative.risk_per_trade,
+        require_relative_volume_confirmation=True,
+    )
     aggressive = BreakoutStrategyPreset(
         name="aggressive_breakout",
         breakout_lookback=max(5, signal_config.breakout_lookback - 10),
@@ -229,6 +243,7 @@ def build_default_breakout_presets(
     )
     return {
         conservative.name: conservative,
+        confirmed_conservative.name: confirmed_conservative,
         standard.name: standard,
         confirmed.name: confirmed,
         aggressive.name: aggressive,

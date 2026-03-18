@@ -1662,7 +1662,6 @@ def _run_breakout_strategy_comparison(
             starting_cash=config.game_rules.starting_cash,
             base_risk_per_trade=preset.risk_per_trade,
             cost_model=cost_model,
-            trailing_stop_atr_multiple=preset.trailing_stop_atr,
             close_positions_at_end=True,
         )
         result = engine.run(

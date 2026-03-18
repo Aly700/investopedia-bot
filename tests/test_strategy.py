@@ -124,6 +124,35 @@ def test_confirmed_breakout_blocks_low_relative_volume_that_standard_allows() ->
     assert confirmed_signal is None
 
 
+def test_confirmed_conservative_breakout_blocks_low_relative_volume_that_conservative_allows() -> None:
+    low_volume_breakout = _symbol_frame(
+        closes=[9.5] * 13 + [11.6],
+        highs=[10.0] * 13 + [12.0],
+        lows=[9.0] * 13 + [11.0],
+        volumes=[100] * 13 + [150],
+        symbol="AAA",
+    )
+    presets = build_default_breakout_presets(_signal_config(), _risk_config())
+    base_settings = BreakoutMomentumSettings.from_configs(
+        _signal_config(),
+        _risk_config(),
+        enable_regime_filter=False,
+    )
+
+    conservative_signal = generate_breakout_signal(
+        low_volume_breakout,
+        settings=presets["conservative_breakout"].apply_to_settings(base_settings),
+    )
+    confirmed_conservative_signal = generate_breakout_signal(
+        low_volume_breakout,
+        settings=presets["confirmed_conservative_breakout"].apply_to_settings(base_settings),
+    )
+
+    assert conservative_signal is not None
+    assert conservative_signal.metadata["relative_volume_policy"] == "optional"
+    assert confirmed_conservative_signal is None
+
+
 def test_signal_contents_include_stop_and_metadata() -> None:
     price_frame = _symbol_frame(
         closes=[9.5, 10.5, 10.8, 11.6],
@@ -198,6 +227,7 @@ def _settings(
         relative_volume_threshold=1.5,
         atr_window=2,
         stop_atr_multiple=2.0,
+        trailing_stop_atr=3.0,
         require_relative_volume_confirmation=require_relative_volume_confirmation,
         enable_regime_filter=enable_regime_filter,
         regime_filter_mode="either",
