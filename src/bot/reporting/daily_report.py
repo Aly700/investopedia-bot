@@ -88,6 +88,36 @@ PORTFOLIO_REVIEW_COLUMNS = (
     "rationale",
     "metadata_json",
 )
+MARKET_MONITOR_COLUMNS = (
+    "date",
+    "symbol",
+    "category",
+    "preset_name",
+    "latest_close",
+    "average_entry_price",
+    "current_stop",
+    "suggested_stop",
+    "entry_price_hint",
+    "stop_level",
+    "rationale",
+    "metadata_json",
+)
+MARKET_MONITOR_CATEGORIES = (
+    "BUY CANDIDATE",
+    "HOLD",
+    "WATCH CLOSELY",
+    "RAISE STOP",
+    "EXIT CANDIDATE",
+    "NO ACTION",
+)
+MARKET_MONITOR_CATEGORY_PRIORITY = {
+    "EXIT CANDIDATE": 0,
+    "RAISE STOP": 1,
+    "BUY CANDIDATE": 2,
+    "WATCH CLOSELY": 3,
+    "HOLD": 4,
+    "NO ACTION": 5,
+}
 
 
 @dataclass(frozen=True)
@@ -467,6 +497,142 @@ class PortfolioReviewReport:
         }
 
 
+@dataclass(frozen=True)
+class MarketMonitorAlertRow:
+    """One compact alert row for scheduled market monitoring."""
+
+    date: date
+    symbol: str
+    category: str
+    preset_name: str | None
+    latest_close: float | None
+    average_entry_price: float | None
+    current_stop: float | None
+    suggested_stop: float | None
+    entry_price_hint: float | None
+    stop_level: float | None
+    rationale: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.category not in MARKET_MONITOR_CATEGORIES:
+            raise ValueError(
+                f"category must be one of {MARKET_MONITOR_CATEGORIES}, got '{self.category}'."
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation of the alert row."""
+
+        return {
+            "date": self.date.isoformat(),
+            "symbol": self.symbol,
+            "category": self.category,
+            "preset_name": self.preset_name,
+            "latest_close": self.latest_close,
+            "average_entry_price": self.average_entry_price,
+            "current_stop": self.current_stop,
+            "suggested_stop": self.suggested_stop,
+            "entry_price_hint": self.entry_price_hint,
+            "stop_level": self.stop_level,
+            "rationale": self.rationale,
+            "metadata": dict(self.metadata),
+        }
+
+    def to_record(self) -> dict[str, str]:
+        """Return a CSV-friendly representation of the alert row."""
+
+        return {
+            "date": self.date.isoformat(),
+            "symbol": self.symbol,
+            "category": self.category,
+            "preset_name": self.preset_name or "",
+            "latest_close": _format_optional_float(self.latest_close),
+            "average_entry_price": _format_optional_float(self.average_entry_price),
+            "current_stop": _format_optional_float(self.current_stop),
+            "suggested_stop": _format_optional_float(self.suggested_stop),
+            "entry_price_hint": _format_optional_float(self.entry_price_hint),
+            "stop_level": _format_optional_float(self.stop_level),
+            "rationale": self.rationale,
+            "metadata_json": json.dumps(self.metadata, sort_keys=True),
+        }
+
+
+@dataclass(frozen=True)
+class MarketMonitorReport:
+    """Combined entry and portfolio-management alert summary."""
+
+    as_of_date: date
+    generated_at_utc: str
+    portfolio_path: str | None
+    preset_names: tuple[str, ...]
+    benchmark_symbol: str | None
+    alerts: tuple[MarketMonitorAlertRow, ...]
+
+    @property
+    def category_counts(self) -> dict[str, int]:
+        """Return alert counts for each supported category."""
+
+        counts = {category: 0 for category in MARKET_MONITOR_CATEGORIES}
+        for alert in self.alerts:
+            counts[alert.category] += 1
+        return counts
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly market-monitor payload."""
+
+        category_counts = self.category_counts
+        return {
+            "as_of_date": self.as_of_date.isoformat(),
+            "generated_at_utc": self.generated_at_utc,
+            "portfolio_path": self.portfolio_path,
+            "preset_names": list(self.preset_names),
+            "benchmark_symbol": self.benchmark_symbol,
+            "alert_count": len(self.alerts),
+            "category_counts": dict(category_counts),
+            "buy_candidate_count": category_counts["BUY CANDIDATE"],
+            "hold_count": category_counts["HOLD"],
+            "watch_closely_count": category_counts["WATCH CLOSELY"],
+            "raise_stop_count": category_counts["RAISE STOP"],
+            "exit_candidate_count": category_counts["EXIT CANDIDATE"],
+            "no_action_count": category_counts["NO ACTION"],
+            "alerts": [alert.to_dict() for alert in self.alerts],
+        }
+
+    def to_text(self) -> str:
+        """Return a compact plain-text summary suitable for later notifications."""
+
+        counts = self.category_counts
+        lines = [
+            f"Market monitor for {self.as_of_date.isoformat()}",
+            f"BUY CANDIDATE: {counts['BUY CANDIDATE']}",
+            f"HOLD: {counts['HOLD']}",
+            f"WATCH CLOSELY: {counts['WATCH CLOSELY']}",
+            f"RAISE STOP: {counts['RAISE STOP']}",
+            f"EXIT CANDIDATE: {counts['EXIT CANDIDATE']}",
+            f"NO ACTION: {counts['NO ACTION']}",
+            "",
+        ]
+        for alert in self.alerts:
+            details: list[str] = [alert.category, alert.symbol]
+            if alert.preset_name:
+                details.append(f"preset={alert.preset_name}")
+            if alert.latest_close is not None:
+                details.append(f"close={_format_optional_float(alert.latest_close)}")
+            if alert.entry_price_hint is not None:
+                details.append(f"entry_hint={_format_optional_float(alert.entry_price_hint)}")
+            if alert.average_entry_price is not None:
+                details.append(f"avg_entry={_format_optional_float(alert.average_entry_price)}")
+            if alert.current_stop is not None:
+                details.append(f"current_stop={_format_optional_float(alert.current_stop)}")
+            if alert.suggested_stop is not None:
+                details.append(f"suggested_stop={_format_optional_float(alert.suggested_stop)}")
+            if alert.stop_level is not None:
+                details.append(f"stop={_format_optional_float(alert.stop_level)}")
+            lines.append(" | ".join(details))
+            lines.append(f"  {alert.rationale}")
+        return "\n".join(lines).rstrip() + "\n"
+
+
 def build_portfolio_review_report(
     *,
     as_of_date: date,
@@ -482,6 +648,102 @@ def build_portfolio_review_report(
         benchmark_symbol=benchmark_symbol,
         current_positions=tuple(current_positions),
         rows=tuple(rows),
+    )
+
+
+def build_market_monitor_report(
+    *,
+    as_of_date: date,
+    daily_summary: DailyResearchSummary | None = None,
+    portfolio_review: PortfolioReviewReport | None = None,
+    portfolio_path: str | None = None,
+) -> MarketMonitorReport:
+    """Build a combined monitoring report from entry and position-review outputs."""
+
+    alerts: list[MarketMonitorAlertRow] = []
+    preset_names: list[str] = []
+    benchmark_symbol: str | None = None
+
+    if daily_summary is not None:
+        preset_names.extend(preset.name for preset in daily_summary.selected_presets)
+        benchmark_symbol = daily_summary.benchmark_symbol or benchmark_symbol
+        for row in daily_summary.rows:
+            if row.status != "approved":
+                continue
+            alerts.append(
+                MarketMonitorAlertRow(
+                    date=as_of_date,
+                    symbol=row.symbol,
+                    category="BUY CANDIDATE",
+                    preset_name=row.preset_name,
+                    latest_close=row.entry_price_hint,
+                    average_entry_price=None,
+                    current_stop=None,
+                    suggested_stop=None,
+                    entry_price_hint=row.entry_price_hint,
+                    stop_level=row.stop_level,
+                    rationale=row.rationale,
+                    metadata={
+                        "parameter_id": row.parameter_id,
+                        "score": row.score,
+                        "score_components": dict(row.metadata.get("score_components", {})),
+                        "strategy_name": row.strategy_name,
+                    },
+                )
+            )
+
+    if portfolio_review is not None:
+        benchmark_symbol = portfolio_review.benchmark_symbol or benchmark_symbol
+        for row in portfolio_review.rows:
+            alerts.append(
+                MarketMonitorAlertRow(
+                    date=as_of_date,
+                    symbol=row.symbol,
+                    category=row.suggested_action,
+                    preset_name=row.preset_name,
+                    latest_close=row.latest_close,
+                    average_entry_price=row.average_entry_price,
+                    current_stop=row.current_stop,
+                    suggested_stop=row.suggested_stop,
+                    entry_price_hint=None,
+                    stop_level=None,
+                    rationale=row.rationale,
+                    metadata=dict(row.metadata),
+                )
+            )
+
+    if not alerts:
+        alerts.append(
+            MarketMonitorAlertRow(
+                date=as_of_date,
+                symbol="MARKET",
+                category="NO ACTION",
+                preset_name=None,
+                latest_close=None,
+                average_entry_price=None,
+                current_stop=None,
+                suggested_stop=None,
+                entry_price_hint=None,
+                stop_level=None,
+                rationale="No approved buy candidates or portfolio-management alerts for the requested date.",
+                metadata={},
+            )
+        )
+
+    alerts.sort(
+        key=lambda alert: (
+            MARKET_MONITOR_CATEGORY_PRIORITY.get(alert.category, 99),
+            alert.symbol,
+            alert.preset_name or "",
+        )
+    )
+    return MarketMonitorReport(
+        as_of_date=as_of_date,
+        generated_at_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        portfolio_path=portfolio_path,
+        preset_names=tuple(dict.fromkeys(preset_names)),
+        benchmark_symbol=benchmark_symbol,
+        alerts=tuple(alerts),
     )
 
 
@@ -509,6 +771,45 @@ def write_portfolio_review_report(
         writer.writeheader()
         for row in report.rows:
             writer.writerow(row.to_record())
+    return resolved_output_path
+
+
+def write_market_monitor_report(
+    report: MarketMonitorReport,
+    output_path: Path,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Write a market-monitor report to CSV or JSON."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_format = _resolve_output_format(resolved_output_path, output_format)
+
+    if resolved_format == "json":
+        resolved_output_path.write_text(
+            json.dumps(report.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return resolved_output_path
+
+    with resolved_output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=MARKET_MONITOR_COLUMNS)
+        writer.writeheader()
+        for row in report.alerts:
+            writer.writerow(row.to_record())
+    return resolved_output_path
+
+
+def write_market_monitor_text_summary(
+    report: MarketMonitorReport,
+    output_path: Path,
+) -> Path:
+    """Write a plain-text market-monitor summary suitable for scheduled delivery."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_output_path.write_text(report.to_text(), encoding="utf-8")
     return resolved_output_path
 
 

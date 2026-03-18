@@ -213,6 +213,28 @@ def test_cli_parser_exposes_review_portfolio_command() -> None:
     assert args.portfolio_file == Path("data/processed/portfolio.json")
 
 
+def test_cli_parser_exposes_monitor_market_command() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "monitor-market",
+            "data/raw/candidate_symbols.txt",
+            "--portfolio-file",
+            "data/processed/portfolio.json",
+            "--as-of",
+            "2024-01-05",
+            "--preset-names",
+            "standard_breakout",
+        ]
+    )
+
+    assert args.command == "monitor-market"
+    assert args.candidate_path == Path("data/raw/candidate_symbols.txt")
+    assert args.as_of == date(2024, 1, 5)
+    assert args.portfolio_file == Path("data/processed/portfolio.json")
+    assert args.preset_names == "standard_breakout"
+
+
 def _candidate(
     *,
     symbol: str,

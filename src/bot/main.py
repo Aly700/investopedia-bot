@@ -53,9 +53,12 @@ from bot.reporting.daily_report import (
     PresetCandidateEvaluation,
     PortfolioReviewRow,
     build_daily_research_summary,
+    build_market_monitor_report,
     build_portfolio_review_report,
     build_daily_signal_report,
     rank_preset_candidate_evaluations,
+    write_market_monitor_report,
+    write_market_monitor_text_summary,
     write_daily_preset_summary,
     write_portfolio_review_report,
     write_daily_research_summary,
@@ -398,6 +401,90 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass local cache and force provider fetches.",
     )
     review_portfolio_parser.set_defaults(handler=_handle_review_portfolio)
+
+    monitor_market_parser = subparsers.add_parser(
+        "monitor-market",
+        help="Combine new-entry scans and portfolio-management alerts into one scheduled summary.",
+    )
+    monitor_market_parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    monitor_market_parser.add_argument(
+        "--portfolio-file",
+        type=Path,
+        default=None,
+        help="Optional CSV or JSON portfolio snapshot to include in the monitor run.",
+    )
+    monitor_market_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Right edge of the monitoring window.",
+    )
+    monitor_market_parser.add_argument(
+        "--preset-names",
+        default=None,
+        help="Comma-separated preset names to evaluate for buy candidates.",
+    )
+    monitor_market_parser.add_argument(
+        "--comparison-results",
+        type=Path,
+        default=None,
+        help="Optional ranked preset output from compare-strategies. When provided, the top preset is included automatically.",
+    )
+    monitor_market_parser.add_argument(
+        "--equity",
+        type=float,
+        default=None,
+        help="Current account equity used for position sizing. Defaults to config starting_cash.",
+    )
+    monitor_market_parser.add_argument(
+        "--current-drawdown",
+        type=float,
+        default=0.0,
+        help="Current portfolio drawdown as a decimal fraction for drawdown-aware risk reduction.",
+    )
+    monitor_market_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=20,
+        help="Lookback window used for universe liquidity screening.",
+    )
+    monitor_market_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter.",
+    )
+    monitor_market_parser.add_argument(
+        "--require-relative-volume",
+        action="store_true",
+        help="Require relative-volume confirmation for breakout entries.",
+    )
+    monitor_market_parser.add_argument(
+        "--disable-regime-filter",
+        action="store_true",
+        help="Disable the benchmark-based regime filter.",
+    )
+    monitor_market_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for monitoring JSON, CSV, and text outputs.",
+    )
+    monitor_market_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    monitor_market_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    monitor_market_parser.set_defaults(handler=_handle_monitor_market)
 
     generate_orders_parser = subparsers.add_parser(
         "generate-orders",
@@ -1016,100 +1103,19 @@ def _handle_remove_position(args: argparse.Namespace) -> int:
 def _handle_review_portfolio(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     current_positions = _load_current_positions(args.portfolio_file)
+    provider = (
+        create_daily_bar_provider(config, env_file=args.env_file)
+        if current_positions
+        else None
+    )
+    report = _run_portfolio_review_workflow(
+        args,
+        config=config,
+        provider=provider,
+        current_positions=current_positions,
+    )
     output_dir = (args.output_dir or _default_daily_output_dir(config.project_root, args.as_of)).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    benchmark_symbol_override = (
-        args.benchmark_symbol.strip().upper()
-        if isinstance(args.benchmark_symbol, str) and args.benchmark_symbol.strip()
-        else None
-    )
-
-    if not current_positions:
-        empty_report = build_portfolio_review_report(
-            as_of_date=args.as_of,
-            rows=[],
-            current_positions=[],
-            benchmark_symbol=benchmark_symbol_override,
-        )
-        review_json_path = write_portfolio_review_report(
-            empty_report,
-            output_dir / "portfolio_review.json",
-        )
-        review_csv_path = write_portfolio_review_report(
-            empty_report,
-            output_dir / "portfolio_review.csv",
-        )
-        payload = {
-            "portfolio_path": str(args.portfolio_file.resolve()),
-            "position_count": 0,
-            "symbols_reviewed": [],
-            "hold_count": 0,
-            "watch_closely_count": 0,
-            "raise_stop_count": 0,
-            "exit_candidate_count": 0,
-            "outputs": {
-                "portfolio_review_json": str(review_json_path),
-                "portfolio_review_csv": str(review_csv_path),
-            },
-        }
-        _print_structured(payload, output_format=args.format)
-        return 0
-
-    provider = create_daily_bar_provider(config, env_file=args.env_file)
-    preset_catalog = _portfolio_review_preset_catalog(args, config)
-    base_settings = BreakoutMomentumSettings.from_configs(
-        config.strategy.signals,
-        config.strategy.risk,
-    )
-    if benchmark_symbol_override is not None:
-        base_settings = replace(base_settings, benchmark_symbol=benchmark_symbol_override)
-
-    position_plans = [
-        _build_portfolio_review_plan(
-            position,
-            preset_catalog=preset_catalog,
-            base_settings=base_settings,
-            as_of_date=args.as_of,
-        )
-        for position in current_positions
-    ]
-
-    benchmark_symbol = (
-        base_settings.benchmark_symbol
-        if any(plan["settings"].enable_regime_filter for plan in position_plans)
-        else None
-    )
-    benchmark_frame = None
-    if benchmark_symbol is not None:
-        earliest_fetch_start = min(plan["fetch_start"] for plan in position_plans)
-        benchmark_frame = provider.fetch_daily_bars(
-            benchmark_symbol,
-            earliest_fetch_start,
-            args.as_of,
-            refresh_cache=args.refresh_cache,
-        )
-        if benchmark_frame.empty:
-            raise ValueError(
-                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
-            )
-
-    rows = [
-        _build_portfolio_review_row(
-            plan,
-            provider=provider,
-            as_of_date=args.as_of,
-            benchmark_frame=benchmark_frame,
-            refresh_cache=args.refresh_cache,
-        )
-        for plan in position_plans
-    ]
-    report = build_portfolio_review_report(
-        as_of_date=args.as_of,
-        rows=rows,
-        current_positions=current_positions,
-        benchmark_symbol=benchmark_symbol,
-    )
     review_json_path = write_portfolio_review_report(report, output_dir / "portfolio_review.json")
     review_csv_path = write_portfolio_review_report(report, output_dir / "portfolio_review.csv")
     report_payload = report.to_dict()
@@ -1124,6 +1130,67 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         "outputs": {
             "portfolio_review_json": str(review_json_path),
             "portfolio_review_csv": str(review_csv_path),
+        },
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_monitor_market(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    current_positions = _load_current_positions(args.portfolio_file)
+    summary_result = _run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=provider,
+        current_positions=current_positions,
+    )
+    summary = summary_result["summary"]
+
+    portfolio_review = None
+    if args.portfolio_file is not None:
+        portfolio_review = _run_portfolio_review_workflow(
+            args,
+            config=config,
+            provider=provider,
+            current_positions=current_positions,
+        )
+
+    monitor_report = build_market_monitor_report(
+        as_of_date=args.as_of,
+        daily_summary=summary,
+        portfolio_review=portfolio_review,
+        portfolio_path=str(args.portfolio_file.resolve()) if args.portfolio_file else None,
+    )
+    output_dir = (
+        args.output_dir
+        or (config.project_root / "data" / "processed" / "monitor_market" / args.as_of.isoformat())
+    ).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    alert_json_path = write_market_monitor_report(monitor_report, output_dir / "market_monitor.json")
+    alert_csv_path = write_market_monitor_report(monitor_report, output_dir / "market_monitor.csv")
+    alert_text_path = write_market_monitor_text_summary(
+        monitor_report,
+        output_dir / "market_monitor.txt",
+    )
+    report_payload = monitor_report.to_dict()
+    payload = {
+        "as_of_date": args.as_of.isoformat(),
+        "portfolio_file": str(args.portfolio_file.resolve()) if args.portfolio_file else None,
+        "preset_names": list(report_payload["preset_names"]),
+        "alert_count": report_payload["alert_count"],
+        "buy_candidate_count": report_payload["buy_candidate_count"],
+        "hold_count": report_payload["hold_count"],
+        "watch_closely_count": report_payload["watch_closely_count"],
+        "raise_stop_count": report_payload["raise_stop_count"],
+        "exit_candidate_count": report_payload["exit_candidate_count"],
+        "no_action_count": report_payload["no_action_count"],
+        "outputs": {
+            "market_monitor_json": str(alert_json_path),
+            "market_monitor_csv": str(alert_csv_path),
+            "market_monitor_text": str(alert_text_path),
         },
     }
     _print_structured(payload, output_format=args.format)
@@ -1629,163 +1696,13 @@ def _handle_compare_strategies(args: argparse.Namespace) -> int:
 def _handle_daily_summary(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     provider = create_daily_bar_provider(config, env_file=args.env_file)
-    presets, preset_selection_source = _resolve_daily_summary_presets(args, config)
-    current_positions = _load_current_positions(args.portfolio_file)
-
-    current_equity = (
-        config.game_rules.starting_cash if args.equity is None else float(args.equity)
-    )
-    if current_equity <= 0:
-        raise ValueError("equity must be greater than zero.")
-    if args.current_drawdown < 0:
-        raise ValueError("current_drawdown must be non-negative.")
-
-    builder = UniverseBuilder(provider, config.strategy.universe)
-    universe_members = builder.screen_candidates(
-        args.candidate_path,
-        as_of_date=args.as_of,
-        lookback_days=args.lookback_days,
-        refresh_cache=args.refresh_cache,
-    )
-
-    fetch_start = _comparison_warmup_start(
-        start_date=args.as_of,
-        atr_window=config.strategy.risk.atr_length,
-        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
-        presets=presets,
-        enable_regime_filter=not args.disable_regime_filter,
-    )
-
-    symbol_frames: dict[str, pd.DataFrame] = {}
-    for member in universe_members:
-        try:
-            bars = provider.fetch_daily_bars(
-                member.symbol,
-                fetch_start,
-                args.as_of,
-                refresh_cache=args.refresh_cache,
-            )
-        except DataProviderError as exc:
-            LOGGER.warning("Skipping %s due to provider error: %s", member.symbol, exc)
-            continue
-        if bars.empty:
-            LOGGER.warning("Skipping %s because no bars were returned in the requested range.", member.symbol)
-            continue
-        symbol_frames[member.symbol] = bars
-
-    benchmark_frame = None
-    benchmark_symbol = None
-    if not args.disable_regime_filter and universe_members:
-        benchmark_symbol = (
-            args.benchmark_symbol.strip().upper()
-            if args.benchmark_symbol
-            else config.strategy.signals.benchmark_symbol
-        )
-        if benchmark_symbol in symbol_frames:
-            benchmark_frame = symbol_frames[benchmark_symbol]
-        else:
-            benchmark_frame = provider.fetch_daily_bars(
-                benchmark_symbol,
-                fetch_start,
-                args.as_of,
-                refresh_cache=args.refresh_cache,
-            )
-        if benchmark_frame.empty:
-            raise ValueError(
-                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
-            )
-
-    constraints = PortfolioConstraints.from_configs(
-        config.strategy.risk,
-        config.game_rules.rules,
-    )
-    evaluations: list[PresetCandidateEvaluation] = []
-    no_signal_symbols_by_preset: dict[str, list[str]] = {
-        preset.name: []
-        for preset in presets
-    }
-
-    for preset in presets:
-        strategy_settings = BreakoutMomentumSettings.from_configs(
-            config.strategy.signals,
-            config.strategy.risk,
-            require_relative_volume_confirmation=args.require_relative_volume,
-            enable_regime_filter=not args.disable_regime_filter,
-        )
-        strategy_settings = preset.apply_to_settings(
-            strategy_settings,
-            force_require_relative_volume_confirmation=(
-                True if args.require_relative_volume else None
-            ),
-        )
-        if args.benchmark_symbol:
-            strategy_settings = replace(
-                strategy_settings,
-                benchmark_symbol=args.benchmark_symbol.strip().upper(),
-            )
-
-        for member in universe_members:
-            bars = symbol_frames.get(member.symbol)
-            if bars is None or bars.empty:
-                no_signal_symbols_by_preset[preset.name].append(member.symbol)
-                continue
-
-            signal = generate_breakout_signal(
-                bars,
-                settings=strategy_settings,
-                benchmark_frame=benchmark_frame,
-                has_open_position=False,
-                symbol=member.symbol,
-            )
-            if signal is None:
-                no_signal_symbols_by_preset[preset.name].append(member.symbol)
-                continue
-
-            signal_metadata = dict(signal.metadata)
-            signal_metadata["preset_name"] = preset.name
-            signal_metadata["parameter_id"] = preset.parameter_id
-            signal = replace(
-                signal,
-                strategy_name=f"{signal.strategy_name}:{preset.name}",
-                metadata=signal_metadata,
-            )
-            evaluations.append(
-                PresetCandidateEvaluation(
-                    preset_name=preset.name,
-                    parameter_id=preset.parameter_id,
-                    candidate=assess_signal_candidate(
-                        signal,
-                        current_equity=current_equity,
-                        base_risk_per_trade=preset.risk_per_trade,
-                        constraints=constraints,
-                        current_positions=current_positions,
-                        current_drawdown=float(args.current_drawdown),
-                    ),
-                )
-            )
-
-    ranked_evaluations = rank_preset_candidate_evaluations(
-        evaluations,
-        current_equity=current_equity,
-    )
-    executor = ManualExecutor()
-    execution_batch = executor.build_execution_batch(
-        [evaluation.candidate for evaluation in ranked_evaluations],
-        as_of_date=args.as_of,
-    )
-    summary = build_daily_research_summary(
-        as_of_date=args.as_of,
-        execution_batch=execution_batch,
-        evaluations=evaluations,
-        selected_presets=presets,
-        universe_symbols=[member.symbol for member in universe_members],
-        current_positions=current_positions,
-        current_equity=current_equity,
-        no_signal_symbols_by_preset=no_signal_symbols_by_preset,
-        benchmark_symbol=benchmark_symbol,
-        preset_selection_source=preset_selection_source,
-        force_require_relative_volume_confirmation=bool(args.require_relative_volume),
-    )
+    workflow = _run_daily_summary_workflow(args, config=config, provider=provider)
+    summary = workflow["summary"]
+    presets = workflow["presets"]
+    preset_selection_source = workflow["preset_selection_source"]
+    current_positions = workflow["current_positions"]
+    current_equity = workflow["current_equity"]
+    execution_batch = workflow["execution_batch"]
 
     output_dir = (
         args.output_dir
@@ -1842,6 +1759,189 @@ def _default_daily_output_dir(project_root: Path, as_of_date: date) -> Path:
     return project_root / "data" / "processed" / "daily" / as_of_date.isoformat()
 
 
+def _benchmark_symbol_override(raw_value: object) -> str | None:
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    return raw_value.strip().upper()
+
+
+def _run_daily_summary_workflow(
+    args: argparse.Namespace,
+    *,
+    config: AppConfig,
+    provider: object,
+    current_positions: list[ExistingPosition] | None = None,
+) -> dict[str, object]:
+    presets, preset_selection_source = _resolve_daily_summary_presets(args, config)
+    resolved_current_positions = (
+        _load_current_positions(args.portfolio_file)
+        if current_positions is None
+        else current_positions
+    )
+
+    current_equity = (
+        config.game_rules.starting_cash if args.equity is None else float(args.equity)
+    )
+    if current_equity <= 0:
+        raise ValueError("equity must be greater than zero.")
+    if args.current_drawdown < 0:
+        raise ValueError("current_drawdown must be non-negative.")
+
+    builder = UniverseBuilder(provider, config.strategy.universe)
+    universe_members = builder.screen_candidates(
+        args.candidate_path,
+        as_of_date=args.as_of,
+        lookback_days=args.lookback_days,
+        refresh_cache=args.refresh_cache,
+    )
+
+    fetch_start = _comparison_warmup_start(
+        start_date=args.as_of,
+        atr_window=config.strategy.risk.atr_length,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        presets=presets,
+        enable_regime_filter=not args.disable_regime_filter,
+    )
+
+    symbol_frames: dict[str, pd.DataFrame] = {}
+    for member in universe_members:
+        try:
+            bars = provider.fetch_daily_bars(
+                member.symbol,
+                fetch_start,
+                args.as_of,
+                refresh_cache=args.refresh_cache,
+            )
+        except DataProviderError as exc:
+            LOGGER.warning("Skipping %s due to provider error: %s", member.symbol, exc)
+            continue
+        if bars.empty:
+            LOGGER.warning(
+                "Skipping %s because no bars were returned in the requested range.",
+                member.symbol,
+            )
+            continue
+        symbol_frames[member.symbol] = bars
+
+    benchmark_frame = None
+    benchmark_symbol = None
+    benchmark_override = _benchmark_symbol_override(args.benchmark_symbol)
+    if not args.disable_regime_filter and universe_members:
+        benchmark_symbol = benchmark_override or config.strategy.signals.benchmark_symbol
+        if benchmark_symbol in symbol_frames:
+            benchmark_frame = symbol_frames[benchmark_symbol]
+        else:
+            benchmark_frame = provider.fetch_daily_bars(
+                benchmark_symbol,
+                fetch_start,
+                args.as_of,
+                refresh_cache=args.refresh_cache,
+            )
+        if benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
+            )
+
+    constraints = PortfolioConstraints.from_configs(
+        config.strategy.risk,
+        config.game_rules.rules,
+    )
+    evaluations: list[PresetCandidateEvaluation] = []
+    no_signal_symbols_by_preset: dict[str, list[str]] = {
+        preset.name: []
+        for preset in presets
+    }
+
+    for preset in presets:
+        strategy_settings = BreakoutMomentumSettings.from_configs(
+            config.strategy.signals,
+            config.strategy.risk,
+            require_relative_volume_confirmation=args.require_relative_volume,
+            enable_regime_filter=not args.disable_regime_filter,
+        )
+        strategy_settings = preset.apply_to_settings(
+            strategy_settings,
+            force_require_relative_volume_confirmation=(
+                True if args.require_relative_volume else None
+            ),
+        )
+        if benchmark_override is not None:
+            strategy_settings = replace(
+                strategy_settings,
+                benchmark_symbol=benchmark_override,
+            )
+
+        for member in universe_members:
+            bars = symbol_frames.get(member.symbol)
+            if bars is None or bars.empty:
+                no_signal_symbols_by_preset[preset.name].append(member.symbol)
+                continue
+
+            signal = generate_breakout_signal(
+                bars,
+                settings=strategy_settings,
+                benchmark_frame=benchmark_frame,
+                has_open_position=False,
+                symbol=member.symbol,
+            )
+            if signal is None:
+                no_signal_symbols_by_preset[preset.name].append(member.symbol)
+                continue
+
+            signal_metadata = dict(signal.metadata)
+            signal_metadata["preset_name"] = preset.name
+            signal_metadata["parameter_id"] = preset.parameter_id
+            signal = replace(
+                signal,
+                strategy_name=f"{signal.strategy_name}:{preset.name}",
+                metadata=signal_metadata,
+            )
+            evaluations.append(
+                PresetCandidateEvaluation(
+                    preset_name=preset.name,
+                    parameter_id=preset.parameter_id,
+                    candidate=assess_signal_candidate(
+                        signal,
+                        current_equity=current_equity,
+                        base_risk_per_trade=preset.risk_per_trade,
+                        constraints=constraints,
+                        current_positions=resolved_current_positions,
+                        current_drawdown=float(args.current_drawdown),
+                    ),
+                )
+            )
+
+    ranked_evaluations = rank_preset_candidate_evaluations(
+        evaluations,
+        current_equity=current_equity,
+    )
+    execution_batch = ManualExecutor().build_execution_batch(
+        [evaluation.candidate for evaluation in ranked_evaluations],
+        as_of_date=args.as_of,
+    )
+    summary = build_daily_research_summary(
+        as_of_date=args.as_of,
+        execution_batch=execution_batch,
+        evaluations=evaluations,
+        selected_presets=presets,
+        universe_symbols=[member.symbol for member in universe_members],
+        current_positions=resolved_current_positions,
+        current_equity=current_equity,
+        no_signal_symbols_by_preset=no_signal_symbols_by_preset,
+        benchmark_symbol=benchmark_symbol,
+        preset_selection_source=preset_selection_source,
+        force_require_relative_volume_confirmation=bool(args.require_relative_volume),
+    )
+    return {
+        "summary": summary,
+        "execution_batch": execution_batch,
+        "presets": presets,
+        "preset_selection_source": preset_selection_source,
+        "current_positions": resolved_current_positions,
+        "current_equity": current_equity,
+    }
+
+
 def _portfolio_review_preset_catalog(
     args: argparse.Namespace,
     config: AppConfig,
@@ -1875,6 +1975,85 @@ def _resolve_portfolio_review_preset(
     if preset is None:
         return default_preset, f"fallback_default_standard_breakout:{requested_name}"
     return preset, "portfolio_snapshot"
+
+
+def _run_portfolio_review_workflow(
+    args: argparse.Namespace,
+    *,
+    config: AppConfig,
+    provider: object | None,
+    current_positions: list[ExistingPosition] | None = None,
+) -> object:
+    resolved_current_positions = (
+        _load_current_positions(args.portfolio_file)
+        if current_positions is None
+        else current_positions
+    )
+    benchmark_symbol_override = _benchmark_symbol_override(args.benchmark_symbol)
+
+    if not resolved_current_positions:
+        return build_portfolio_review_report(
+            as_of_date=args.as_of,
+            rows=[],
+            current_positions=[],
+            benchmark_symbol=benchmark_symbol_override,
+        )
+    if provider is None:
+        raise ValueError("A data provider is required when reviewing non-empty portfolios.")
+
+    preset_catalog = _portfolio_review_preset_catalog(args, config)
+    base_settings = BreakoutMomentumSettings.from_configs(
+        config.strategy.signals,
+        config.strategy.risk,
+    )
+    if benchmark_symbol_override is not None:
+        base_settings = replace(base_settings, benchmark_symbol=benchmark_symbol_override)
+
+    position_plans = [
+        _build_portfolio_review_plan(
+            position,
+            preset_catalog=preset_catalog,
+            base_settings=base_settings,
+            as_of_date=args.as_of,
+        )
+        for position in resolved_current_positions
+    ]
+
+    benchmark_symbol = (
+        base_settings.benchmark_symbol
+        if any(plan["settings"].enable_regime_filter for plan in position_plans)
+        else None
+    )
+    benchmark_frame = None
+    if benchmark_symbol is not None:
+        earliest_fetch_start = min(plan["fetch_start"] for plan in position_plans)
+        benchmark_frame = provider.fetch_daily_bars(
+            benchmark_symbol,
+            earliest_fetch_start,
+            args.as_of,
+            refresh_cache=args.refresh_cache,
+        )
+        if benchmark_frame.empty:
+            raise ValueError(
+                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
+            )
+
+    rows = [
+        _build_portfolio_review_row(
+            plan,
+            provider=provider,
+            as_of_date=args.as_of,
+            benchmark_frame=benchmark_frame,
+            refresh_cache=args.refresh_cache,
+        )
+        for plan in position_plans
+    ]
+    return build_portfolio_review_report(
+        as_of_date=args.as_of,
+        rows=rows,
+        current_positions=resolved_current_positions,
+        benchmark_symbol=benchmark_symbol,
+    )
 
 
 def _build_portfolio_review_plan(

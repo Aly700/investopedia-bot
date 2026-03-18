@@ -304,6 +304,29 @@ This command:
 If no preset selection is supplied, the command defaults to `standard_breakout`. If `--comparison-results` is supplied, the top preset from that file is included automatically.
 Like `generate-orders`, relative-volume confirmation is optional unless `--require-relative-volume` is enabled, and the ranked outputs preserve that policy in their rationale text and metadata. When `--portfolio-file` is provided, the summary also includes current holdings context and rejection reasons for duplicate entries or averaging-down attempts.
 
+### Monitor the market on a schedule
+
+```bash
+investopedia-bot monitor-market data/raw/candidate_symbols.txt --as-of 2026-03-17
+investopedia-bot monitor-market data/raw/candidate_symbols.txt --as-of 2026-03-17 --portfolio-file data/processed/portfolio/current_positions.json --preset-names conservative_breakout,confirmed_conservative_breakout
+investopedia-bot monitor-market data/raw/candidate_symbols.txt --as-of 2026-03-17 --portfolio-file data/processed/portfolio/current_positions.json --output-dir data/processed/monitor_market/2026-03-17
+```
+
+This command:
+
+- reuses the existing `daily-summary` scan to find approved `BUY CANDIDATE` entries
+- reuses `review-portfolio` logic to classify current holdings as `HOLD`, `WATCH CLOSELY`, `RAISE STOP`, or `EXIT CANDIDATE`
+- combines both into a compact machine-readable alert payload
+- writes `market_monitor.json`, `market_monitor.csv`, and a plain-text `market_monitor.txt` summary for later notification delivery
+
+This is the background-friendly layer for automation. You can run it from `cron`, `launchd`, or any scheduler, then hand the JSON or text file to a future email, Discord, Telegram, or other notifier without changing the trading logic itself.
+
+Typical flow:
+
+1. update the portfolio snapshot after fills, stop changes, or exits
+2. run `monitor-market` on a schedule
+3. inspect the alert summary or route the generated files into a later notification step
+
 ## Architecture Notes
 
 - Signal generation should stay separate from execution. Research code can emit candidate trades, while execution modules only format or route orders.
