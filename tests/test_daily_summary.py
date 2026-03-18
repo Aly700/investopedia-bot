@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 
 from bot.execution.manual_executor import ManualExecutor
-from bot.main import _load_top_preset_name_from_results, build_parser
+from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
 from bot.reporting.daily_report import (
     PresetCandidateEvaluation,
     build_daily_research_summary,
@@ -384,6 +384,27 @@ def test_cli_parser_exposes_daily_summary_command() -> None:
     assert args.as_of == date(2024, 1, 5)
     assert args.preset_names == "standard_breakout,aggressive_breakout"
     assert args.portfolio_file == Path("data/processed/portfolio.csv")
+
+
+def test_daily_summary_preset_names_with_spaces_are_parsed_correctly() -> None:
+    # Verifies the daily-summary CLI path handles "name, name" (comma-space) input.
+    # The raw argparse value retains the user's string; _parse_text_list strips it.
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--preset-names",
+            "standard_breakout, aggressive_breakout",
+        ]
+    )
+    # argparse stores the raw string unchanged — that is expected.
+    assert args.preset_names == "standard_breakout, aggressive_breakout"
+    # _parse_text_list (the CLI split/parse boundary) must strip whitespace.
+    parsed = _parse_text_list(args.preset_names)
+    assert parsed == ("standard_breakout", "aggressive_breakout")
 
 
 def test_cli_parser_exposes_portfolio_snapshot_commands() -> None:

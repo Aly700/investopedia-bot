@@ -138,6 +138,39 @@ def test_trailing_stop_atr_from_settings_affects_final_stop() -> None:
     assert tight_final_stop > wide_final_stop
 
 
+def test_backtest_enforces_max_concurrent_positions() -> None:
+    # Both AAA and BBB signal a breakout on the same bar (day 3).
+    # With max_concurrent_positions=1, only the first alphabetically should be approved.
+    #
+    # Determinism: the engine iterates symbols in sorted order, so AAA is assessed
+    # before BBB. When BBB is assessed, AAA is already in the pending-entries snapshot,
+    # which counts against the cap. BBB is therefore rejected at signal-assessment time,
+    # never reaches the fill stage, and never appears in the trade log.
+    engine = _engine(slippage_bps=0, market_commission=0.0, stop_commission=0.0, max_concurrent_positions=1)
+
+    # Identical price series → identical breakout signal on the same bar.
+    shared_bars = dict(
+        opens=[9.0, 10.0, 11.0, 12.5, 13.0],
+        highs=[10.0, 11.0, 12.0, 13.0, 13.0],
+        lows=[8.0, 9.0, 10.0, 11.5, 12.0],
+        closes=[9.0, 10.0, 12.0, 12.5, 12.5],
+    )
+    aaa_frame = _symbol_frame(**shared_bars, symbol="AAA")
+    bbb_frame = _symbol_frame(**shared_bars, symbol="BBB")
+
+    result = engine.run(
+        {"AAA": aaa_frame, "BBB": bbb_frame},
+        benchmark_frame=None,
+        start_date=date(2024, 1, 1),
+        end_date=date(2024, 1, 5),
+    )
+
+    # Slot cap: only one position should ever be opened.
+    assert len(result.trade_log) == 1
+    assert result.trade_log.iloc[0]["symbol"] == "AAA"
+    assert int(result.equity_curve["open_positions"].max()) == 1
+
+
 def test_backtest_handles_no_trade_runs_cleanly() -> None:
     engine = _engine(slippage_bps=0, market_commission=0.0, stop_commission=0.0)
     symbol_frame = _symbol_frame(
@@ -202,6 +235,7 @@ def _engine(
     market_commission: float,
     stop_commission: float,
     trailing_stop_atr_multiple: float = 1.0,
+    max_concurrent_positions: int = 5,
 ) -> DailyBarBacktestEngine:
     settings = BreakoutMomentumSettings(
         breakout_lookback=2,
@@ -217,7 +251,7 @@ def _engine(
         regime_filter_mode="either",
     )
     constraints = PortfolioConstraints(
-        max_concurrent_positions=5,
+        max_concurrent_positions=max_concurrent_positions,
         max_position_pct_equity=1.0,
         no_averaging_down=True,
     )

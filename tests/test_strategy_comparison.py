@@ -11,7 +11,7 @@ from bot.backtest.metrics import (
     rank_strategy_comparisons,
 )
 from bot.config import RiskConfig, SignalConfig
-from bot.main import build_parser
+from bot.main import _parse_text_list, build_parser
 from bot.strategy.breakout_momentum import (
     BreakoutMomentumSettings,
     BreakoutStrategyPreset,
@@ -166,6 +166,28 @@ def test_rank_strategy_comparisons_handles_no_trade_rows_cleanly() -> None:
     assert ranked["rank"].tolist() == [1, 2]
     assert ranked["trade_count"].tolist() == [0, 0]
     assert ranked["total_return"].tolist() == [0.0, 0.0]
+
+
+def test_parse_text_list_strips_whitespace_at_split_boundary() -> None:
+    # Simulates "--preset-names standard_breakout, aggressive_breakout" (comma-space).
+    # Stripping must happen in _parse_text_list itself, not only in downstream lookup.
+    result = _parse_text_list("standard_breakout, aggressive_breakout")
+    assert result == ("standard_breakout", "aggressive_breakout")
+
+
+def test_parse_text_list_handles_mixed_whitespace_and_empty_segments() -> None:
+    result = _parse_text_list("  standard_breakout ,, aggressive_breakout  ")
+    assert result == ("standard_breakout", "aggressive_breakout")
+
+
+def test_preset_names_with_spaces_resolve_to_correct_presets() -> None:
+    # End-to-end: spaced names from CLI → resolve_breakout_strategy_presets → correct presets.
+    presets = resolve_breakout_strategy_presets(
+        _signal_config(),
+        _risk_config(),
+        preset_names=("standard_breakout ", " aggressive_breakout"),
+    )
+    assert [p.name for p in presets] == ["standard_breakout", "aggressive_breakout"]
 
 
 def test_cli_parser_exposes_compare_strategies_command() -> None:
