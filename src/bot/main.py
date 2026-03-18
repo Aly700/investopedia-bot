@@ -66,6 +66,8 @@ from bot.risk.portfolio_rules import (
     assess_signal_candidate,
     initialize_portfolio_snapshot,
     load_existing_positions,
+    remove_existing_position_snapshot,
+    update_existing_position_stop_snapshot,
     upsert_existing_position_snapshot,
 )
 from bot.strategy.breakout_momentum import (
@@ -289,6 +291,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Console summary output format.",
     )
     upsert_position_parser.set_defaults(handler=_handle_upsert_position)
+
+    update_stop_parser = subparsers.add_parser(
+        "update-stop",
+        help="Update the current stop for an existing holding in a portfolio snapshot.",
+    )
+    update_stop_parser.add_argument(
+        "portfolio_path",
+        type=Path,
+        help="Path to the portfolio snapshot file to update.",
+    )
+    update_stop_parser.add_argument(
+        "symbol",
+        help="Ticker symbol for the holding to update.",
+    )
+    update_stop_parser.add_argument(
+        "--current-stop",
+        type=float,
+        required=True,
+        help="Updated stop level for the holding.",
+    )
+    update_stop_parser.add_argument(
+        "--snapshot-format",
+        choices=("csv", "json"),
+        default=None,
+        help="Optional portfolio snapshot format override. Defaults to the file extension.",
+    )
+    update_stop_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    update_stop_parser.set_defaults(handler=_handle_update_stop)
+
+    remove_position_parser = subparsers.add_parser(
+        "remove-position",
+        help="Remove an existing holding from a CSV or JSON portfolio snapshot.",
+    )
+    remove_position_parser.add_argument(
+        "portfolio_path",
+        type=Path,
+        help="Path to the portfolio snapshot file to update.",
+    )
+    remove_position_parser.add_argument(
+        "symbol",
+        help="Ticker symbol for the holding to remove.",
+    )
+    remove_position_parser.add_argument(
+        "--snapshot-format",
+        choices=("csv", "json"),
+        default=None,
+        help="Optional portfolio snapshot format override. Defaults to the file extension.",
+    )
+    remove_position_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    remove_position_parser.set_defaults(handler=_handle_remove_position)
 
     generate_orders_parser = subparsers.add_parser(
         "generate-orders",
@@ -860,6 +922,43 @@ def _handle_upsert_position(args: argparse.Namespace) -> int:
         "portfolio_path": str(written_path),
         "snapshot_format": written_path.suffix.lower().lstrip("."),
         "updated_symbol": position.symbol,
+        "position_count": len(current_positions),
+        "current_position_symbols": [current_position.symbol for current_position in current_positions],
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_update_stop(args: argparse.Namespace) -> int:
+    written_path = update_existing_position_stop_snapshot(
+        args.portfolio_path,
+        args.symbol,
+        float(args.current_stop),
+        output_format=args.snapshot_format,
+    )
+    current_positions = load_existing_positions(written_path)
+    payload = {
+        "portfolio_path": str(written_path),
+        "snapshot_format": written_path.suffix.lower().lstrip("."),
+        "updated_symbol": args.symbol.strip().upper(),
+        "position_count": len(current_positions),
+        "current_position_symbols": [current_position.symbol for current_position in current_positions],
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_remove_position(args: argparse.Namespace) -> int:
+    written_path = remove_existing_position_snapshot(
+        args.portfolio_path,
+        args.symbol,
+        output_format=args.snapshot_format,
+    )
+    current_positions = load_existing_positions(written_path)
+    payload = {
+        "portfolio_path": str(written_path),
+        "snapshot_format": written_path.suffix.lower().lstrip("."),
+        "removed_symbol": args.symbol.strip().upper(),
         "position_count": len(current_positions),
         "current_position_symbols": [current_position.symbol for current_position in current_positions],
     }

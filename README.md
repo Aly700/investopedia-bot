@@ -164,9 +164,11 @@ To create and maintain that snapshot locally:
 investopedia-bot init-portfolio data/processed/portfolio/current_positions.csv
 investopedia-bot upsert-position data/processed/portfolio/current_positions.csv MU --quantity 50 --average-entry-price 96.25 --current-stop 90 --preset-name confirmed_breakout --source investopedia
 investopedia-bot upsert-position data/processed/portfolio/current_positions.json NVDA --quantity 10 --average-entry-price 870 --metadata-json '{"note":"starter"}'
+investopedia-bot update-stop data/processed/portfolio/current_positions.csv MU --current-stop 92
+investopedia-bot remove-position data/processed/portfolio/current_positions.csv MU
 ```
 
-`init-portfolio` creates an empty CSV or JSON snapshot compatible with `--portfolio-file`. `upsert-position` appends a new symbol or replaces the existing row/object for that symbol.
+`init-portfolio` creates an empty CSV or JSON snapshot compatible with `--portfolio-file`. `upsert-position` appends a new symbol or replaces the existing row/object for that symbol. `update-stop` changes `current_stop` for an existing symbol, and `remove-position` deletes a symbol from the snapshot after an exit. Both commands fail clearly if the symbol is missing.
 
 ### Render manual orders from offline signals
 

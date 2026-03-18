@@ -15,6 +15,8 @@ from bot.risk.portfolio_rules import (
     evaluate_portfolio_rules,
     initialize_portfolio_snapshot,
     load_existing_positions,
+    remove_existing_position_snapshot,
+    update_existing_position_stop_snapshot,
     upsert_existing_position_snapshot,
 )
 from bot.risk.position_sizing import size_position
@@ -384,6 +386,90 @@ def test_upsert_existing_position_snapshot_appends_json(tmp_path: Path) -> None:
 
     assert [position.symbol for position in positions] == ["MSFT", "NVDA"]
     assert positions[1].current_stop == pytest.approx(850.0)
+
+
+def test_update_existing_position_stop_snapshot_updates_csv(tmp_path: Path) -> None:
+    csv_path = tmp_path / "portfolio.csv"
+    initialize_portfolio_snapshot(csv_path)
+    upsert_existing_position_snapshot(
+        csv_path,
+        ExistingPosition(symbol="AAPL", shares=10, average_entry_price=150.0, current_stop=145.0),
+    )
+
+    written_path = update_existing_position_stop_snapshot(csv_path, "AAPL", 147.5)
+    positions = load_existing_positions(written_path)
+
+    assert positions[0].symbol == "AAPL"
+    assert positions[0].current_stop == pytest.approx(147.5)
+
+
+def test_update_existing_position_stop_snapshot_updates_json(tmp_path: Path) -> None:
+    json_path = tmp_path / "portfolio.json"
+    initialize_portfolio_snapshot(json_path)
+    upsert_existing_position_snapshot(
+        json_path,
+        ExistingPosition(symbol="MSFT", shares=5, average_entry_price=300.0, current_stop=290.0),
+    )
+
+    written_path = update_existing_position_stop_snapshot(json_path, "MSFT", 295.0)
+    positions = load_existing_positions(written_path)
+
+    assert positions[0].symbol == "MSFT"
+    assert positions[0].current_stop == pytest.approx(295.0)
+
+
+def test_remove_existing_position_snapshot_removes_csv_position(tmp_path: Path) -> None:
+    csv_path = tmp_path / "portfolio.csv"
+    initialize_portfolio_snapshot(csv_path)
+    upsert_existing_position_snapshot(
+        csv_path,
+        ExistingPosition(symbol="AAPL", shares=10, average_entry_price=150.0),
+    )
+    upsert_existing_position_snapshot(
+        csv_path,
+        ExistingPosition(symbol="MSFT", shares=5, average_entry_price=300.0),
+    )
+
+    written_path = remove_existing_position_snapshot(csv_path, "AAPL")
+    positions = load_existing_positions(written_path)
+
+    assert [position.symbol for position in positions] == ["MSFT"]
+
+
+def test_remove_existing_position_snapshot_removes_json_position(tmp_path: Path) -> None:
+    json_path = tmp_path / "portfolio.json"
+    initialize_portfolio_snapshot(json_path)
+    upsert_existing_position_snapshot(
+        json_path,
+        ExistingPosition(symbol="AAPL", shares=10, average_entry_price=150.0),
+    )
+    upsert_existing_position_snapshot(
+        json_path,
+        ExistingPosition(symbol="NVDA", shares=3, average_entry_price=900.0),
+    )
+
+    written_path = remove_existing_position_snapshot(json_path, "NVDA")
+    positions = load_existing_positions(written_path)
+
+    assert [position.symbol for position in positions] == ["AAPL"]
+
+
+def test_update_existing_position_stop_snapshot_errors_for_missing_symbol(
+    tmp_path: Path,
+) -> None:
+    csv_path = tmp_path / "portfolio.csv"
+    initialize_portfolio_snapshot(csv_path)
+
+    with pytest.raises(PortfolioInputError, match="does not exist"):
+        update_existing_position_stop_snapshot(csv_path, "AAPL", 145.0)
+
+
+def test_remove_existing_position_snapshot_errors_for_missing_symbol(tmp_path: Path) -> None:
+    json_path = tmp_path / "portfolio.json"
+    initialize_portfolio_snapshot(json_path)
+
+    with pytest.raises(PortfolioInputError, match="does not exist"):
+        remove_existing_position_snapshot(json_path, "AAPL")
 
 
 def _signal(*, symbol: str, entry_price: float, stop_price: float | None) -> StrategySignal:

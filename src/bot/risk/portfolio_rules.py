@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 from math import isfinite
 from pathlib import Path
@@ -256,6 +256,71 @@ def upsert_existing_position_snapshot(
     return write_existing_positions_snapshot(
         updated_positions,
         resolved_output_path,
+        output_format=output_format,
+    )
+
+
+def update_existing_position_stop_snapshot(
+    output_path: Path,
+    symbol: str,
+    current_stop: float,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Update ``current_stop`` for an existing symbol in a portfolio snapshot."""
+
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise PortfolioInputError("symbol cannot be empty.")
+
+    positions = load_existing_positions(output_path.resolve())
+    updated_positions: list[ExistingPosition] = []
+    matched = False
+    for existing_position in positions:
+        if existing_position.symbol == normalized_symbol:
+            updated_positions.append(replace(existing_position, current_stop=current_stop))
+            matched = True
+        else:
+            updated_positions.append(existing_position)
+
+    if not matched:
+        raise PortfolioInputError(
+            f"Symbol '{normalized_symbol}' does not exist in portfolio snapshot."
+        )
+
+    return write_existing_positions_snapshot(
+        updated_positions,
+        output_path.resolve(),
+        output_format=output_format,
+    )
+
+
+def remove_existing_position_snapshot(
+    output_path: Path,
+    symbol: str,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Remove an existing symbol from a portfolio snapshot."""
+
+    normalized_symbol = symbol.strip().upper()
+    if not normalized_symbol:
+        raise PortfolioInputError("symbol cannot be empty.")
+
+    positions = load_existing_positions(output_path.resolve())
+    remaining_positions = [
+        existing_position
+        for existing_position in positions
+        if existing_position.symbol != normalized_symbol
+    ]
+    if len(remaining_positions) == len(positions):
+        raise PortfolioInputError(
+            f"Symbol '{normalized_symbol}' does not exist in portfolio snapshot."
+        )
+
+    return write_existing_positions_snapshot(
+        remaining_positions,
+        output_path.resolve(),
         output_format=output_format,
     )
 

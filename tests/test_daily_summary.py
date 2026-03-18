@@ -433,6 +433,22 @@ def test_cli_parser_exposes_portfolio_snapshot_commands() -> None:
             "standard_breakout",
         ]
     )
+    update_stop_args = parser.parse_args(
+        [
+            "update-stop",
+            "data/processed/portfolio/current_positions.csv",
+            "AAPL",
+            "--current-stop",
+            "145",
+        ]
+    )
+    remove_position_args = parser.parse_args(
+        [
+            "remove-position",
+            "data/processed/portfolio/current_positions.json",
+            "AAPL",
+        ]
+    )
 
     assert init_args.command == "init-portfolio"
     assert init_args.output_path == Path("data/processed/portfolio/current_positions.json")
@@ -442,6 +458,17 @@ def test_cli_parser_exposes_portfolio_snapshot_commands() -> None:
     assert upsert_args.symbol == "AAPL"
     assert upsert_args.quantity == 10
     assert upsert_args.average_entry_price == 150.0
+    assert update_stop_args.command == "update-stop"
+    assert update_stop_args.portfolio_path == Path(
+        "data/processed/portfolio/current_positions.csv"
+    )
+    assert update_stop_args.symbol == "AAPL"
+    assert update_stop_args.current_stop == 145.0
+    assert remove_position_args.command == "remove-position"
+    assert remove_position_args.portfolio_path == Path(
+        "data/processed/portfolio/current_positions.json"
+    )
+    assert remove_position_args.symbol == "AAPL"
 
 
 def _evaluation(
