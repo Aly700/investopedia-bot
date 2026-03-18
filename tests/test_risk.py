@@ -44,7 +44,7 @@ def test_position_sizing_math_returns_expected_share_count() -> None:
     assert result.notional_value == pytest.approx(10_000.0)
 
 
-def test_position_sizing_rejects_zero_stop_distance() -> None:
+def test_position_sizing_rejects_stop_equal_to_entry() -> None:
     result = size_position(
         current_equity=100_000.0,
         risk_per_trade=0.01,
@@ -54,7 +54,49 @@ def test_position_sizing_rejects_zero_stop_distance() -> None:
 
     assert result.is_valid is False
     assert result.shares == 0
-    assert result.rejection_reason == "Per-share risk must be greater than zero."
+    assert result.per_share_risk == pytest.approx(0.0)
+    assert "50" in (result.rejection_reason or "")
+
+
+def test_position_sizing_rejects_stop_above_entry() -> None:
+    result = size_position(
+        current_equity=100_000.0,
+        risk_per_trade=0.01,
+        entry_price=50.0,
+        stop_price=55.0,
+    )
+
+    assert result.is_valid is False
+    assert result.shares == 0
+    assert result.per_share_risk == pytest.approx(0.0)
+    assert "55" in (result.rejection_reason or "")
+    assert "50" in (result.rejection_reason or "")
+
+
+def test_position_sizing_accepts_stop_below_entry() -> None:
+    result = size_position(
+        current_equity=100_000.0,
+        risk_per_trade=0.01,
+        entry_price=50.0,
+        stop_price=45.0,
+    )
+
+    assert result.is_valid is True
+    assert result.per_share_risk == pytest.approx(5.0)
+    assert result.shares == 200
+
+
+def test_stop_distance_returns_positive_for_valid_long_stop() -> None:
+    assert stop_distance(100.0, 95.0) == pytest.approx(5.0)
+
+
+def test_stop_distance_returns_zero_when_stop_equals_entry() -> None:
+    assert stop_distance(100.0, 100.0) == pytest.approx(0.0)
+
+
+def test_stop_distance_returns_negative_when_stop_above_entry() -> None:
+    # Negative result is the signal to callers that the stop placement is invalid.
+    assert stop_distance(100.0, 105.0) == pytest.approx(-5.0)
 
 
 def test_position_sizing_enforces_max_notional_cap() -> None:

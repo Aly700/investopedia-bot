@@ -54,6 +54,23 @@ def size_position(
         )
 
     risk_budget = current_equity * risk_per_trade
+
+    if stop_price >= entry_price:
+        return PositionSizingResult(
+            shares=0,
+            risk_budget=risk_budget,
+            per_share_risk=0.0,
+            notional_value=0.0,
+            max_shares_by_risk=0,
+            max_shares_by_notional=None,
+            capped_by_notional=False,
+            is_valid=False,
+            rejection_reason=(
+                f"Stop price ({stop_price}) must be below entry price ({entry_price}) "
+                "for a long position."
+            ),
+        )
+
     per_share_risk = stop_distance(entry_price, stop_price)
     if per_share_risk <= 0:
         return PositionSizingResult(

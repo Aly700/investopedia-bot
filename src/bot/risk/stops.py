@@ -50,11 +50,16 @@ def trailing_stop_reference(
 
 
 def stop_distance(entry_price: float, stop_price: float) -> float:
-    """Return the absolute distance between entry and stop price."""
+    """Return the per-share risk distance for a long position (entry minus stop).
+
+    Returns a positive value when stop_price is below entry_price (valid long stop).
+    Returns zero or negative when stop_price is at or above entry_price, which
+    callers must treat as an invalid configuration.
+    """
 
     _validate_finite(entry_price, name="entry_price")
     _validate_finite(stop_price, name="stop_price")
-    return abs(entry_price - stop_price)
+    return entry_price - stop_price
 
 
 def _validate_finite(value: float, *, name: str) -> None:
