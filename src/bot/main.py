@@ -491,7 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Inline custom preset definition. "
             "Format: name=my_preset,breakout_lookback=20,relative_volume_threshold=1.5,"
-            "initial_stop_atr=2.5,trailing_stop_atr=3.0,risk_per_trade=0.01"
+            "initial_stop_atr=2.5,trailing_stop_atr=3.0,risk_per_trade=0.01,"
+            "require_relative_volume_confirmation=true"
         ),
     )
     compare_parser.add_argument(
@@ -1298,7 +1299,12 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
             require_relative_volume_confirmation=args.require_relative_volume,
             enable_regime_filter=not args.disable_regime_filter,
         )
-        strategy_settings = preset.apply_to_settings(strategy_settings)
+        strategy_settings = preset.apply_to_settings(
+            strategy_settings,
+            force_require_relative_volume_confirmation=(
+                True if args.require_relative_volume else None
+            ),
+        )
         if args.benchmark_symbol:
             strategy_settings = replace(
                 strategy_settings,
@@ -1483,7 +1489,12 @@ def _run_breakout_strategy_comparison(
     rows: list[dict[str, object]] = []
     for preset in presets:
         engine = DailyBarBacktestEngine(
-            strategy_settings=preset.apply_to_settings(base_settings),
+            strategy_settings=preset.apply_to_settings(
+                base_settings,
+                force_require_relative_volume_confirmation=(
+                    True if require_relative_volume_confirmation else None
+                ),
+            ),
             portfolio_constraints=portfolio_constraints,
             starting_cash=config.game_rules.starting_cash,
             base_risk_per_trade=preset.risk_per_trade,

@@ -98,6 +98,7 @@ class BreakoutStrategyPreset:
     initial_stop_atr: float
     trailing_stop_atr: float
     risk_per_trade: float
+    require_relative_volume_confirmation: bool = False
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -124,6 +125,11 @@ class BreakoutStrategyPreset:
             initial_stop_atr=_mapping_float(data, "initial_stop_atr"),
             trailing_stop_atr=_mapping_float(data, "trailing_stop_atr"),
             risk_per_trade=_mapping_float(data, "risk_per_trade"),
+            require_relative_volume_confirmation=_mapping_bool(
+                data,
+                "require_relative_volume_confirmation",
+                default=False,
+            ),
         )
 
     @property
@@ -133,19 +139,35 @@ class BreakoutStrategyPreset:
         return (
             f"lookback={self.breakout_lookback}|"
             f"rv={self.relative_volume_threshold:g}|"
+            f"rv_required={int(self.require_relative_volume_confirmation)}|"
             f"initial_stop={self.initial_stop_atr:g}|"
             f"trailing_stop={self.trailing_stop_atr:g}|"
             f"risk={self.risk_per_trade:g}"
         )
 
-    def apply_to_settings(self, settings: BreakoutMomentumSettings) -> BreakoutMomentumSettings:
-        """Return strategy settings with the preset's strategy fields applied."""
+    def apply_to_settings(
+        self,
+        settings: BreakoutMomentumSettings,
+        *,
+        force_require_relative_volume_confirmation: bool | None = None,
+    ) -> BreakoutMomentumSettings:
+        """Return strategy settings with the preset's fields applied.
+
+        When ``force_require_relative_volume_confirmation`` is provided, it overrides
+        the preset's own relative-volume confirmation policy. This preserves the
+        existing CLI behavior where a global flag can require RV for every preset.
+        """
 
         return replace(
             settings,
             breakout_lookback=self.breakout_lookback,
             relative_volume_threshold=self.relative_volume_threshold,
             stop_atr_multiple=self.initial_stop_atr,
+            require_relative_volume_confirmation=(
+                self.require_relative_volume_confirmation
+                if force_require_relative_volume_confirmation is None
+                else force_require_relative_volume_confirmation
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -156,6 +178,7 @@ class BreakoutStrategyPreset:
             "parameter_id": self.parameter_id,
             "breakout_lookback": self.breakout_lookback,
             "relative_volume_threshold": self.relative_volume_threshold,
+            "require_relative_volume_confirmation": self.require_relative_volume_confirmation,
             "initial_stop_atr": self.initial_stop_atr,
             "trailing_stop_atr": self.trailing_stop_atr,
             "risk_per_trade": self.risk_per_trade,
@@ -175,6 +198,16 @@ def build_default_breakout_presets(
         initial_stop_atr=risk_config.initial_stop_atr,
         trailing_stop_atr=risk_config.trailing_stop_atr,
         risk_per_trade=risk_config.risk_per_trade,
+        require_relative_volume_confirmation=False,
+    )
+    confirmed = BreakoutStrategyPreset(
+        name="confirmed_breakout",
+        breakout_lookback=signal_config.breakout_lookback,
+        relative_volume_threshold=signal_config.relative_volume_threshold,
+        initial_stop_atr=risk_config.initial_stop_atr,
+        trailing_stop_atr=risk_config.trailing_stop_atr,
+        risk_per_trade=risk_config.risk_per_trade,
+        require_relative_volume_confirmation=True,
     )
     conservative = BreakoutStrategyPreset(
         name="conservative_breakout",
@@ -183,6 +216,7 @@ def build_default_breakout_presets(
         initial_stop_atr=risk_config.initial_stop_atr + 0.5,
         trailing_stop_atr=risk_config.trailing_stop_atr + 0.5,
         risk_per_trade=max(risk_config.risk_per_trade * 0.5, 0.0025),
+        require_relative_volume_confirmation=False,
     )
     aggressive = BreakoutStrategyPreset(
         name="aggressive_breakout",
@@ -191,10 +225,12 @@ def build_default_breakout_presets(
         initial_stop_atr=max(1.0, risk_config.initial_stop_atr - 0.5),
         trailing_stop_atr=max(1.0, risk_config.trailing_stop_atr - 0.5),
         risk_per_trade=min(0.05, risk_config.risk_per_trade * 1.5),
+        require_relative_volume_confirmation=False,
     )
     return {
         conservative.name: conservative,
         standard.name: standard,
+        confirmed.name: confirmed,
         aggressive.name: aggressive,
     }
 
@@ -487,6 +523,27 @@ def _mapping_float(data: Mapping[str, Any], key: str) -> float:
         raise ValueError(f"Preset mapping is missing required field '{key}'.") from exc
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Preset field '{key}' must be a float.") from exc
+
+
+def _mapping_bool(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    if key not in data:
+        return default
+
+    value = data[key]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    raise ValueError(f"Preset field '{key}' must be a boolean.")
 
 
 def _metadata_float(value: Any) -> float | None:

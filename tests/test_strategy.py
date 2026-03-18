@@ -5,8 +5,10 @@ from datetime import date
 import pytest
 import pandas as pd
 
+from bot.config import RiskConfig, SignalConfig
 from bot.strategy.breakout_momentum import (
     BreakoutMomentumSettings,
+    build_default_breakout_presets,
     compute_breakout_features,
     generate_breakout_signal,
 )
@@ -91,6 +93,35 @@ def test_relative_volume_confirmation_can_block_or_allow_signal() -> None:
     assert allowed_signal.metadata["relative_volume_required"] is False
     assert allowed_signal.metadata["relative_volume_policy"] == "optional"
     assert allowed_signal.metadata["relative_volume_gate_passed"] is True
+
+
+def test_confirmed_breakout_blocks_low_relative_volume_that_standard_allows() -> None:
+    low_volume_breakout = _symbol_frame(
+        closes=[9.5, 10.5, 10.8, 11.6],
+        highs=[10.0, 11.0, 11.0, 12.0],
+        lows=[9.0, 10.0, 10.5, 11.0],
+        volumes=[100, 100, 100, 120],
+        symbol="AAA",
+    )
+    presets = build_default_breakout_presets(_signal_config(), _risk_config())
+    base_settings = BreakoutMomentumSettings.from_configs(
+        _signal_config(),
+        _risk_config(),
+        enable_regime_filter=False,
+    )
+
+    standard_signal = generate_breakout_signal(
+        low_volume_breakout,
+        settings=presets["standard_breakout"].apply_to_settings(base_settings),
+    )
+    confirmed_signal = generate_breakout_signal(
+        low_volume_breakout,
+        settings=presets["confirmed_breakout"].apply_to_settings(base_settings),
+    )
+
+    assert standard_signal is not None
+    assert standard_signal.metadata["relative_volume_policy"] == "optional"
+    assert confirmed_signal is None
 
 
 def test_signal_contents_include_stop_and_metadata() -> None:
@@ -207,4 +238,24 @@ def _benchmark_frame(closes: list[float], *, symbol: str) -> pd.DataFrame:
             "volume": [1_000_000] * len(closes),
             "symbol": [symbol] * len(closes),
         }
+    )
+
+
+def _signal_config() -> SignalConfig:
+    return SignalConfig(
+        breakout_lookback=3,
+        benchmark_symbol="SPY",
+        benchmark_sma_fast=2,
+        benchmark_sma_slow=3,
+        relative_volume_threshold=1.5,
+    )
+
+
+def _risk_config() -> RiskConfig:
+    return RiskConfig(
+        risk_per_trade=0.01,
+        atr_length=2,
+        initial_stop_atr=2.0,
+        trailing_stop_atr=3.0,
+        drawdown_risk_reduction_threshold=0.15,
     )

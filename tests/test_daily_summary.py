@@ -234,7 +234,7 @@ def test_daily_research_summary_labels_relative_volume_policy_in_rationale() -> 
 
 
 def test_daily_research_summary_labels_required_relative_volume_when_enabled() -> None:
-    preset = _selected_presets("standard_breakout")[0]
+    preset = _selected_presets("confirmed_breakout")[0]
     approved = _evaluation(
         preset,
         symbol="AAA",
@@ -242,7 +242,6 @@ def test_daily_research_summary_labels_required_relative_volume_when_enabled() -
         shares=20,
         relative_volume=2.0,
         relative_volume_confirmed=True,
-        relative_volume_required=True,
     )
 
     execution_batch = ManualExecutor().build_execution_batch(
@@ -261,6 +260,7 @@ def test_daily_research_summary_labels_required_relative_volume_when_enabled() -
         preset_selection_source="named_presets",
     )
 
+    assert preset.require_relative_volume_confirmation is True
     assert "relative_volume=2.00 (required; threshold=1.50; confirmed)" in summary.rows[0].rationale
 
 
@@ -308,10 +308,15 @@ def _evaluation(
     entry_price: float = 100.0,
     relative_volume: float = 1.8,
     relative_volume_confirmed: bool | None = None,
-    relative_volume_required: bool = False,
+    relative_volume_required: bool | None = None,
     rejection_reasons: tuple[str, ...] = (),
 ) -> PresetCandidateEvaluation:
     relative_volume_threshold = preset.relative_volume_threshold
+    required = (
+        preset.require_relative_volume_confirmation
+        if relative_volume_required is None
+        else relative_volume_required
+    )
     confirmed = (
         relative_volume >= relative_volume_threshold
         if relative_volume_confirmed is None
@@ -333,11 +338,11 @@ def _evaluation(
             "relative_volume": relative_volume,
             "relative_volume_threshold": relative_volume_threshold,
             "relative_volume_confirmed": confirmed,
-            "relative_volume_required": relative_volume_required,
+            "relative_volume_required": required,
             "relative_volume_policy": (
-                "required" if relative_volume_required else "optional"
+                "required" if required else "optional"
             ),
-            "relative_volume_gate_passed": confirmed or not relative_volume_required,
+            "relative_volume_gate_passed": confirmed or not required,
         },
     )
     sizing = PositionSizingResult(

@@ -29,11 +29,13 @@ def test_resolve_breakout_strategy_presets_supports_defaults_config_and_cli() ->
                 "initial_stop_atr": 2.7,
                 "trailing_stop_atr": 3.3,
                 "risk_per_trade": 0.008,
+                "require_relative_volume_confirmation": True,
             }
         },
         cli_preset_definitions=(
             "name=cli_fast,breakout_lookback=12,relative_volume_threshold=1.2,"
-            "initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.015",
+            "initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.015,"
+            "require_relative_volume_confirmation=false",
         ),
         preset_names=("conservative_breakout", "research_breakout", "cli_fast"),
     )
@@ -44,7 +46,9 @@ def test_resolve_breakout_strategy_presets_supports_defaults_config_and_cli() ->
         "cli_fast",
     ]
     assert presets[1].breakout_lookback == 30
+    assert presets[1].require_relative_volume_confirmation is True
     assert presets[2].risk_per_trade == pytest.approx(0.015)
+    assert presets[2].require_relative_volume_confirmation is False
 
 
 def test_build_default_breakout_presets_exposes_named_variants() -> None:
@@ -53,9 +57,32 @@ def test_build_default_breakout_presets_exposes_named_variants() -> None:
     assert list(presets) == [
         "conservative_breakout",
         "standard_breakout",
+        "confirmed_breakout",
         "aggressive_breakout",
     ]
     assert presets["standard_breakout"].breakout_lookback == 20
+    assert (
+        presets["confirmed_breakout"].breakout_lookback
+        == presets["standard_breakout"].breakout_lookback
+    )
+    assert (
+        presets["confirmed_breakout"].relative_volume_threshold
+        == presets["standard_breakout"].relative_volume_threshold
+    )
+    assert (
+        presets["confirmed_breakout"].initial_stop_atr
+        == presets["standard_breakout"].initial_stop_atr
+    )
+    assert (
+        presets["confirmed_breakout"].trailing_stop_atr
+        == presets["standard_breakout"].trailing_stop_atr
+    )
+    assert (
+        presets["confirmed_breakout"].risk_per_trade
+        == presets["standard_breakout"].risk_per_trade
+    )
+    assert presets["standard_breakout"].require_relative_volume_confirmation is False
+    assert presets["confirmed_breakout"].require_relative_volume_confirmation is True
     assert presets["conservative_breakout"].risk_per_trade < presets["standard_breakout"].risk_per_trade
     assert presets["aggressive_breakout"].risk_per_trade > presets["standard_breakout"].risk_per_trade
 

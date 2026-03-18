@@ -190,8 +190,8 @@ If sweep arguments are omitted, the command uses the current single values from 
 
 ```bash
 investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31
-investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset-names conservative_breakout,standard_breakout,aggressive_breakout --objective sharpe_ratio
-investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset "name=research_fast,breakout_lookback=15,relative_volume_threshold=1.2,initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.012"
+investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset-names standard_breakout,confirmed_breakout,aggressive_breakout --objective sharpe_ratio
+investopedia-bot compare-strategies data/raw/candidate_symbols.txt --start 2025-01-01 --end 2025-03-31 --preset "name=research_fast,breakout_lookback=15,relative_volume_threshold=1.2,initial_stop_atr=2.0,trailing_stop_atr=2.5,risk_per_trade=0.012,require_relative_volume_confirmation=true"
 ```
 
 This command:
@@ -200,7 +200,8 @@ This command:
 - reuses the deterministic backtest engine and the existing summary metric logic
 - writes `comparison_results`, `ranked_presets`, and `summary.json` in machine-readable formats
 
-Built-in presets are `conservative_breakout`, `standard_breakout`, and `aggressive_breakout`.
+Built-in presets are `conservative_breakout`, `standard_breakout`, `confirmed_breakout`, and `aggressive_breakout`.
+`confirmed_breakout` matches `standard_breakout` except that relative-volume confirmation is a hard entry gate.
 You can also add repo-local presets in `config/strategy.yaml` with an optional `comparison_presets` section:
 
 ```yaml
@@ -211,13 +212,14 @@ comparison_presets:
     initial_stop_atr: 2.7
     trailing_stop_atr: 3.3
     risk_per_trade: 0.008
+    require_relative_volume_confirmation: true
 ```
 
 ### Generate a daily research summary
 
 ```bash
 investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17
-investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --preset-names standard_breakout,aggressive_breakout
+investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --preset-names standard_breakout,confirmed_breakout
 investopedia-bot daily-summary data/raw/candidate_symbols.txt --as-of 2026-03-17 --comparison-results data/processed/strategy_comparison/2025-01-01_2025-03-31/ranked_presets.csv
 ```
 
