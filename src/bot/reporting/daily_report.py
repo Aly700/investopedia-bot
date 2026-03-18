@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from bot.execution.interface import ExecutionBatch, ExecutionOrder
-from bot.risk.portfolio_rules import ExistingPosition, RiskAssessedCandidate
+from bot.risk.portfolio_rules import (
+    PORTFOLIO_REVIEW_ACTIONS,
+    ExistingPosition,
+    RiskAssessedCandidate,
+)
 from bot.strategy.breakout_momentum import BreakoutStrategyPreset, build_breakout_rationale
 
 
@@ -103,21 +107,24 @@ MARKET_MONITOR_COLUMNS = (
     "metadata_json",
 )
 MARKET_MONITOR_CATEGORIES = (
-    "BUY CANDIDATE",
-    "HOLD",
-    "WATCH CLOSELY",
-    "RAISE STOP",
     "EXIT CANDIDATE",
+    "RAISE STOP",
+    "BUY CANDIDATE",
+    "WATCH CLOSELY",
+    "HOLD",
     "NO ACTION",
 )
 MARKET_MONITOR_CATEGORY_PRIORITY = {
-    "EXIT CANDIDATE": 0,
-    "RAISE STOP": 1,
-    "BUY CANDIDATE": 2,
-    "WATCH CLOSELY": 3,
-    "HOLD": 4,
-    "NO ACTION": 5,
+    category: priority for priority, category in enumerate(MARKET_MONITOR_CATEGORIES)
 }
+_MISSING_PORTFOLIO_REVIEW_CATEGORIES = sorted(
+    set(PORTFOLIO_REVIEW_ACTIONS) - set(MARKET_MONITOR_CATEGORIES)
+)
+if _MISSING_PORTFOLIO_REVIEW_CATEGORIES:
+    raise RuntimeError(
+        "Portfolio review actions must also be valid market monitor categories. "
+        f"Missing categories: {_MISSING_PORTFOLIO_REVIEW_CATEGORIES}"
+    )
 
 
 @dataclass(frozen=True)
@@ -424,6 +431,13 @@ class PortfolioReviewRow:
     rationale: str
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.suggested_action not in PORTFOLIO_REVIEW_ACTIONS:
+            raise ValueError(
+                f"suggested_action must be one of {PORTFOLIO_REVIEW_ACTIONS}, "
+                f"got '{self.suggested_action}'."
+            )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation of the review row."""
 
@@ -480,6 +494,12 @@ class PortfolioReviewReport:
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly review report payload."""
 
+        action_counts = {
+            f"{action.lower().replace(' ', '_')}_count": sum(
+                row.suggested_action == action for row in self.rows
+            )
+            for action in PORTFOLIO_REVIEW_ACTIONS
+        }
         return {
             "as_of_date": self.as_of_date.isoformat(),
             "generated_at_utc": self.generated_at_utc,
@@ -489,10 +509,7 @@ class PortfolioReviewReport:
             "reviewed_symbols": [row.symbol for row in self.rows],
             "current_position_symbols": [position.symbol for position in self.current_positions],
             "current_positions": [position.to_dict() for position in self.current_positions],
-            "hold_count": sum(row.suggested_action == "HOLD" for row in self.rows),
-            "watch_closely_count": sum(row.suggested_action == "WATCH CLOSELY" for row in self.rows),
-            "raise_stop_count": sum(row.suggested_action == "RAISE STOP" for row in self.rows),
-            "exit_candidate_count": sum(row.suggested_action == "EXIT CANDIDATE" for row in self.rows),
+            **action_counts,
             "rows": [row.to_dict() for row in self.rows],
         }
 
@@ -604,16 +621,18 @@ class MarketMonitorReport:
         counts = self.category_counts
         lines = [
             f"Market monitor for {self.as_of_date.isoformat()}",
-            f"BUY CANDIDATE: {counts['BUY CANDIDATE']}",
-            f"HOLD: {counts['HOLD']}",
-            f"WATCH CLOSELY: {counts['WATCH CLOSELY']}",
-            f"RAISE STOP: {counts['RAISE STOP']}",
             f"EXIT CANDIDATE: {counts['EXIT CANDIDATE']}",
+            f"RAISE STOP: {counts['RAISE STOP']}",
+            f"BUY CANDIDATE: {counts['BUY CANDIDATE']}",
+            f"WATCH CLOSELY: {counts['WATCH CLOSELY']}",
+            f"HOLD: {counts['HOLD']}",
             f"NO ACTION: {counts['NO ACTION']}",
             "",
         ]
         for alert in self.alerts:
-            details: list[str] = [alert.category, alert.symbol]
+            details: list[str] = [alert.category]
+            if alert.symbol:
+                details.append(alert.symbol)
             if alert.preset_name:
                 details.append(f"preset={alert.preset_name}")
             if alert.latest_close is not None:
@@ -694,6 +713,9 @@ def build_market_monitor_report(
 
     if portfolio_review is not None:
         benchmark_symbol = portfolio_review.benchmark_symbol or benchmark_symbol
+        preset_names.extend(
+            row.preset_name for row in portfolio_review.rows if row.preset_name is not None
+        )
         for row in portfolio_review.rows:
             alerts.append(
                 MarketMonitorAlertRow(
@@ -716,7 +738,7 @@ def build_market_monitor_report(
         alerts.append(
             MarketMonitorAlertRow(
                 date=as_of_date,
-                symbol="MARKET",
+                symbol="",
                 category="NO ACTION",
                 preset_name=None,
                 latest_close=None,

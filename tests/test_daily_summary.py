@@ -4,7 +4,11 @@ import csv
 import json
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
+
+import bot.main as main_module
 from bot.execution.manual_executor import ManualExecutor
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
 from bot.reporting.daily_report import (
@@ -19,7 +23,11 @@ from bot.reporting.daily_report import (
     write_portfolio_review_report,
     write_daily_research_summary,
 )
-from bot.risk.portfolio_rules import ExistingPosition, RiskAssessedCandidate
+from bot.risk.portfolio_rules import (
+    PORTFOLIO_REVIEW_ACTIONS,
+    ExistingPosition,
+    RiskAssessedCandidate,
+)
 from bot.risk.position_sizing import PositionSizingResult
 from bot.strategy.breakout_momentum import BreakoutStrategyPreset, build_default_breakout_presets
 from bot.strategy.signal_models import StrategySignal
@@ -199,6 +207,74 @@ def test_portfolio_review_report_exports_one_holding(tmp_path: Path) -> None:
     assert rows[0]["suggested_stop"] == "101"
 
 
+def test_portfolio_review_report_to_dict_counts_actions_from_declared_action_list() -> None:
+    positions = [
+        ExistingPosition(
+            symbol=f"SYM{index}",
+            shares=10,
+            average_entry_price=100.0 + index,
+            current_stop=95.0 + index,
+            preset_name="standard_breakout",
+        )
+        for index, _ in enumerate(PORTFOLIO_REVIEW_ACTIONS, start=1)
+    ]
+    rows = [
+        PortfolioReviewRow(
+            date=date(2024, 1, 5),
+            symbol=position.symbol,
+            quantity=position.shares,
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            suggested_stop=position.current_stop,
+            latest_close=position.average_entry_price + 5.0,
+            unrealized_pl_pct=0.05,
+            distance_to_stop_pct=0.10,
+            regime_passed=True,
+            above_entry=True,
+            suggested_action=action,
+            preset_name="standard_breakout",
+            rationale=f"{action} rationale.",
+            metadata={},
+        )
+        for position, action in zip(positions, PORTFOLIO_REVIEW_ACTIONS)
+    ]
+
+    payload = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        rows=rows,
+        current_positions=positions,
+        benchmark_symbol="SPY",
+    ).to_dict()
+
+    expected_count_fields = {
+        f"{action.lower().replace(' ', '_')}_count": 1
+        for action in PORTFOLIO_REVIEW_ACTIONS
+    }
+    for key, expected_value in expected_count_fields.items():
+        assert payload[key] == expected_value
+
+
+def test_portfolio_review_row_rejects_invalid_suggested_action() -> None:
+    with pytest.raises(ValueError, match="got 'TRIM'"):
+        PortfolioReviewRow(
+            date=date(2024, 1, 5),
+            symbol="AAPL",
+            quantity=10,
+            average_entry_price=100.0,
+            current_stop=95.0,
+            suggested_stop=101.0,
+            latest_close=110.0,
+            unrealized_pl_pct=0.10,
+            distance_to_stop_pct=(110.0 - 95.0) / 110.0,
+            regime_passed=True,
+            above_entry=True,
+            suggested_action="TRIM",
+            preset_name="standard_breakout",
+            rationale="Invalid action for regression coverage.",
+            metadata={},
+        )
+
+
 def test_market_monitor_report_handles_no_alert_day(tmp_path: Path) -> None:
     summary = build_daily_research_summary(
         as_of_date=date(2024, 1, 5),
@@ -221,7 +297,18 @@ def test_market_monitor_report_handles_no_alert_day(tmp_path: Path) -> None:
 
     assert payload["no_action_count"] == 1
     assert payload["alerts"][0]["category"] == "NO ACTION"
+    assert payload["alerts"][0]["symbol"] == ""
     assert "NO ACTION: 1" in text
+
+
+def test_market_monitor_report_handles_no_action_when_inputs_are_absent() -> None:
+    report = build_market_monitor_report(as_of_date=date(2024, 1, 5))
+
+    assert report.category_counts["NO ACTION"] == 1
+    assert len(report.alerts) == 1
+    assert report.alerts[0].category == "NO ACTION"
+    assert report.alerts[0].symbol == ""
+    assert report.preset_names == ()
 
 
 def test_market_monitor_report_includes_buy_candidate_alert() -> None:
@@ -289,6 +376,44 @@ def test_market_monitor_report_includes_portfolio_review_alert() -> None:
     assert report.category_counts["RAISE STOP"] == 1
     assert report.alerts[0].category == "RAISE STOP"
     assert report.alerts[0].symbol == "AAPL"
+
+
+def test_market_monitor_report_includes_review_preset_names_without_daily_summary() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        preset_name="confirmed_conservative_breakout",
+    )
+    review = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        rows=[
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=101.0,
+                latest_close=110.0,
+                unrealized_pl_pct=0.10,
+                distance_to_stop_pct=(110.0 - 95.0) / 110.0,
+                regime_passed=True,
+                above_entry=True,
+                suggested_action="RAISE STOP",
+                preset_name="confirmed_conservative_breakout",
+                rationale="Trailing-stop logic supports a higher stop.",
+                metadata={"trailing_stop_candidate": 101.0},
+            )
+        ],
+        current_positions=[position],
+        benchmark_symbol="SPY",
+    )
+
+    report = build_market_monitor_report(as_of_date=date(2024, 1, 5), portfolio_review=review)
+
+    assert report.preset_names == ("confirmed_conservative_breakout",)
 
 
 def test_market_monitor_report_combines_entry_and_position_management_alerts(
@@ -360,6 +485,202 @@ def test_market_monitor_report_combines_entry_and_position_management_alerts(
     assert [row["category"] for row in rows] == ["RAISE STOP", "BUY CANDIDATE"]
     assert "BUY CANDIDATE: 1" in text
     assert "RAISE STOP: 1" in text
+
+
+def test_market_monitor_text_summary_header_matches_alert_priority_order() -> None:
+    report = build_market_monitor_report(as_of_date=date(2024, 1, 5))
+
+    assert report.to_text().splitlines()[:7] == [
+        "Market monitor for 2024-01-05",
+        "EXIT CANDIDATE: 0",
+        "RAISE STOP: 0",
+        "BUY CANDIDATE: 0",
+        "WATCH CLOSELY: 0",
+        "HOLD: 0",
+        "NO ACTION: 1",
+    ]
+
+
+def test_market_monitor_report_orders_multiple_alert_categories_by_priority() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved = _evaluation(preset, symbol="MSFT", approved=True, shares=25)
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=ManualExecutor().build_execution_batch(
+            [approved.candidate],
+            as_of_date=date(2024, 1, 5),
+        ),
+        evaluations=[approved],
+        selected_presets=[preset],
+        universe_symbols=["MSFT"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        preset_name="standard_breakout",
+    )
+    review = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        rows=[
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="TSLA",
+                quantity=5,
+                average_entry_price=200.0,
+                current_stop=195.0,
+                suggested_stop=195.0,
+                latest_close=190.0,
+                unrealized_pl_pct=-0.05,
+                distance_to_stop_pct=(190.0 - 195.0) / 190.0,
+                regime_passed=False,
+                above_entry=False,
+                suggested_action="EXIT CANDIDATE",
+                preset_name="standard_breakout",
+                rationale="Close is below the active stop.",
+                metadata={},
+            ),
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=101.0,
+                latest_close=110.0,
+                unrealized_pl_pct=0.10,
+                distance_to_stop_pct=(110.0 - 95.0) / 110.0,
+                regime_passed=True,
+                above_entry=True,
+                suggested_action="RAISE STOP",
+                preset_name="standard_breakout",
+                rationale="Trailing-stop logic supports a higher stop.",
+                metadata={"trailing_stop_candidate": 101.0},
+            ),
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AMD",
+                quantity=10,
+                average_entry_price=150.0,
+                current_stop=145.0,
+                suggested_stop=145.0,
+                latest_close=147.0,
+                unrealized_pl_pct=-0.02,
+                distance_to_stop_pct=(147.0 - 145.0) / 147.0,
+                regime_passed=True,
+                above_entry=False,
+                suggested_action="WATCH CLOSELY",
+                preset_name="standard_breakout",
+                rationale="Position is below entry and close to the stop.",
+                metadata={},
+            ),
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="GOOG",
+                quantity=8,
+                average_entry_price=120.0,
+                current_stop=110.0,
+                suggested_stop=110.0,
+                latest_close=130.0,
+                unrealized_pl_pct=0.0833,
+                distance_to_stop_pct=(130.0 - 110.0) / 130.0,
+                regime_passed=True,
+                above_entry=True,
+                suggested_action="HOLD",
+                preset_name="standard_breakout",
+                rationale="Trend remains healthy above the stop.",
+                metadata={},
+            ),
+        ],
+        current_positions=[position],
+        benchmark_symbol="SPY",
+    )
+
+    report = build_market_monitor_report(
+        as_of_date=date(2024, 1, 5),
+        daily_summary=summary,
+        portfolio_review=review,
+    )
+
+    assert [alert.category for alert in report.alerts] == [
+        "EXIT CANDIDATE",
+        "RAISE STOP",
+        "BUY CANDIDATE",
+        "WATCH CLOSELY",
+        "HOLD",
+    ]
+
+
+def test_handle_monitor_market_payload_includes_daily_summary_status_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved = _evaluation(preset, symbol="AAA", approved=True, shares=25)
+    rejected = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=False,
+        shares=0,
+        rejection_reasons=("Max concurrent positions reached.",),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=ManualExecutor().build_execution_batch(
+            [approved.candidate, rejected.candidate],
+            as_of_date=date(2024, 1, 5),
+        ),
+        evaluations=[approved, rejected],
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB", "CCC"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ("CCC",)},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: SimpleNamespace(project_root=tmp_path))
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
+    monkeypatch.setattr(
+        main_module,
+        "_run_daily_summary_workflow",
+        lambda args, *, config, provider, current_positions=None: {"summary": summary},
+    )
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--config-dir",
+            str(tmp_path / "config"),
+            "--env-file",
+            str(tmp_path / ".env"),
+            "monitor-market",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--output-dir",
+            str(tmp_path / "monitor"),
+            "--format",
+            "json",
+        ]
+    )
+
+    result = args.handler(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert payload["approved_count"] == 1
+    assert payload["rejected_count"] == 1
+    assert payload["universe_count"] == 3
+    assert payload["buy_candidate_count"] == 1
+    assert Path(payload["outputs"]["market_monitor_json"]).exists()
 
 
 def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:
