@@ -6,9 +6,12 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 import bot.main as main_module
+from bot.config import load_app_config
+from bot.data.providers import DataProviderError
 from bot.execution.manual_executor import ManualExecutor
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
 from bot.reporting.daily_report import (
@@ -731,6 +734,165 @@ def test_handle_monitor_market_payload_includes_daily_summary_status_counts(
     assert payload["universe_count"] == 3
     assert payload["buy_candidate_count"] == 1
     assert Path(payload["outputs"]["market_monitor_json"]).exists()
+
+
+def test_run_portfolio_review_workflow_skips_symbols_with_provider_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = load_app_config()
+    current_positions = [
+        ExistingPosition(
+            symbol="AAPL",
+            shares=10,
+            average_entry_price=100.0,
+            current_stop=95.0,
+            preset_name="standard_breakout",
+        ),
+        ExistingPosition(
+            symbol="MSFT",
+            shares=5,
+            average_entry_price=200.0,
+            current_stop=190.0,
+            preset_name="standard_breakout",
+        ),
+    ]
+    args = SimpleNamespace(
+        as_of=date(2024, 1, 5),
+        portfolio_file=None,
+        benchmark_symbol=None,
+        refresh_cache=False,
+        config_dir=tmp_path,
+    )
+
+    monkeypatch.setattr(main_module, "_portfolio_review_preset_catalog", lambda args, config: {})
+    monkeypatch.setattr(
+        main_module,
+        "_build_portfolio_review_plan",
+        lambda position, *, preset_catalog, base_settings, as_of_date: {
+            "position": position,
+            "settings": SimpleNamespace(enable_regime_filter=False),
+            "fetch_start": as_of_date,
+        },
+    )
+
+    def fake_build_review_row(plan: dict[str, object], **_: object) -> PortfolioReviewRow:
+        position = plan["position"]
+        if not isinstance(position, ExistingPosition):
+            raise TypeError("position must be an ExistingPosition")
+        if position.symbol == "MSFT":
+            raise DataProviderError("provider failed")
+        return PortfolioReviewRow(
+            date=date(2024, 1, 5),
+            symbol=position.symbol,
+            quantity=position.shares,
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            suggested_stop=101.0,
+            latest_close=110.0,
+            unrealized_pl_pct=0.10,
+            distance_to_stop_pct=(110.0 - 95.0) / 110.0,
+            regime_passed=True,
+            above_entry=True,
+            suggested_action="RAISE STOP",
+            preset_name="standard_breakout",
+            rationale="Trailing-stop logic supports a higher stop.",
+            metadata={},
+        )
+
+    monkeypatch.setattr(main_module, "_build_portfolio_review_row", fake_build_review_row)
+
+    report = main_module._run_portfolio_review_workflow(
+        args,
+        config=config,
+        provider=object(),
+        current_positions=current_positions,
+    )
+
+    assert [row.symbol for row in report.rows] == ["AAPL"]
+    assert report.to_dict()["reviewed_symbol_count"] == 1
+
+
+def test_run_daily_summary_workflow_treats_held_symbol_as_no_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config()
+    current_positions = [
+        ExistingPosition(
+            symbol="AAA",
+            shares=10,
+            average_entry_price=100.0,
+            current_stop=95.0,
+            preset_name="standard_breakout",
+        )
+    ]
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache: [
+            SimpleNamespace(symbol="AAA")
+        ],
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    signal_calls: list[tuple[str, bool]] = []
+
+    def fake_generate_breakout_signal(
+        bars: pd.DataFrame,
+        *,
+        settings: object,
+        benchmark_frame: pd.DataFrame | None,
+        has_open_position: bool,
+        symbol: str,
+    ) -> None:
+        signal_calls.append((symbol, has_open_position))
+        return None
+
+    monkeypatch.setattr(main_module, "generate_breakout_signal", fake_generate_breakout_signal)
+
+    workflow = main_module._run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=current_positions,
+    )
+    summary = workflow["summary"]
+    payload = summary.to_dict()
+
+    assert signal_calls == [("AAA", True)]
+    assert payload["candidate_count"] == 0
+    assert payload["rejected_count"] == 0
+    assert payload["unique_no_signal_symbols"] == ["AAA"]
 
 
 def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:

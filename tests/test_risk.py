@@ -551,7 +551,28 @@ def test_review_existing_long_position_suggests_exit_candidate() -> None:
     )
 
     assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.suggested_stop is None
     assert "current stop" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_clears_stop_for_weak_regime_exit_candidate() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=85.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=95.0,
+        regime_passed=False,
+        trailing_stop_candidate=90.0,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.suggested_stop is None
+    assert "weak" in " ".join(decision.rationale).lower()
 
 
 def _signal(*, symbol: str, entry_price: float, stop_price: float | None) -> StrategySignal:

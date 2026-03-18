@@ -51,6 +51,7 @@ from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
 from bot.reporting.daily_report import (
     PresetCandidateEvaluation,
+    PortfolioReviewReport,
     PortfolioReviewRow,
     build_daily_research_summary,
     build_market_monitor_report,
@@ -1120,14 +1121,17 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
     review_json_path = write_portfolio_review_report(report, output_dir / "portfolio_review.json")
     review_csv_path = write_portfolio_review_report(report, output_dir / "portfolio_review.csv")
     report_payload = report.to_dict()
+    action_counts = {
+        f"{action.lower().replace(' ', '_')}_count": report_payload[
+            f"{action.lower().replace(' ', '_')}_count"
+        ]
+        for action in PORTFOLIO_REVIEW_ACTIONS
+    }
     payload = {
         "portfolio_path": str(args.portfolio_file.resolve()),
         "position_count": len(current_positions),
         "symbols_reviewed": report_payload["reviewed_symbols"],
-        "hold_count": report_payload["hold_count"],
-        "watch_closely_count": report_payload["watch_closely_count"],
-        "raise_stop_count": report_payload["raise_stop_count"],
-        "exit_candidate_count": report_payload["exit_candidate_count"],
+        **action_counts,
         "outputs": {
             "portfolio_review_json": str(review_json_path),
             "portfolio_review_csv": str(review_csv_path),
@@ -1886,7 +1890,10 @@ def _run_daily_summary_workflow(
                 bars,
                 settings=strategy_settings,
                 benchmark_frame=benchmark_frame,
-                has_open_position=False,
+                has_open_position=any(
+                    current_position.symbol == member.symbol
+                    for current_position in resolved_current_positions
+                ),
                 symbol=member.symbol,
             )
             if signal is None:
@@ -1988,7 +1995,7 @@ def _run_portfolio_review_workflow(
     config: AppConfig,
     provider: object | None,
     current_positions: list[ExistingPosition] | None = None,
-) -> object:
+) -> PortfolioReviewReport:
     resolved_current_positions = (
         _load_current_positions(args.portfolio_file)
         if current_positions is None
@@ -2043,16 +2050,22 @@ def _run_portfolio_review_workflow(
                 f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
             )
 
-    rows = [
-        _build_portfolio_review_row(
-            plan,
-            provider=provider,
-            as_of_date=args.as_of,
-            benchmark_frame=benchmark_frame,
-            refresh_cache=args.refresh_cache,
-        )
-        for plan in position_plans
-    ]
+    rows: list[PortfolioReviewRow] = []
+    for plan in position_plans:
+        position = plan.get("position")
+        symbol = position.symbol if isinstance(position, ExistingPosition) else "<unknown>"
+        try:
+            rows.append(
+                _build_portfolio_review_row(
+                    plan,
+                    provider=provider,
+                    as_of_date=args.as_of,
+                    benchmark_frame=benchmark_frame,
+                    refresh_cache=args.refresh_cache,
+                )
+            )
+        except DataProviderError as exc:
+            LOGGER.warning("Skipping held symbol %s due to provider error: %s", symbol, exc)
     return build_portfolio_review_report(
         as_of_date=args.as_of,
         rows=rows,
@@ -2133,6 +2146,7 @@ def _build_portfolio_review_row(
         regime_passed=regime_passed,
         trailing_stop_candidate=trailing_stop_candidate,
     )
+    entry_date_used = _position_entry_date(position)
     return PortfolioReviewRow(
         date=as_of_date,
         symbol=position.symbol,
@@ -2156,7 +2170,7 @@ def _build_portfolio_review_row(
             "regime_filter_enabled": settings.enable_regime_filter,
             "regime_filter_mode": settings.regime_filter_mode,
             "benchmark_symbol": settings.benchmark_symbol if settings.enable_regime_filter else None,
-            "entry_date_used": _position_entry_date(position),
+            "entry_date_used": entry_date_used.isoformat() if entry_date_used is not None else None,
         },
     )
 
@@ -2211,7 +2225,7 @@ def _portfolio_review_reference_close(
     return float(prepared["close"].max())
 
 
-def _position_entry_date(position: ExistingPosition) -> str | None:
+def _position_entry_date(position: ExistingPosition) -> date | None:
     for key in ("entry_date", "entry_datetime", "opened_at"):
         raw_value = position.metadata.get(key)
         if raw_value is None:
@@ -2219,7 +2233,7 @@ def _position_entry_date(position: ExistingPosition) -> str | None:
         parsed_value = pd.to_datetime(raw_value, errors="coerce")
         if pd.isna(parsed_value):
             continue
-        return parsed_value.date().isoformat()
+        return parsed_value.date()
     return None
 
 

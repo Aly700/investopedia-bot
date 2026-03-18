@@ -636,16 +636,9 @@ class MarketMonitorReport:
         """Return a compact plain-text summary suitable for later notifications."""
 
         counts = self.category_counts
-        lines = [
-            f"Market monitor for {self.as_of_date.isoformat()}",
-            f"EXIT CANDIDATE: {counts['EXIT CANDIDATE']}",
-            f"RAISE STOP: {counts['RAISE STOP']}",
-            f"BUY CANDIDATE: {counts['BUY CANDIDATE']}",
-            f"WATCH CLOSELY: {counts['WATCH CLOSELY']}",
-            f"HOLD: {counts['HOLD']}",
-            f"NO ACTION: {counts['NO ACTION']}",
-            "",
-        ]
+        lines = [f"Market monitor for {self.as_of_date.isoformat()}"]
+        lines.extend(f"{category}: {counts[category]}" for category in MARKET_MONITOR_CATEGORIES)
+        lines.append("")
         for alert in self.alerts:
             details: list[str] = [alert.category]
             if alert.symbol:

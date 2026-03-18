@@ -421,6 +421,9 @@ def review_existing_long_position(
         rationale.append("Position remains above entry and sufficiently above the current stop.")
         action = "HOLD"
 
+    if action == "EXIT CANDIDATE":
+        suggested_stop = None
+
     return PortfolioReviewDecision(
         latest_close=latest_close,
         unrealized_pl_pct=unrealized_pl_pct,
