@@ -281,6 +281,52 @@ def test_apply_to_settings_preserves_trailing_stop_atr_across_all_default_preset
         )
 
 
+def test_apply_to_settings_propagates_regime_filter_mode() -> None:
+    """apply_to_settings must wire regime_filter_mode from the preset into BreakoutMomentumSettings."""
+    base_settings = BreakoutMomentumSettings.from_configs(_signal_config(), _risk_config())
+    # base_settings defaults to "either"; use a clearly different preset value.
+    preset = BreakoutStrategyPreset(
+        name="custom_regime",
+        breakout_lookback=15,
+        relative_volume_threshold=1.5,
+        initial_stop_atr=2.5,
+        trailing_stop_atr=3.0,
+        risk_per_trade=0.01,
+        regime_filter_mode="fast_above_slow",
+    )
+
+    applied = preset.apply_to_settings(base_settings)
+
+    assert applied.regime_filter_mode == "fast_above_slow"
+    assert applied.regime_filter_mode != base_settings.regime_filter_mode
+
+
+def test_aggressive_breakout_preset_uses_fast_above_slow_regime() -> None:
+    presets = build_default_breakout_presets(_signal_config(), _risk_config())
+    assert presets["aggressive_breakout"].regime_filter_mode == "fast_above_slow"
+
+
+def test_non_aggressive_presets_use_either_regime() -> None:
+    presets = build_default_breakout_presets(_signal_config(), _risk_config())
+    non_aggressive = [name for name in presets if name != "aggressive_breakout"]
+
+    for name in non_aggressive:
+        assert presets[name].regime_filter_mode == "either", (
+            f"Preset '{name}' should use 'either' regime mode."
+        )
+
+
+def test_aggressive_breakout_apply_to_settings_sets_fast_above_slow() -> None:
+    """End-to-end: applying aggressive preset must produce settings with fast_above_slow."""
+    base_settings = BreakoutMomentumSettings.from_configs(_signal_config(), _risk_config())
+    presets = build_default_breakout_presets(_signal_config(), _risk_config())
+
+    applied = presets["aggressive_breakout"].apply_to_settings(base_settings)
+
+    assert applied.regime_filter_mode == "fast_above_slow"
+    assert applied.regime_settings.mode == "fast_above_slow"
+
+
 def _signal_config() -> SignalConfig:
     return SignalConfig(
         breakout_lookback=20,

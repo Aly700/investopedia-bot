@@ -103,6 +103,7 @@ class BreakoutStrategyPreset:
     trailing_stop_atr: float
     risk_per_trade: float
     require_relative_volume_confirmation: bool = False
+    regime_filter_mode: RegimeFilterMode = "either"
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -134,6 +135,7 @@ class BreakoutStrategyPreset:
                 "require_relative_volume_confirmation",
                 default=False,
             ),
+            regime_filter_mode=_mapping_regime_filter_mode(data),
         )
 
     @property
@@ -146,7 +148,8 @@ class BreakoutStrategyPreset:
             f"rv_required={int(self.require_relative_volume_confirmation)}|"
             f"initial_stop={self.initial_stop_atr:g}|"
             f"trailing_stop={self.trailing_stop_atr:g}|"
-            f"risk={self.risk_per_trade:g}"
+            f"risk={self.risk_per_trade:g}|"
+            f"regime={self.regime_filter_mode}"
         )
 
     def apply_to_settings(
@@ -173,6 +176,7 @@ class BreakoutStrategyPreset:
                 if force_require_relative_volume_confirmation is None
                 else force_require_relative_volume_confirmation
             ),
+            regime_filter_mode=self.regime_filter_mode,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -187,6 +191,7 @@ class BreakoutStrategyPreset:
             "initial_stop_atr": self.initial_stop_atr,
             "trailing_stop_atr": self.trailing_stop_atr,
             "risk_per_trade": self.risk_per_trade,
+            "regime_filter_mode": self.regime_filter_mode,
         }
 
 
@@ -240,6 +245,7 @@ def build_default_breakout_presets(
         trailing_stop_atr=max(1.0, risk_config.trailing_stop_atr - 0.5),
         risk_per_trade=min(0.05, risk_config.risk_per_trade * 1.5),
         require_relative_volume_confirmation=False,
+        regime_filter_mode="fast_above_slow",
     )
     return {
         conservative.name: conservative,
@@ -563,6 +569,21 @@ def _mapping_bool(
         if normalized in {"false", "0", "no", "n", "off"}:
             return False
     raise ValueError(f"Preset field '{key}' must be a boolean.")
+
+
+_VALID_REGIME_MODES: frozenset[str] = frozenset({"close_above_slow", "fast_above_slow", "either"})
+
+
+def _mapping_regime_filter_mode(data: Mapping[str, Any]) -> RegimeFilterMode:
+    key = "regime_filter_mode"
+    if key not in data:
+        return "either"
+    value = str(data[key]).strip()
+    if value not in _VALID_REGIME_MODES:
+        raise ValueError(
+            f"Preset field '{key}' must be one of {sorted(_VALID_REGIME_MODES)}, got '{value}'."
+        )
+    return value  # type: ignore[return-value]
 
 
 def _metadata_float(value: Any) -> float | None:
