@@ -1787,6 +1787,11 @@ def _run_daily_summary_workflow(
         if current_positions is None
         else current_positions
     )
+    open_position_symbols = {
+        position.symbol.strip().upper()
+        for position in resolved_current_positions
+        if position.symbol.strip()
+    }
 
     current_equity = (
         config.game_rules.starting_cash if args.equity is None else float(args.equity)
@@ -1890,10 +1895,7 @@ def _run_daily_summary_workflow(
                 bars,
                 settings=strategy_settings,
                 benchmark_frame=benchmark_frame,
-                has_open_position=any(
-                    current_position.symbol == member.symbol
-                    for current_position in resolved_current_positions
-                ),
+                has_open_position=member.symbol.strip().upper() in open_position_symbols,
                 symbol=member.symbol,
             )
             if signal is None:
@@ -2064,8 +2066,8 @@ def _run_portfolio_review_workflow(
                     refresh_cache=args.refresh_cache,
                 )
             )
-        except DataProviderError as exc:
-            LOGGER.warning("Skipping held symbol %s due to provider error: %s", symbol, exc)
+        except (DataProviderError, ValueError) as exc:
+            LOGGER.warning("Skipping held symbol %s due to review error: %s", symbol, exc)
     return build_portfolio_review_report(
         as_of_date=args.as_of,
         rows=rows,

@@ -552,6 +552,7 @@ def test_review_existing_long_position_suggests_exit_candidate() -> None:
 
     assert decision.suggested_action == "EXIT CANDIDATE"
     assert decision.suggested_stop is None
+    assert decision.trailing_stop_candidate is None
     assert "current stop" in " ".join(decision.rationale).lower()
 
 
@@ -572,6 +573,7 @@ def test_review_existing_long_position_clears_stop_for_weak_regime_exit_candidat
 
     assert decision.suggested_action == "EXIT CANDIDATE"
     assert decision.suggested_stop is None
+    assert decision.trailing_stop_candidate is None
     assert "weak" in " ".join(decision.rationale).lower()
 
 

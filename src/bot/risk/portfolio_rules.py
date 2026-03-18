@@ -423,6 +423,7 @@ def review_existing_long_position(
 
     if action == "EXIT CANDIDATE":
         suggested_stop = None
+        trailing_stop_candidate = None
 
     return PortfolioReviewDecision(
         latest_close=latest_close,

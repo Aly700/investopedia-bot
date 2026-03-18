@@ -810,7 +810,87 @@ def test_run_portfolio_review_workflow_skips_symbols_with_provider_errors(
     )
 
     assert [row.symbol for row in report.rows] == ["AAPL"]
+    assert report.to_dict()["position_count"] == 2
     assert report.to_dict()["reviewed_symbol_count"] == 1
+
+
+def test_run_portfolio_review_workflow_skips_symbols_with_value_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = load_app_config()
+    current_positions = [
+        ExistingPosition(
+            symbol="AAPL",
+            shares=10,
+            average_entry_price=100.0,
+            current_stop=95.0,
+            preset_name="standard_breakout",
+        ),
+        ExistingPosition(
+            symbol="MSFT",
+            shares=5,
+            average_entry_price=200.0,
+            current_stop=190.0,
+            preset_name="standard_breakout",
+        ),
+    ]
+    args = SimpleNamespace(
+        as_of=date(2024, 1, 5),
+        portfolio_file=None,
+        benchmark_symbol=None,
+        refresh_cache=False,
+        config_dir=tmp_path,
+    )
+
+    monkeypatch.setattr(main_module, "_portfolio_review_preset_catalog", lambda args, config: {})
+    monkeypatch.setattr(
+        main_module,
+        "_build_portfolio_review_plan",
+        lambda position, *, preset_catalog, base_settings, as_of_date: {
+            "position": position,
+            "settings": SimpleNamespace(enable_regime_filter=False),
+            "fetch_start": as_of_date,
+        },
+    )
+
+    def fake_build_review_row(plan: dict[str, object], **_: object) -> PortfolioReviewRow:
+        position = plan["position"]
+        if not isinstance(position, ExistingPosition):
+            raise TypeError("position must be an ExistingPosition")
+        if position.symbol == "MSFT":
+            raise ValueError("unusable close prices")
+        return PortfolioReviewRow(
+            date=date(2024, 1, 5),
+            symbol=position.symbol,
+            quantity=position.shares,
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            suggested_stop=101.0,
+            latest_close=110.0,
+            unrealized_pl_pct=0.10,
+            distance_to_stop_pct=(110.0 - 95.0) / 110.0,
+            regime_passed=True,
+            above_entry=True,
+            suggested_action="RAISE STOP",
+            preset_name="standard_breakout",
+            rationale="Trailing-stop logic supports a higher stop.",
+            metadata={},
+        )
+
+    monkeypatch.setattr(main_module, "_build_portfolio_review_row", fake_build_review_row)
+
+    report = main_module._run_portfolio_review_workflow(
+        args,
+        config=config,
+        provider=object(),
+        current_positions=current_positions,
+    )
+
+    payload = report.to_dict()
+    assert [row.symbol for row in report.rows] == ["AAPL"]
+    assert payload["position_count"] == 2
+    assert payload["reviewed_symbol_count"] == 1
 
 
 def test_run_daily_summary_workflow_treats_held_symbol_as_no_signal(
@@ -819,7 +899,7 @@ def test_run_daily_summary_workflow_treats_held_symbol_as_no_signal(
     config = load_app_config()
     current_positions = [
         ExistingPosition(
-            symbol="AAA",
+            symbol=" aaa ",
             shares=10,
             average_entry_price=100.0,
             current_stop=95.0,
@@ -893,6 +973,41 @@ def test_run_daily_summary_workflow_treats_held_symbol_as_no_signal(
     assert payload["candidate_count"] == 0
     assert payload["rejected_count"] == 0
     assert payload["unique_no_signal_symbols"] == ["AAA"]
+
+
+def test_position_entry_date_returns_date_object() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        metadata={"entry_date": "2024-01-03"},
+    )
+
+    entry_date = main_module._position_entry_date(position)
+
+    assert entry_date == date(2024, 1, 3)
+    assert not isinstance(entry_date, str)
+
+
+def test_portfolio_review_reference_close_filters_to_post_entry_dates_only() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        metadata={"entry_date": "2024-01-03"},
+    )
+    bars = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+            "close": [200.0, 150.0, 160.0],
+        }
+    )
+
+    reference_close = main_module._portfolio_review_reference_close(bars, position=position)
+
+    assert reference_close == pytest.approx(160.0)
 
 
 def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:
