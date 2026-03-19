@@ -338,9 +338,20 @@ Default wrapper inputs:
 - `INVESTOPEDIA_BOT_PRESET_NAMES`: `standard_breakout`
 - `INVESTOPEDIA_BOT_OUTPUT_BASE`: `data/processed/monitor_market`
 - `INVESTOPEDIA_BOT_NOTIFY`: `true`
+- `INVESTOPEDIA_BOT_NOTIFY_DISCORD`: `true`
+- `INVESTOPEDIA_BOT_NOTIFY_LOCAL`: `true`
 - `INVESTOPEDIA_BOT_NOTIFY_ON_WATCH`: `true`
 - `INVESTOPEDIA_BOT_NOTIFY_SOUND`: `default`
 - `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN`: optional explicit notifier path
+- `INVESTOPEDIA_BOT_DISCORD_WEBHOOK`: optional Discord webhook URL
+
+For Discord alerts, create a webhook in your target server/channel:
+
+1. open the channel settings in Discord
+2. go to `Integrations`
+3. create a new webhook
+4. copy the webhook URL
+5. paste it into `INVESTOPEDIA_BOT_DISCORD_WEBHOOK` in the LaunchAgent plist or export it before running the wrapper manually
 
 For local macOS notifications, install `terminal-notifier` once:
 
@@ -356,6 +367,14 @@ After `monitor-market` finishes and writes `market_monitor.txt`, the wrapper che
 - sends a lower-priority notification for `WATCH CLOSELY` when there are no actionable alerts and `INVESTOPEDIA_BOT_NOTIFY_ON_WATCH=true`
 - sends no notification for pure `NO ACTION` runs by default
 
+Discord webhook alerts are the primary remote path in the wrapper. If `INVESTOPEDIA_BOT_DISCORD_WEBHOOK` is set and `INVESTOPEDIA_BOT_NOTIFY_DISCORD=true`, the wrapper sends a compact Discord message with:
+
+- the as-of date
+- the key category count summary
+- the relevant alert lines from `market_monitor.txt`
+
+The wrapper keeps the message compact and trims it before sending so it stays readable in Discord.
+
 The wrapper resolves `terminal-notifier` in this order:
 
 1. `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN`, if set and executable
@@ -363,7 +382,8 @@ The wrapper resolves `terminal-notifier` in this order:
 3. `/usr/local/bin/terminal-notifier`
 4. `command -v terminal-notifier`
 
-If no notifier is found, the wrapper does not fail the monitor run; it logs a short message to stderr and continues.
+If no local notifier is found, the wrapper does not fail the monitor run; it logs a short message to stderr and continues.
+If the Discord webhook is missing or the delivery fails, the monitor run also continues without failing.
 
 Run it manually:
 
@@ -374,6 +394,8 @@ chmod +x scripts/monitor_market.sh
 INVESTOPEDIA_BOT_CANDIDATE_FILE="$PWD/data/raw/candidate_symbols.txt" \
 INVESTOPEDIA_BOT_PORTFOLIO_FILE="$PWD/data/processed/portfolio/current_positions.json" \
 INVESTOPEDIA_BOT_PRESET_NAMES="conservative_breakout,confirmed_conservative_breakout" \
+INVESTOPEDIA_BOT_DISCORD_WEBHOOK="https://discord.com/api/webhooks/REPLACE_ME/REPLACE_ME" \
+INVESTOPEDIA_BOT_NOTIFY_DISCORD="true" \
 INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN="/opt/homebrew/bin/terminal-notifier" \
 INVESTOPEDIA_BOT_NOTIFY_SOUND="default" \
 ./scripts/monitor_market.sh
@@ -395,8 +417,8 @@ The examples use `launchd` as the primary macOS scheduler:
 - `after-close`: weekdays at `16:15`
 - `market-open`: weekdays at `09:35`
 
-Each LaunchAgent runs the wrapper, and the wrapper sends local notifications after `market_monitor.txt` is written.
-The example plists also set an explicit `PATH` and `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN` so launchd can find Homebrew-installed binaries reliably.
+Each LaunchAgent runs the wrapper after the scheduled time. The wrapper sends Discord alerts after `market_monitor.txt` is written, and it can also send local macOS notifications if `terminal-notifier` is available.
+The example plists also set an explicit `PATH`, `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN`, and a placeholder `INVESTOPEDIA_BOT_DISCORD_WEBHOOK` so the launchd environment is explicit.
 
 Install the after-close LaunchAgent:
 
@@ -449,6 +471,8 @@ launchctl disable "gui/$(id -u)/$AGENT_NAME"
 Disable notifications without disabling the LaunchAgent:
 
 - set `INVESTOPEDIA_BOT_NOTIFY=false` in the LaunchAgent `EnvironmentVariables`
+- or set `INVESTOPEDIA_BOT_NOTIFY_DISCORD=false` to suppress only Discord delivery
+- or set `INVESTOPEDIA_BOT_NOTIFY_LOCAL=false` to suppress only local macOS notifications
 - or leave the LaunchAgent enabled and uninstall `terminal-notifier`
 
 Outputs and logs:

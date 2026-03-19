@@ -21,11 +21,14 @@ OUTPUT_BASE="${INVESTOPEDIA_BOT_OUTPUT_BASE:-$REPO_ROOT/data/processed/monitor_m
 OUTPUT_DIR="$OUTPUT_BASE/$AS_OF_DATE"
 MONITOR_TEXT_PATH="$OUTPUT_DIR/market_monitor.txt"
 NOTIFY_ENABLED="${INVESTOPEDIA_BOT_NOTIFY:-true}"
+NOTIFY_LOCAL="${INVESTOPEDIA_BOT_NOTIFY_LOCAL:-true}"
+NOTIFY_DISCORD="${INVESTOPEDIA_BOT_NOTIFY_DISCORD:-true}"
 NOTIFY_ON_WATCH="${INVESTOPEDIA_BOT_NOTIFY_ON_WATCH:-true}"
 NOTIFY_SOUND="${INVESTOPEDIA_BOT_NOTIFY_SOUND:-default}"
 NOTIFY_TITLE="${INVESTOPEDIA_BOT_NOTIFY_TITLE:-Investopedia Bot}"
 NOTIFY_GROUP="${INVESTOPEDIA_BOT_NOTIFY_GROUP:-investopedia-bot-monitor-market}"
 TERMINAL_NOTIFIER_BIN="${INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN:-}"
+DISCORD_WEBHOOK="${INVESTOPEDIA_BOT_DISCORD_WEBHOOK:-}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "Python interpreter not found or not executable: $PYTHON_BIN" >&2
@@ -73,6 +76,25 @@ summarize_alert_counts() {
   printf '%s\n' "$summary"
 }
 
+summarize_alert_lines() {
+  local pattern="$1"
+  local max_lines="${2:-5}"
+
+  grep -E "$pattern" "$MONITOR_TEXT_PATH" | head -n "$max_lines" || true
+}
+
+truncate_message() {
+  local message="$1"
+  local max_length="${2:-1500}"
+
+  if [ "${#message}" -le "$max_length" ]; then
+    printf '%s\n' "$message"
+    return 0
+  fi
+
+  printf '%s...\n' "${message:0:$((max_length - 3))}"
+}
+
 resolve_terminal_notifier() {
   if [ -n "$TERMINAL_NOTIFIER_BIN" ] && [ -x "$TERMINAL_NOTIFIER_BIN" ]; then
     printf '%s\n' "$TERMINAL_NOTIFIER_BIN"
@@ -92,12 +114,84 @@ resolve_terminal_notifier() {
   command -v terminal-notifier 2>/dev/null || true
 }
 
-send_notification() {
+resolve_curl_bin() {
+  if [ -x "/usr/bin/curl" ]; then
+    printf '%s\n' "/usr/bin/curl"
+    return 0
+  fi
+
+  command -v curl 2>/dev/null || true
+}
+
+build_discord_message() {
+  local heading="$1"
+  local counts_pattern="$2"
+  local detail_pattern="$3"
+  local counts
+  local details
+  local message
+
+  counts="$(summarize_alert_counts "$counts_pattern")"
+  details="$(summarize_alert_lines "$detail_pattern" 5)"
+
+  message="**$heading**"$'\n'"Date: $AS_OF_DATE"
+  if [ -n "$counts" ]; then
+    message="$message"$'\n'"$counts"
+  fi
+  if [ -n "$details" ]; then
+    message="$message"$'\n'"$details"
+  fi
+
+  truncate_message "$message"
+}
+
+send_discord_notification() {
+  local heading="$1"
+  local counts_pattern="$2"
+  local detail_pattern="$3"
+  local curl_bin
+  local message
+  local payload
+
+  if ! is_truthy "$NOTIFY_ENABLED" || ! is_truthy "$NOTIFY_DISCORD"; then
+    return 0
+  fi
+
+  if [ -z "$DISCORD_WEBHOOK" ]; then
+    return 0
+  fi
+
+  curl_bin="$(resolve_curl_bin)"
+  if [ -z "$curl_bin" ]; then
+    echo "curl not found; skipping Discord webhook notification." >&2
+    return 0
+  fi
+
+  message="$(build_discord_message "$heading" "$counts_pattern" "$detail_pattern")"
+  payload="$("$PYTHON_BIN" - "$message" <<'PY'
+import json
+import sys
+
+print(json.dumps({"content": sys.argv[1]}))
+PY
+)"
+
+  "$curl_bin" \
+    --silent \
+    --show-error \
+    --fail \
+    --header "Content-Type: application/json" \
+    --data "$payload" \
+    "$DISCORD_WEBHOOK" >/dev/null || \
+    echo "Discord webhook delivery failed; continuing without failing the monitor run." >&2
+}
+
+send_local_notification() {
   local subtitle="$1"
   local message="$2"
   local notifier_bin
 
-  if ! is_truthy "$NOTIFY_ENABLED"; then
+  if ! is_truthy "$NOTIFY_ENABLED" || ! is_truthy "$NOTIFY_LOCAL"; then
     return 0
   fi
 
@@ -132,14 +226,22 @@ maybe_notify() {
   if alert_count_present "BUY CANDIDATE" || \
     alert_count_present "RAISE STOP" || \
     alert_count_present "EXIT CANDIDATE"; then
-    send_notification \
+    send_discord_notification \
+      "Actionable monitor alerts" \
+      "^(BUY CANDIDATE|RAISE STOP|EXIT CANDIDATE): " \
+      "^(BUY CANDIDATE|RAISE STOP|EXIT CANDIDATE) \\|"
+    send_local_notification \
       "Actionable monitor alerts" \
       "$(summarize_alert_counts '^(BUY CANDIDATE|RAISE STOP|EXIT CANDIDATE): ')"
     return 0
   fi
 
   if is_truthy "$NOTIFY_ON_WATCH" && alert_count_present "WATCH CLOSELY"; then
-    send_notification \
+    send_discord_notification \
+      "Watch closely" \
+      "^WATCH CLOSELY: " \
+      "^WATCH CLOSELY \\|"
+    send_local_notification \
       "Watch closely" \
       "$(summarize_alert_counts '^WATCH CLOSELY: ')"
   fi
