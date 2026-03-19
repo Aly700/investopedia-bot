@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.investopedia.bot.monitor-market.market-open</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO_ROOT__/scripts/monitor_market.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO_ROOT__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>INVESTOPEDIA_BOT_CANDIDATE_FILE</key>
+    <string>__REPO_ROOT__/data/raw/candidate_symbols.txt</string>
+    <key>INVESTOPEDIA_BOT_PORTFOLIO_FILE</key>
+    <string>__REPO_ROOT__/data/processed/portfolio/current_positions.json</string>
+    <key>INVESTOPEDIA_BOT_PRESET_NAMES</key>
+    <string>standard_breakout,confirmed_conservative_breakout</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>35</integer></dict>
+  </array>
+
+  <key>StandardOutPath</key>
+  <string>__REPO_ROOT__/data/logs/launchd/monitor-market.market-open.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__REPO_ROOT__/data/logs/launchd/monitor-market.market-open.err.log</string>
+</dict>
+</plist>

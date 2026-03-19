@@ -319,13 +319,96 @@ This command:
 - combines both into a compact machine-readable alert payload
 - writes `market_monitor.json`, `market_monitor.csv`, and a plain-text `market_monitor.txt` summary for later notification delivery
 
-This is the background-friendly layer for automation. You can run it from `cron`, `launchd`, or any scheduler, then hand the JSON or text file to a future email, Discord, Telegram, or other notifier without changing the trading logic itself.
+This is the background-friendly layer for automation. On macOS, prefer `launchd` over `cron`, then hand the JSON or text file to a future email, Discord, Telegram, or other notifier without changing the trading logic itself.
 
 Typical flow:
 
 1. update the portfolio snapshot after fills, stop changes, or exits
 2. run `monitor-market` on a schedule
 3. inspect the alert summary or route the generated files into a later notification step
+
+### macOS wrapper and launchd examples
+
+The repo includes a small wrapper at `scripts/monitor_market.sh`. It runs the existing `monitor-market` command, defaults `--as-of` to today, writes outputs to `data/processed/monitor_market/YYYY-MM-DD/`, and is safe to call from `launchd`.
+
+Default wrapper inputs:
+
+- `INVESTOPEDIA_BOT_CANDIDATE_FILE`: `data/raw/candidate_symbols.txt`
+- `INVESTOPEDIA_BOT_PORTFOLIO_FILE`: `data/processed/portfolio/current_positions.json`
+- `INVESTOPEDIA_BOT_PRESET_NAMES`: `standard_breakout`
+- `INVESTOPEDIA_BOT_OUTPUT_BASE`: `data/processed/monitor_market`
+
+Run it manually:
+
+```bash
+chmod +x scripts/monitor_market.sh
+./scripts/monitor_market.sh
+./scripts/monitor_market.sh 2026-03-17
+INVESTOPEDIA_BOT_CANDIDATE_FILE="$PWD/data/raw/candidate_symbols.txt" \
+INVESTOPEDIA_BOT_PORTFOLIO_FILE="$PWD/data/processed/portfolio/current_positions.json" \
+INVESTOPEDIA_BOT_PRESET_NAMES="conservative_breakout,confirmed_conservative_breakout" \
+./scripts/monitor_market.sh
+```
+
+You can also pass extra CLI flags after the optional date:
+
+```bash
+./scripts/monitor_market.sh 2026-03-17 --current-drawdown 0.05
+```
+
+Two example LaunchAgents are provided:
+
+- `ops/launchd/com.investopedia.bot.monitor-market.after-close.plist`
+- `ops/launchd/com.investopedia.bot.monitor-market.market-open.plist`
+
+The examples use `launchd` as the primary macOS scheduler:
+
+- `after-close`: weekdays at `16:15`
+- `market-open`: weekdays at `09:35`
+
+Install the after-close LaunchAgent:
+
+```bash
+REPO_ROOT="$PWD"
+AGENT_NAME="com.investopedia.bot.monitor-market.after-close"
+mkdir -p "$REPO_ROOT/data/logs/launchd" "$HOME/Library/LaunchAgents"
+cp "$REPO_ROOT/ops/launchd/$AGENT_NAME.plist" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+perl -0pi -e "s#__REPO_ROOT__#$REPO_ROOT#g" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+plutil -lint "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+launchctl enable "gui/$(id -u)/$AGENT_NAME"
+launchctl kickstart -k "gui/$(id -u)/$AGENT_NAME"
+```
+
+Install the optional market-open LaunchAgent:
+
+```bash
+REPO_ROOT="$PWD"
+AGENT_NAME="com.investopedia.bot.monitor-market.market-open"
+mkdir -p "$REPO_ROOT/data/logs/launchd" "$HOME/Library/LaunchAgents"
+cp "$REPO_ROOT/ops/launchd/$AGENT_NAME.plist" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+perl -0pi -e "s#__REPO_ROOT__#$REPO_ROOT#g" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+plutil -lint "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+launchctl enable "gui/$(id -u)/$AGENT_NAME"
+launchctl kickstart -k "gui/$(id -u)/$AGENT_NAME"
+```
+
+Disable or unload either LaunchAgent:
+
+```bash
+AGENT_NAME="com.investopedia.bot.monitor-market.after-close"
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+launchctl disable "gui/$(id -u)/$AGENT_NAME"
+```
+
+Outputs and logs:
+
+- monitor outputs: `data/processed/monitor_market/YYYY-MM-DD/market_monitor.json`
+- CSV/text summaries: `data/processed/monitor_market/YYYY-MM-DD/market_monitor.csv` and `market_monitor.txt`
+- launchd stdout/stderr logs: `data/logs/launchd/monitor-market.after-close.out.log`, `monitor-market.after-close.err.log`, `monitor-market.market-open.out.log`, and `monitor-market.market-open.err.log`
 
 ## Architecture Notes
 
