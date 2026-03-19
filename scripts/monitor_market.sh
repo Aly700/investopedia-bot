@@ -19,6 +19,12 @@ PORTFOLIO_FILE="${INVESTOPEDIA_BOT_PORTFOLIO_FILE:-$REPO_ROOT/data/processed/por
 PRESET_NAMES="${INVESTOPEDIA_BOT_PRESET_NAMES:-standard_breakout}"
 OUTPUT_BASE="${INVESTOPEDIA_BOT_OUTPUT_BASE:-$REPO_ROOT/data/processed/monitor_market}"
 OUTPUT_DIR="$OUTPUT_BASE/$AS_OF_DATE"
+MONITOR_TEXT_PATH="$OUTPUT_DIR/market_monitor.txt"
+NOTIFY_ENABLED="${INVESTOPEDIA_BOT_NOTIFY:-true}"
+NOTIFY_ON_WATCH="${INVESTOPEDIA_BOT_NOTIFY_ON_WATCH:-true}"
+NOTIFY_SOUND="${INVESTOPEDIA_BOT_NOTIFY_SOUND:-default}"
+NOTIFY_TITLE="${INVESTOPEDIA_BOT_NOTIFY_TITLE:-Investopedia Bot}"
+NOTIFY_GROUP="${INVESTOPEDIA_BOT_NOTIFY_GROUP:-investopedia-bot-monitor-market}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "Python interpreter not found or not executable: $PYTHON_BIN" >&2
@@ -31,6 +37,93 @@ if [ ! -f "$CANDIDATE_FILE" ]; then
 fi
 
 mkdir -p "$OUTPUT_DIR"
+
+is_truthy() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+alert_count_present() {
+  local category="$1"
+  if [ ! -f "$MONITOR_TEXT_PATH" ]; then
+    return 1
+  fi
+  grep -Eq "^${category}: [1-9][0-9]*$" "$MONITOR_TEXT_PATH"
+}
+
+summarize_alert_counts() {
+  local pattern="$1"
+  local summary=""
+
+  while IFS= read -r line; do
+    if [ -z "$summary" ]; then
+      summary="$line"
+    else
+      summary="$summary; $line"
+    fi
+  done < <(grep -E "$pattern" "$MONITOR_TEXT_PATH")
+
+  printf '%s\n' "$summary"
+}
+
+send_notification() {
+  local subtitle="$1"
+  local message="$2"
+  local notifier_bin
+
+  if ! is_truthy "$NOTIFY_ENABLED"; then
+    return 0
+  fi
+
+  notifier_bin="$(command -v terminal-notifier || true)"
+  if [ -z "$notifier_bin" ]; then
+    echo "terminal-notifier not found on PATH; skipping local notification." >&2
+    return 0
+  fi
+
+  local args=(
+    -title "$NOTIFY_TITLE"
+    -subtitle "$subtitle"
+    -message "$message"
+    -group "$NOTIFY_GROUP"
+    -open "file://$MONITOR_TEXT_PATH"
+  )
+
+  if [ -n "$NOTIFY_SOUND" ] && [ "$NOTIFY_SOUND" != "none" ]; then
+    args+=(-sound "$NOTIFY_SOUND")
+  fi
+
+  "$notifier_bin" "${args[@]}" >/dev/null 2>&1 || \
+    echo "terminal-notifier returned a non-zero exit status; continuing without failing the monitor run." >&2
+}
+
+maybe_notify() {
+  if [ ! -f "$MONITOR_TEXT_PATH" ]; then
+    echo "Monitor text summary not found at $MONITOR_TEXT_PATH; skipping local notification." >&2
+    return 0
+  fi
+
+  if alert_count_present "BUY CANDIDATE" || \
+    alert_count_present "RAISE STOP" || \
+    alert_count_present "EXIT CANDIDATE"; then
+    send_notification \
+      "Actionable monitor alerts" \
+      "$(summarize_alert_counts '^(BUY CANDIDATE|RAISE STOP|EXIT CANDIDATE): ')"
+    return 0
+  fi
+
+  if is_truthy "$NOTIFY_ON_WATCH" && alert_count_present "WATCH CLOSELY"; then
+    send_notification \
+      "Watch closely" \
+      "$(summarize_alert_counts '^WATCH CLOSELY: ')"
+  fi
+}
 
 COMMAND=(
   "$PYTHON_BIN"
@@ -62,4 +155,14 @@ if [ "$#" -gt 0 ]; then
   COMMAND+=("$@")
 fi
 
-exec env PYTHONPATH="$REPO_ROOT/src" "${COMMAND[@]}"
+if env PYTHONPATH="$REPO_ROOT/src" "${COMMAND[@]}"; then
+  RUN_STATUS=0
+else
+  RUN_STATUS=$?
+fi
+
+if [ "$RUN_STATUS" -eq 0 ]; then
+  maybe_notify
+fi
+
+exit "$RUN_STATUS"

@@ -337,6 +337,23 @@ Default wrapper inputs:
 - `INVESTOPEDIA_BOT_PORTFOLIO_FILE`: `data/processed/portfolio/current_positions.json`
 - `INVESTOPEDIA_BOT_PRESET_NAMES`: `standard_breakout`
 - `INVESTOPEDIA_BOT_OUTPUT_BASE`: `data/processed/monitor_market`
+- `INVESTOPEDIA_BOT_NOTIFY`: `true`
+- `INVESTOPEDIA_BOT_NOTIFY_ON_WATCH`: `true`
+- `INVESTOPEDIA_BOT_NOTIFY_SOUND`: `default`
+
+For local macOS notifications, install `terminal-notifier` once:
+
+```bash
+brew install terminal-notifier
+```
+
+After `monitor-market` finishes and writes `market_monitor.txt`, the wrapper checks the category counts in that file:
+
+- sends an actionable notification when `BUY CANDIDATE`, `RAISE STOP`, or `EXIT CANDIDATE` is greater than zero
+- sends a lower-priority notification for `WATCH CLOSELY` when there are no actionable alerts and `INVESTOPEDIA_BOT_NOTIFY_ON_WATCH=true`
+- sends no notification for pure `NO ACTION` runs by default
+
+If `terminal-notifier` is not installed or not on `PATH`, the wrapper does not fail the monitor run; it logs a short message to stderr and continues.
 
 Run it manually:
 
@@ -347,6 +364,7 @@ chmod +x scripts/monitor_market.sh
 INVESTOPEDIA_BOT_CANDIDATE_FILE="$PWD/data/raw/candidate_symbols.txt" \
 INVESTOPEDIA_BOT_PORTFOLIO_FILE="$PWD/data/processed/portfolio/current_positions.json" \
 INVESTOPEDIA_BOT_PRESET_NAMES="conservative_breakout,confirmed_conservative_breakout" \
+INVESTOPEDIA_BOT_NOTIFY_SOUND="default" \
 ./scripts/monitor_market.sh
 ```
 
@@ -365,6 +383,8 @@ The examples use `launchd` as the primary macOS scheduler:
 
 - `after-close`: weekdays at `16:15`
 - `market-open`: weekdays at `09:35`
+
+Each LaunchAgent runs the wrapper, and the wrapper sends local notifications after `market_monitor.txt` is written.
 
 Install the after-close LaunchAgent:
 
@@ -403,6 +423,11 @@ AGENT_NAME="com.investopedia.bot.monitor-market.after-close"
 launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
 launchctl disable "gui/$(id -u)/$AGENT_NAME"
 ```
+
+Disable notifications without disabling the LaunchAgent:
+
+- set `INVESTOPEDIA_BOT_NOTIFY=false` in the LaunchAgent `EnvironmentVariables`
+- or leave the LaunchAgent enabled and uninstall `terminal-notifier`
 
 Outputs and logs:
 

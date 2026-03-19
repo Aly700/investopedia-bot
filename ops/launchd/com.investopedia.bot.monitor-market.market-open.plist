@@ -21,6 +21,12 @@
     <string>__REPO_ROOT__/data/processed/portfolio/current_positions.json</string>
     <key>INVESTOPEDIA_BOT_PRESET_NAMES</key>
     <string>standard_breakout,confirmed_conservative_breakout</string>
+    <key>INVESTOPEDIA_BOT_NOTIFY</key>
+    <string>true</string>
+    <key>INVESTOPEDIA_BOT_NOTIFY_ON_WATCH</key>
+    <string>true</string>
+    <key>INVESTOPEDIA_BOT_NOTIFY_SOUND</key>
+    <string>default</string>
   </dict>
 
   <key>RunAtLoad</key>
