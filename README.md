@@ -340,6 +340,7 @@ Default wrapper inputs:
 - `INVESTOPEDIA_BOT_NOTIFY`: `true`
 - `INVESTOPEDIA_BOT_NOTIFY_ON_WATCH`: `true`
 - `INVESTOPEDIA_BOT_NOTIFY_SOUND`: `default`
+- `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN`: optional explicit notifier path
 
 For local macOS notifications, install `terminal-notifier` once:
 
@@ -347,13 +348,22 @@ For local macOS notifications, install `terminal-notifier` once:
 brew install terminal-notifier
 ```
 
+On Apple Silicon Macs, Homebrew commonly installs `terminal-notifier` at `/opt/homebrew/bin/terminal-notifier`. `launchd` jobs usually do not inherit the same `PATH` as an interactive Terminal shell, so a command that works in Terminal may still be missing when the LaunchAgent runs.
+
 After `monitor-market` finishes and writes `market_monitor.txt`, the wrapper checks the category counts in that file:
 
 - sends an actionable notification when `BUY CANDIDATE`, `RAISE STOP`, or `EXIT CANDIDATE` is greater than zero
 - sends a lower-priority notification for `WATCH CLOSELY` when there are no actionable alerts and `INVESTOPEDIA_BOT_NOTIFY_ON_WATCH=true`
 - sends no notification for pure `NO ACTION` runs by default
 
-If `terminal-notifier` is not installed or not on `PATH`, the wrapper does not fail the monitor run; it logs a short message to stderr and continues.
+The wrapper resolves `terminal-notifier` in this order:
+
+1. `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN`, if set and executable
+2. `/opt/homebrew/bin/terminal-notifier`
+3. `/usr/local/bin/terminal-notifier`
+4. `command -v terminal-notifier`
+
+If no notifier is found, the wrapper does not fail the monitor run; it logs a short message to stderr and continues.
 
 Run it manually:
 
@@ -364,6 +374,7 @@ chmod +x scripts/monitor_market.sh
 INVESTOPEDIA_BOT_CANDIDATE_FILE="$PWD/data/raw/candidate_symbols.txt" \
 INVESTOPEDIA_BOT_PORTFOLIO_FILE="$PWD/data/processed/portfolio/current_positions.json" \
 INVESTOPEDIA_BOT_PRESET_NAMES="conservative_breakout,confirmed_conservative_breakout" \
+INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN="/opt/homebrew/bin/terminal-notifier" \
 INVESTOPEDIA_BOT_NOTIFY_SOUND="default" \
 ./scripts/monitor_market.sh
 ```
@@ -385,6 +396,7 @@ The examples use `launchd` as the primary macOS scheduler:
 - `market-open`: weekdays at `09:35`
 
 Each LaunchAgent runs the wrapper, and the wrapper sends local notifications after `market_monitor.txt` is written.
+The example plists also set an explicit `PATH` and `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN` so launchd can find Homebrew-installed binaries reliably.
 
 Install the after-close LaunchAgent:
 
@@ -410,6 +422,16 @@ mkdir -p "$REPO_ROOT/data/logs/launchd" "$HOME/Library/LaunchAgents"
 cp "$REPO_ROOT/ops/launchd/$AGENT_NAME.plist" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
 perl -0pi -e "s#__REPO_ROOT__#$REPO_ROOT#g" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
 plutil -lint "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+launchctl enable "gui/$(id -u)/$AGENT_NAME"
+launchctl kickstart -k "gui/$(id -u)/$AGENT_NAME"
+```
+
+Reload a LaunchAgent after editing its plist:
+
+```bash
+AGENT_NAME="com.investopedia.bot.monitor-market.after-close"
 launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
 launchctl enable "gui/$(id -u)/$AGENT_NAME"

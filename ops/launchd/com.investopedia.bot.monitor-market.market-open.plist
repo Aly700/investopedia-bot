@@ -15,12 +15,16 @@
 
   <key>EnvironmentVariables</key>
   <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>INVESTOPEDIA_BOT_CANDIDATE_FILE</key>
     <string>__REPO_ROOT__/data/raw/candidate_symbols.txt</string>
     <key>INVESTOPEDIA_BOT_PORTFOLIO_FILE</key>
     <string>__REPO_ROOT__/data/processed/portfolio/current_positions.json</string>
     <key>INVESTOPEDIA_BOT_PRESET_NAMES</key>
     <string>standard_breakout,confirmed_conservative_breakout</string>
+    <key>INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN</key>
+    <string>/opt/homebrew/bin/terminal-notifier</string>
     <key>INVESTOPEDIA_BOT_NOTIFY</key>
     <string>true</string>
     <key>INVESTOPEDIA_BOT_NOTIFY_ON_WATCH</key>

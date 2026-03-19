@@ -25,6 +25,7 @@ NOTIFY_ON_WATCH="${INVESTOPEDIA_BOT_NOTIFY_ON_WATCH:-true}"
 NOTIFY_SOUND="${INVESTOPEDIA_BOT_NOTIFY_SOUND:-default}"
 NOTIFY_TITLE="${INVESTOPEDIA_BOT_NOTIFY_TITLE:-Investopedia Bot}"
 NOTIFY_GROUP="${INVESTOPEDIA_BOT_NOTIFY_GROUP:-investopedia-bot-monitor-market}"
+TERMINAL_NOTIFIER_BIN="${INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN:-}"
 
 if [ ! -x "$PYTHON_BIN" ]; then
   echo "Python interpreter not found or not executable: $PYTHON_BIN" >&2
@@ -72,6 +73,25 @@ summarize_alert_counts() {
   printf '%s\n' "$summary"
 }
 
+resolve_terminal_notifier() {
+  if [ -n "$TERMINAL_NOTIFIER_BIN" ] && [ -x "$TERMINAL_NOTIFIER_BIN" ]; then
+    printf '%s\n' "$TERMINAL_NOTIFIER_BIN"
+    return 0
+  fi
+
+  if [ -x "/opt/homebrew/bin/terminal-notifier" ]; then
+    printf '%s\n' "/opt/homebrew/bin/terminal-notifier"
+    return 0
+  fi
+
+  if [ -x "/usr/local/bin/terminal-notifier" ]; then
+    printf '%s\n' "/usr/local/bin/terminal-notifier"
+    return 0
+  fi
+
+  command -v terminal-notifier 2>/dev/null || true
+}
+
 send_notification() {
   local subtitle="$1"
   local message="$2"
@@ -81,9 +101,9 @@ send_notification() {
     return 0
   fi
 
-  notifier_bin="$(command -v terminal-notifier || true)"
+  notifier_bin="$(resolve_terminal_notifier)"
   if [ -z "$notifier_bin" ]; then
-    echo "terminal-notifier not found on PATH; skipping local notification." >&2
+    echo "terminal-notifier not found; skipping local notification." >&2
     return 0
   fi
 
