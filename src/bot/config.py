@@ -32,6 +32,134 @@ class UniverseConfig:
 
 
 @dataclass(frozen=True)
+class UniverseProfileConfig:
+    """Configurable filters for one generated candidate universe."""
+
+    description: str
+    active_only: bool
+    allowed_exchanges: tuple[str, ...]
+    allowed_ticker_types: tuple[str, ...]
+    min_price: float | None
+    min_average_daily_volume: int | None
+    min_dollar_volume: int | None
+    min_market_cap: int | None
+    allowed_sectors: tuple[str, ...]
+    allowed_industries: tuple[str, ...]
+    include_etfs: bool
+    include_adrs: bool
+    common_stock_only: bool
+    exclude_weird_instruments: bool
+    max_symbols: int | None
+    include_symbols: tuple[str, ...]
+    exclude_symbols: tuple[str, ...]
+    preferred_symbol_groups: dict[str, tuple[str, ...]]
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "UniverseProfileConfig":
+        include_symbols = _as_text_tuple(data, "include_symbols", default=())
+        exclude_symbols = _as_text_tuple(data, "exclude_symbols", default=())
+        preferred_symbol_groups = _as_symbol_group_mapping(
+            data,
+            "preferred_symbol_groups",
+        )
+        overlap = sorted(set(include_symbols) & set(exclude_symbols))
+        if overlap:
+            joined = ", ".join(overlap)
+            raise ConfigError(
+                f"Universe profile include_symbols and exclude_symbols overlap: {joined}"
+            )
+
+        return cls(
+            description=_as_str(data, "description", default=""),
+            active_only=_as_bool(data, "active_only", default=True),
+            allowed_exchanges=_as_text_tuple(data, "allowed_exchanges", default=()),
+            allowed_ticker_types=_as_text_tuple(data, "allowed_ticker_types", default=()),
+            min_price=_as_optional_float(data, "min_price"),
+            min_average_daily_volume=_as_optional_int(data, "min_average_daily_volume"),
+            min_dollar_volume=_as_optional_int(data, "min_dollar_volume"),
+            min_market_cap=_as_optional_int(data, "min_market_cap"),
+            allowed_sectors=_as_text_tuple(data, "allowed_sectors", default=()),
+            allowed_industries=_as_text_tuple(data, "allowed_industries", default=()),
+            include_etfs=_as_bool(data, "include_etfs", default=False),
+            include_adrs=_as_bool(data, "include_adrs", default=False),
+            common_stock_only=_as_bool(data, "common_stock_only", default=True),
+            exclude_weird_instruments=_as_bool(
+                data,
+                "exclude_weird_instruments",
+                default=True,
+            ),
+            max_symbols=_as_optional_int(data, "max_symbols"),
+            include_symbols=include_symbols,
+            exclude_symbols=exclude_symbols,
+            preferred_symbol_groups=preferred_symbol_groups,
+        )
+
+
+@dataclass(frozen=True)
+class UniverseMasterConfig:
+    """Stage-1 and stage-2 settings for the universe-builder pipeline."""
+
+    market: str
+    locale: str
+    active_only: bool
+    allowed_ticker_types: tuple[str, ...]
+    liquidity_lookback_days: int
+    reference_cache_dir: str
+    processed_output_dir: str
+    candidate_output_dir: str
+    raw_reference_filename: str
+    master_universe_filename: str
+    profile_summary_dir: str
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "UniverseMasterConfig":
+        return cls(
+            market=_as_str(data, "market"),
+            locale=_as_str(data, "locale"),
+            active_only=_as_bool(data, "active_only", default=True),
+            allowed_ticker_types=_as_text_tuple(
+                data,
+                "allowed_ticker_types",
+                default=(),
+            ),
+            liquidity_lookback_days=_as_int(data, "liquidity_lookback_days"),
+            reference_cache_dir=_as_str(data, "reference_cache_dir"),
+            processed_output_dir=_as_str(data, "processed_output_dir"),
+            candidate_output_dir=_as_str(data, "candidate_output_dir"),
+            raw_reference_filename=_as_str(data, "raw_reference_filename"),
+            master_universe_filename=_as_str(data, "master_universe_filename"),
+            profile_summary_dir=_as_str(data, "profile_summary_dir"),
+        )
+
+
+@dataclass(frozen=True)
+class UniverseBuilderConfig:
+    """Universe-builder configuration, including profiles and output paths."""
+
+    master: UniverseMasterConfig
+    profiles: dict[str, UniverseProfileConfig]
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "UniverseBuilderConfig":
+        master = UniverseMasterConfig.from_mapping(_as_mapping(data, "master_universe"))
+        raw_profiles = _as_mapping(data, "profiles")
+        if not raw_profiles:
+            raise ConfigError("Expected at least one configured universe profile.")
+
+        profiles: dict[str, UniverseProfileConfig] = {}
+        for profile_name, profile_payload in raw_profiles.items():
+            if not isinstance(profile_name, str) or not profile_name.strip():
+                raise ConfigError("Universe profile names must be non-empty strings.")
+            if not isinstance(profile_payload, dict):
+                raise ConfigError(
+                    f"Universe profile '{profile_name}' must be a mapping."
+                )
+            profiles[profile_name.strip()] = UniverseProfileConfig.from_mapping(profile_payload)
+
+        return cls(master=master, profiles=profiles)
+
+
+@dataclass(frozen=True)
 class SignalConfig:
     """Signal model parameters for daily-bar strategies."""
 
@@ -223,6 +351,7 @@ class AppConfig:
     project_root: Path
     config_dir: Path
     strategy: StrategyConfig
+    universe_builder: UniverseBuilderConfig
     data_sources: DataSourcesConfig
     game_rules: GameRulesConfig
 
@@ -286,6 +415,9 @@ def load_app_config(config_dir: Path | None = None) -> AppConfig:
         raise ConfigError(f"Config directory does not exist: {resolved_config_dir}")
 
     strategy = StrategyConfig.from_mapping(_load_yaml_file(resolved_config_dir / "strategy.yaml"))
+    universe_builder = UniverseBuilderConfig.from_mapping(
+        _load_yaml_file(resolved_config_dir / "universe.yaml")
+    )
     data_sources = DataSourcesConfig.from_mapping(
         _load_yaml_file(resolved_config_dir / "data_sources.yaml")
     )
@@ -295,6 +427,7 @@ def load_app_config(config_dir: Path | None = None) -> AppConfig:
         project_root=project_root,
         config_dir=resolved_config_dir,
         strategy=strategy,
+        universe_builder=universe_builder,
         data_sources=data_sources,
         game_rules=game_rules,
     )
@@ -386,9 +519,13 @@ def _as_mapping(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     return value
 
 
-def _as_str(data: Mapping[str, Any], key: str) -> str:
-    value = data.get(key)
-    if not isinstance(value, str) or not value.strip():
+def _as_str(data: Mapping[str, Any], key: str, *, default: str | None = None) -> str:
+    value = data.get(key, default)
+    if not isinstance(value, str):
+        raise ConfigError(f"Expected '{key}' to be a string.")
+    if default == "" and value == "":
+        return ""
+    if not value.strip():
         raise ConfigError(f"Expected '{key}' to be a non-empty string.")
     return value.strip()
 
@@ -407,8 +544,92 @@ def _as_float(data: Mapping[str, Any], key: str) -> float:
     return float(value)
 
 
-def _as_bool(data: Mapping[str, Any], key: str) -> bool:
+def _as_optional_int(data: Mapping[str, Any], key: str) -> int | None:
     value = data.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"Expected '{key}' to be an integer when provided.")
+    return int(value)
+
+
+def _as_optional_float(data: Mapping[str, Any], key: str) -> float | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"Expected '{key}' to be numeric when provided.")
+    return float(value)
+
+
+def _as_bool(data: Mapping[str, Any], key: str, *, default: bool | None = None) -> bool:
+    value = data.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(f"Expected '{key}' to be a boolean.")
     return value
+
+
+def _as_text_tuple(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    default: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    value = data.get(key, list(default))
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"Expected '{key}' to be a list of strings.")
+
+    cleaned: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"Expected all '{key}' values to be non-empty strings.")
+        cleaned.append(item.strip())
+    return tuple(cleaned)
+
+
+def _as_symbol_group_mapping(
+    data: Mapping[str, Any],
+    key: str,
+) -> dict[str, tuple[str, ...]]:
+    value = data.get(key, {})
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"Expected '{key}' to be a mapping of preferred symbols to symbol lists.")
+
+    cleaned_mapping: dict[str, tuple[str, ...]] = {}
+    seen_symbols: dict[str, str] = {}
+    for preferred_symbol, raw_group in value.items():
+        if not isinstance(preferred_symbol, str) or not preferred_symbol.strip():
+            raise ConfigError(f"Expected '{key}' mapping keys to be non-empty strings.")
+        if not isinstance(raw_group, list):
+            raise ConfigError(f"Expected '{key}.{preferred_symbol}' to be a list of symbols.")
+
+        normalized_preferred = preferred_symbol.strip().upper()
+        group_symbols: list[str] = []
+        for raw_symbol in raw_group:
+            if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+                raise ConfigError(
+                    f"Expected all '{key}.{preferred_symbol}' values to be non-empty strings."
+                )
+            normalized_symbol = raw_symbol.strip().upper()
+            if normalized_symbol not in group_symbols:
+                group_symbols.append(normalized_symbol)
+
+        if normalized_preferred not in group_symbols:
+            group_symbols.insert(0, normalized_preferred)
+
+        for symbol in group_symbols:
+            existing_group = seen_symbols.get(symbol)
+            if existing_group is not None and existing_group != normalized_preferred:
+                raise ConfigError(
+                    f"Symbol '{symbol}' appears in multiple '{key}' groups: "
+                    f"{existing_group}, {normalized_preferred}."
+                )
+            seen_symbols[symbol] = normalized_preferred
+
+        cleaned_mapping[normalized_preferred] = tuple(group_symbols)
+
+    return cleaned_mapping
