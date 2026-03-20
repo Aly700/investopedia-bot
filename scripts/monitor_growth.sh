@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+
+run_bot monitor-market \
+  "$BOT_UNIVERSE_GROWTH" \
+  --as-of "$BOT_DATE" \
+  --preset-names "$BOT_PRESET" \
+  --portfolio-file "$BOT_PORTFOLIO_FILE" \
+  "$@"
