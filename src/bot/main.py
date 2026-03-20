@@ -73,7 +73,9 @@ from bot.reporting.daily_report import (
     build_daily_signal_report,
     market_monitor_flat_count_key,
     rank_preset_candidate_evaluations,
+    write_daily_research_brief,
     write_market_monitor_report,
+    write_market_monitor_brief,
     write_market_monitor_text_summary,
     write_daily_preset_summary,
     write_portfolio_review_report,
@@ -1361,6 +1363,10 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         monitor_report,
         output_dir / "market_monitor.txt",
     )
+    alert_brief_path = write_market_monitor_brief(
+        monitor_report,
+        output_dir / "market_monitor_brief.txt",
+    )
     report_payload = monitor_report.to_dict()
     summary_payload = summary.to_dict()
     category_counts = report_payload["category_counts"]
@@ -1381,6 +1387,7 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
             "market_monitor_json": str(alert_json_path),
             "market_monitor_csv": str(alert_csv_path),
             "market_monitor_text": str(alert_text_path),
+            "market_monitor_brief": str(alert_brief_path),
         },
     }
     _print_structured(payload, output_format=args.format)
@@ -1924,6 +1931,20 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     preset_json_path = write_daily_preset_summary(summary, output_dir / "preset_rankings.json")
     orders_csv_path = write_execution_batch(execution_batch, output_dir / "suggested_order_sheet.csv")
     orders_json_path = write_execution_batch(execution_batch, output_dir / "suggested_order_sheet.json")
+    brief_output_paths = {
+        "daily_summary_json": str(summary_json_path),
+        "ranked_opportunities_csv": str(opportunities_csv_path),
+        "preset_rankings_csv": str(preset_csv_path),
+        "preset_rankings_json": str(preset_json_path),
+        "suggested_order_sheet_csv": str(orders_csv_path),
+        "suggested_order_sheet_json": str(orders_json_path),
+        "daily_summary_brief": str((output_dir / "daily_summary_brief.txt").resolve()),
+    }
+    brief_text_path = write_daily_research_brief(
+        summary,
+        output_dir / "daily_summary_brief.txt",
+        output_paths=brief_output_paths,
+    )
 
     payload = {
         "provider": config.data_sources.provider,
@@ -1952,6 +1973,7 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
             "preset_rankings_json": str(preset_json_path),
             "suggested_order_sheet_csv": str(orders_csv_path),
             "suggested_order_sheet_json": str(orders_json_path),
+            "daily_summary_brief": str(brief_text_path),
         },
     }
     _print_structured(payload, output_format=args.format)

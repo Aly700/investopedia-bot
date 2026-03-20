@@ -26,8 +26,10 @@ from bot.reporting.daily_report import (
     write_market_monitor_report,
     write_market_monitor_text_summary,
     write_daily_preset_summary,
+    write_daily_research_brief,
     write_portfolio_review_report,
     write_daily_research_summary,
+    write_market_monitor_brief,
 )
 from bot.risk.portfolio_rules import (
     PORTFOLIO_REVIEW_ACTIONS,
@@ -555,6 +557,107 @@ def test_market_monitor_text_summary_header_matches_alert_priority_order() -> No
     ]
 
 
+def test_market_monitor_brief_separates_holdings_and_buy_candidates(tmp_path: Path) -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved_candidates = [
+        _evaluation(preset, symbol="BBB", approved=True, shares=25),
+        _evaluation(preset, symbol="AAA", approved=True, shares=20),
+    ]
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=ManualExecutor().build_execution_batch(
+            [evaluation.candidate for evaluation in approved_candidates],
+            as_of_date=date(2024, 1, 5),
+        ),
+        evaluations=approved_candidates,
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB", "AAPL", "AMD"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+    review = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        rows=[
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=101.0,
+                latest_close=110.0,
+                unrealized_pl_pct=0.10,
+                distance_to_stop_pct=(110.0 - 95.0) / 110.0,
+                regime_passed=True,
+                above_entry=True,
+                suggested_action="RAISE STOP",
+                preset_name="standard_breakout",
+                rationale="Trailing-stop logic supports a higher stop.",
+                metadata={},
+            ),
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AMD",
+                quantity=8,
+                average_entry_price=150.0,
+                current_stop=145.0,
+                suggested_stop=145.0,
+                latest_close=147.0,
+                unrealized_pl_pct=-0.02,
+                distance_to_stop_pct=(147.0 - 145.0) / 147.0,
+                regime_passed=True,
+                above_entry=False,
+                suggested_action="WATCH CLOSELY",
+                preset_name="standard_breakout",
+                rationale="Position is below entry and close to the stop.",
+                metadata={},
+            ),
+        ],
+        current_positions=[
+            ExistingPosition(
+                symbol="AAPL",
+                shares=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                preset_name="standard_breakout",
+            ),
+            ExistingPosition(
+                symbol="AMD",
+                shares=8,
+                average_entry_price=150.0,
+                current_stop=145.0,
+                preset_name="standard_breakout",
+            ),
+        ],
+        benchmark_symbol="SPY",
+    )
+    report = build_market_monitor_report(
+        as_of_date=date(2024, 1, 5),
+        daily_summary=summary,
+        portfolio_review=review,
+    )
+
+    brief_path = write_market_monitor_brief(report, tmp_path / "market_monitor_brief.txt")
+    text = brief_path.read_text(encoding="utf-8")
+
+    assert "Headline" in text
+    assert "Best actions now" in text
+    assert "Current holdings" in text
+    assert "Top buy candidates" in text
+    assert "Lower-priority names" in text
+    holdings_section = text.split("Current holdings\n", 1)[1].split("\n\nTop buy candidates", 1)[0]
+    buy_section = text.split("Top buy candidates\n", 1)[1].split("\n\nLower-priority names", 1)[0]
+    lower_priority_section = text.split("Lower-priority names\n", 1)[1]
+    assert "AAPL" in holdings_section
+    assert "AAA" in buy_section
+    assert "BBB" in buy_section
+    assert "AAPL" not in buy_section
+    assert buy_section.index("AAA") < buy_section.index("BBB")
+    assert "AMD" in lower_priority_section
+
+
 def test_market_monitor_report_orders_multiple_alert_categories_by_priority() -> None:
     preset = _selected_presets("standard_breakout")[0]
     approved = _evaluation(preset, symbol="MSFT", approved=True, shares=25)
@@ -759,6 +862,7 @@ def test_handle_monitor_market_payload_includes_daily_summary_status_counts(
     assert payload["universe_count"] == 3
     assert payload["buy_candidate_count"] == 1
     assert Path(payload["outputs"]["market_monitor_json"]).exists()
+    assert Path(payload["outputs"]["market_monitor_brief"]).exists()
 
 
 def test_run_portfolio_review_workflow_skips_symbols_with_provider_errors(
@@ -1219,6 +1323,7 @@ def test_handle_daily_summary_uses_workflow_universe_count(
     assert payload["current_position_count"] == 1
     assert payload["current_position_symbols"] == ["AAPL"]
     assert Path(payload["outputs"]["daily_summary_json"]).exists()
+    assert Path(payload["outputs"]["daily_summary_brief"]).exists()
 
 
 def test_position_entry_date_returns_date_object() -> None:
@@ -1341,6 +1446,69 @@ def test_daily_research_summary_exports_ranked_rows_and_preset_summaries(tmp_pat
     assert ranked_rows[0]["preset_name"] == "standard_breakout"
     assert ranked_rows[0]["status"] == "approved"
     assert ranked_rows[1]["rejection_reasons"] == "No averaging down is allowed for existing long positions."
+
+
+def test_daily_research_brief_includes_trade_cards_and_lower_priority_section(
+    tmp_path: Path,
+) -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved = _evaluation(preset, symbol="AAA", approved=True, shares=40)
+    rejected = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=False,
+        shares=0,
+        rejection_reasons=("Max concurrent positions reached.",),
+    )
+    execution_batch = ManualExecutor().build_execution_batch(
+        [approved.candidate, rejected.candidate],
+        as_of_date=date(2024, 1, 5),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[approved, rejected],
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB", "CCC"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ("CCC",)},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+        current_positions=[
+            ExistingPosition(
+                symbol="MSFT",
+                shares=5,
+                average_entry_price=200.0,
+                current_stop=190.0,
+                preset_name="standard_breakout",
+            )
+        ],
+    )
+
+    brief_path = write_daily_research_brief(
+        summary,
+        tmp_path / "daily_summary_brief.txt",
+        output_paths={
+            "daily_summary_json": "/tmp/daily_summary.json",
+            "ranked_opportunities_csv": "/tmp/ranked_opportunities.csv",
+        },
+    )
+    text = brief_path.read_text(encoding="utf-8")
+
+    assert "Headline" in text
+    assert "Top opportunities" in text
+    assert "Lower-priority / rejected candidates" in text
+    assert "Portfolio context" in text
+    assert "Output files" in text
+    assert "1. AAA" in text
+    assert "qty=40" in text
+    assert "entry=" in text
+    assert "stop=" in text
+    assert "notional=" in text
+    assert "- BBB | preset=standard_breakout | reason=Max concurrent positions reached." in text
+    assert "Current holdings: 1 | symbols=MSFT" in text
+    assert "- daily_summary_json: /tmp/daily_summary.json" in text
+    assert text.index("1. AAA") < text.index("- BBB | preset=standard_breakout")
 
 
 def test_daily_research_summary_includes_current_holdings_context_for_rejections() -> None:

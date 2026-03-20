@@ -428,6 +428,67 @@ class DailyResearchSummary:
             "suggested_order_sheet": self.execution_batch.to_dict(),
         }
 
+    def to_brief(self, *, output_paths: Mapping[str, str] | None = None) -> str:
+        """Return a human-readable trader brief for the daily summary."""
+
+        approved_rows = [row for row in self.rows if row.status == "approved"]
+        rejected_rows = [row for row in self.rows if row.status == "rejected"]
+        current_symbols = [position.symbol for position in self.current_positions]
+
+        lines = [f"Daily summary brief for {self.as_of_date.isoformat()}", "", "Headline"]
+        lines.append(
+            "Recommended preset: "
+            f"{self.recommended_preset or 'none'} | "
+            f"Universe: {len(self.universe_symbols)} | "
+            f"Approved: {len(approved_rows)} | "
+            f"Rejected: {len(rejected_rows)} | "
+            f"Orders: {len(self.execution_batch.orders)}"
+        )
+        lines.append(
+            f"Relative-volume policy: {self.relative_volume_policy} | "
+            f"Preset selection: {self.preset_selection_source or 'n/a'}"
+        )
+
+        lines.extend(("", "Top opportunities"))
+        if approved_rows:
+            for row in approved_rows[:5]:
+                lines.extend(_daily_research_brief_card(row))
+        else:
+            lines.append("No approved buy candidates today.")
+
+        lines.extend(("", "Lower-priority / rejected candidates"))
+        if rejected_rows:
+            for row in rejected_rows[:5]:
+                reason = row.rejection_reasons[0] if row.rejection_reasons else row.rationale
+                lines.append(
+                    f"- {row.symbol} | preset={row.preset_name} | "
+                    f"reason={_single_line(reason)}"
+                )
+        else:
+            lines.append("No lower-priority rejected candidates today.")
+
+        lines.extend(("", "Portfolio context"))
+        lines.append(
+            f"Current holdings: {len(current_symbols)}"
+            + (f" | symbols={', '.join(current_symbols)}" if current_symbols else "")
+        )
+        if self.preset_summaries:
+            top_preset = self.preset_summaries[0]
+            lines.append(
+                f"Top preset today: {top_preset.preset_name} | "
+                f"approved={top_preset.approved_count} | "
+                f"top_symbol={top_preset.top_symbol or 'n/a'}"
+            )
+        else:
+            lines.append("Top preset today: none")
+
+        if output_paths:
+            lines.extend(("", "Output files"))
+            for name, path in sorted(output_paths.items()):
+                lines.append(f"- {name}: {path}")
+
+        return "\n".join(lines).rstrip() + "\n"
+
 
 @dataclass(frozen=True)
 class PortfolioReviewRow:
@@ -669,6 +730,70 @@ class MarketMonitorReport:
             lines.append(f"  {alert.rationale}")
         return "\n".join(lines).rstrip() + "\n"
 
+    def to_brief(self) -> str:
+        """Return a human-readable trader brief for the monitor run."""
+
+        counts = self.category_counts
+        actionable_alerts = [
+            alert
+            for alert in self.alerts
+            if alert.category in {"EXIT CANDIDATE", "RAISE STOP", "BUY CANDIDATE"}
+        ]
+        holding_alerts = [
+            alert
+            for alert in self.alerts
+            if alert.category in {"EXIT CANDIDATE", "RAISE STOP", "WATCH CLOSELY", "HOLD"}
+        ]
+        buy_alerts = [alert for alert in self.alerts if alert.category == "BUY CANDIDATE"]
+        lower_priority_alerts = [
+            alert
+            for alert in self.alerts
+            if alert.category in {"WATCH CLOSELY", "HOLD", "NO ACTION"}
+        ]
+
+        lines = [f"Market monitor brief for {self.as_of_date.isoformat()}", "", "Headline"]
+        lines.append(
+            f"Actionable now: {len(actionable_alerts)} | "
+            f"Buys: {counts['BUY CANDIDATE']} | "
+            f"Raise stop: {counts['RAISE STOP']} | "
+            f"Exit: {counts['EXIT CANDIDATE']} | "
+            f"Watch: {counts['WATCH CLOSELY']}"
+        )
+        lines.append(
+            "Presets: "
+            + (", ".join(self.preset_names) if self.preset_names else "none")
+        )
+
+        lines.extend(("", "Best actions now"))
+        if actionable_alerts:
+            for alert in actionable_alerts:
+                lines.append(_market_monitor_brief_line(alert))
+        else:
+            lines.append("No immediate action is required.")
+
+        lines.extend(("", "Current holdings"))
+        if holding_alerts:
+            for alert in holding_alerts:
+                lines.append(_market_monitor_brief_line(alert))
+        else:
+            lines.append("No held positions were reviewed.")
+
+        lines.extend(("", "Top buy candidates"))
+        if buy_alerts:
+            for alert in buy_alerts[:5]:
+                lines.append(_market_monitor_brief_line(alert))
+        else:
+            lines.append("No approved buy candidates.")
+
+        lines.extend(("", "Lower-priority names"))
+        if lower_priority_alerts:
+            for alert in lower_priority_alerts:
+                lines.append(_market_monitor_brief_line(alert))
+        else:
+            lines.append("No lower-priority names.")
+
+        return "\n".join(lines).rstrip() + "\n"
+
 
 def build_portfolio_review_report(
     *,
@@ -850,6 +975,18 @@ def write_market_monitor_text_summary(
     resolved_output_path = output_path.resolve()
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
     resolved_output_path.write_text(report.to_text(), encoding="utf-8")
+    return resolved_output_path
+
+
+def write_market_monitor_brief(
+    report: MarketMonitorReport,
+    output_path: Path,
+) -> Path:
+    """Write a human-readable market-monitor trader brief."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_output_path.write_text(report.to_brief(), encoding="utf-8")
     return resolved_output_path
 
 
@@ -1167,6 +1304,23 @@ def write_daily_research_summary(
     return resolved_output_path
 
 
+def write_daily_research_brief(
+    summary: DailyResearchSummary,
+    output_path: Path,
+    *,
+    output_paths: Mapping[str, str] | None = None,
+) -> Path:
+    """Write a human-readable daily-summary trader brief."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_output_path.write_text(
+        summary.to_brief(output_paths=output_paths),
+        encoding="utf-8",
+    )
+    return resolved_output_path
+
+
 def write_daily_preset_summary(
     summary: DailyResearchSummary,
     output_path: Path,
@@ -1380,6 +1534,47 @@ def _format_optional_float(value: float | None) -> str:
     if value is None:
         return ""
     return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def _single_line(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _daily_research_brief_card(row: DailyResearchOpportunityRow) -> list[str]:
+    return [
+        f"{row.rank}. {row.symbol} | preset={row.preset_name} | score={_format_optional_float(row.score)}",
+        "   "
+        f"qty={row.quantity} | "
+        f"entry={_brief_value(row.entry_price_hint)} | "
+        f"stop={_brief_value(row.stop_level)} | "
+        f"notional={_brief_value(row.notional_value)}",
+        f"   {_single_line(row.rationale)}",
+    ]
+
+
+def _market_monitor_brief_line(alert: MarketMonitorAlertRow) -> str:
+    parts = [alert.category]
+    if alert.symbol:
+        parts.append(alert.symbol)
+    if alert.preset_name:
+        parts.append(f"preset={alert.preset_name}")
+    if alert.entry_price_hint is not None:
+        parts.append(f"entry={_brief_value(alert.entry_price_hint)}")
+    if alert.stop_level is not None:
+        parts.append(f"stop={_brief_value(alert.stop_level)}")
+    if alert.current_stop is not None:
+        parts.append(f"current_stop={_brief_value(alert.current_stop)}")
+    if alert.suggested_stop is not None:
+        parts.append(f"suggested_stop={_brief_value(alert.suggested_stop)}")
+    if alert.latest_close is not None:
+        parts.append(f"close={_brief_value(alert.latest_close)}")
+    parts.append(f"note={_single_line(alert.rationale)}")
+    return "- " + " | ".join(parts)
+
+
+def _brief_value(value: float | None) -> str:
+    formatted = _format_optional_float(value)
+    return formatted if formatted else "n/a"
 
 
 def _format_optional_bool(value: bool | None) -> str:
