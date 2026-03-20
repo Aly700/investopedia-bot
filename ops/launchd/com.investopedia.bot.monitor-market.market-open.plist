@@ -17,26 +17,36 @@
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+
     <key>INVESTOPEDIA_BOT_CANDIDATE_FILE</key>
-    <string>__REPO_ROOT__/data/raw/candidate_symbols.txt</string>
+    <string>__REPO_ROOT__/data/raw/candidate_symbols_quality_liquid.txt</string>
+
     <key>INVESTOPEDIA_BOT_PORTFOLIO_FILE</key>
-    <string>__REPO_ROOT__/data/processed/portfolio/current_positions.json</string>
+    <string>__REPO_ROOT__/data/processed/portfolio/current_positions.csv</string>
+
     <key>INVESTOPEDIA_BOT_PRESET_NAMES</key>
-    <string>standard_breakout,confirmed_conservative_breakout</string>
+    <string>aggressive_breakout</string>
+
     <key>INVESTOPEDIA_BOT_DISCORD_WEBHOOK</key>
     <string>https://discord.com/api/webhooks/REPLACE_ME/REPLACE_ME</string>
-    <key>INVESTOPEDIA_BOT_NOTIFY_DISCORD</key>
-    <string>true</string>
-    <key>INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN</key>
-    <string>/opt/homebrew/bin/terminal-notifier</string>
+
     <key>INVESTOPEDIA_BOT_NOTIFY</key>
     <string>true</string>
+
+    <key>INVESTOPEDIA_BOT_NOTIFY_DISCORD</key>
+    <string>true</string>
+
     <key>INVESTOPEDIA_BOT_NOTIFY_LOCAL</key>
     <string>true</string>
+
     <key>INVESTOPEDIA_BOT_NOTIFY_ON_WATCH</key>
     <string>true</string>
+
     <key>INVESTOPEDIA_BOT_NOTIFY_SOUND</key>
     <string>default</string>
+
+    <key>INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN</key>
+    <string>/opt/homebrew/bin/terminal-notifier</string>
   </dict>
 
   <key>RunAtLoad</key>

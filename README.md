@@ -26,7 +26,7 @@ Optional environment variables live in `.env`. A starter file is provided in `.e
 ## Repo Layout
 
 ```text
-config/                  YAML configuration for strategy, data sources, and simulator rules
+config/                  YAML configuration for strategy, universe-builder, data sources, and simulator rules
 data/                    Local research inputs, caches, processed outputs, and logs
 notebooks/               Ad hoc research notebooks
 src/bot/backtest/        Backtest engine, metrics, slippage, and walk-forward modules
@@ -44,9 +44,10 @@ tests/                   Test suite
 
 ## Configuration
 
-The repo uses three YAML files under `config/`:
+The repo uses four YAML files under `config/`:
 
 - `strategy.yaml`: universe filters, signal parameters, and per-trade risk settings
+- `universe.yaml`: master-universe settings, profile filters, and universe-builder output paths
 - `data_sources.yaml`: active research data provider and the environment variable name for each API key
 - `game_rules.yaml`: simulator cash, commissions, fill assumptions, and account-level constraints
 
@@ -83,23 +84,103 @@ investopedia-bot fetch-data AAPL --start 2025-01-01 --end 2025-03-31 --refresh-c
 
 This uses the configured provider, normalizes the response to the canonical daily-bar schema, and caches the requested range locally.
 
-### Build a filtered universe
+### Build and refresh candidate universes
 
 ```bash
-investopedia-bot build-universe data/raw/candidate_symbols.txt --as-of 2026-03-17
-investopedia-bot build-universe data/raw/candidate_symbols.csv --as-of 2026-03-17 --lookback-days 20 --format json
+investopedia-bot build-universe --profile broad_momentum
+investopedia-bot build-universe --profile growth_momentum
+investopedia-bot build-universe --profile quality_liquid
+investopedia-bot build-universe --profile semis_ai --profile growth_software --as-of 2026-03-17
+investopedia-bot build-universe --master-input data/processed/universe/master_universe.csv --profile large_cap_liquid --format json
 ```
 
-Candidate lists can be either:
+This command is the staged universe-builder pipeline. It:
 
-- text files with one symbol per line or comma-separated symbols
-- CSV files with a `symbol` column
+- fetches or loads a broad master universe
+- enriches symbols with reference metadata plus recent price and liquidity metrics
+- applies one or more named profile filters from `config/universe.yaml`
+- writes fresh plain-text candidate files that stay compatible with the rest of the bot
 
-Universe filtering uses the thresholds already defined in `config/strategy.yaml`:
+By default it writes:
 
-- `universe.min_price`
-- `universe.min_avg_dollar_volume`
-- `universe.max_symbols`
+- `data/processed/universe/master_reference.csv`
+- `data/processed/universe/master_universe.csv`
+- `data/processed/universe/profiles/<profile>.json`
+- `data/raw/candidate_symbols_<profile>.txt`
+
+The generated text files are plain one-symbol-per-line watchlists, so they plug directly into the existing commands:
+
+```bash
+investopedia-bot daily-summary data/raw/candidate_symbols_broad_momentum.txt --as-of 2026-03-17
+investopedia-bot monitor-market data/raw/candidate_symbols_semis_ai.txt --as-of 2026-03-17 --portfolio-file data/processed/portfolio/current_positions.json
+investopedia-bot compare-strategies data/raw/candidate_symbols_large_cap_liquid.txt --start 2025-01-01 --end 2025-03-31
+```
+
+The pipeline is cache-friendly and deterministic for a given master input or cached refresh:
+
+1. stage 1 fetches the broad reference list into `data/cache/reference_universe/`
+2. stage 2 enriches the master file with metadata and daily-bar liquidity metrics
+3. stage 3 applies profile filters and writes candidate outputs
+
+Universe profile rules live in `config/universe.yaml`. Each profile can define:
+
+- `allowed_exchanges`
+- `allowed_ticker_types`
+- `active_only`
+- `common_stock_only`
+- `include_etfs`
+- `include_adrs`
+- `min_price`
+- `min_average_daily_volume`
+- `min_dollar_volume`
+- `min_market_cap`
+- `allowed_sectors`
+- `allowed_industries`
+- `include_symbols`
+- `exclude_symbols`
+- `preferred_symbol_groups`
+- `max_symbols`
+
+`allowed_sectors` and `allowed_industries` are case-insensitive substring matches, which makes thematic profiles like semis or software practical even when provider metadata is verbose.
+`preferred_symbol_groups` lets a profile collapse obvious dual-class duplicates, such as keeping `GOOGL` over `GOOG`, without hardcoding ticker-specific logic in the pipeline.
+`growth_momentum` is intended to sit between `broad_momentum` and the narrower thematic profiles: it keeps the universe liquid and growth-heavy, leans into semis, software, cloud, cybersecurity, internet platforms, and networking/AI infrastructure, and still emits a plain-text candidate file for the existing bot commands.
+`quality_liquid` is the more conservative large-universe option: it stays cross-sector, raises the market-cap and liquidity bars above `broad_momentum`, and uses a small cleanup blacklist to keep the output cleaner for lower-noise scans.
+
+To add a new profile, copy one of the existing entries in `config/universe.yaml`, rename it, and adjust the filters:
+
+```yaml
+profiles:
+  software_cloud:
+    description: Cloud software names with liquidity and market-cap gates.
+    active_only: true
+    allowed_exchanges: [XNAS, XNYS, ARCX]
+    allowed_ticker_types: [CS]
+    common_stock_only: true
+    include_etfs: false
+    include_adrs: false
+    min_price: 10
+    min_average_daily_volume: 250000
+    min_dollar_volume: 7500000
+    min_market_cap: 1000000000
+    allowed_industries: [software, cloud, data processing]
+    include_symbols: [CRM, NOW, SNOW]
+    exclude_symbols: []
+    max_symbols: 175
+```
+
+The manual override layer is built into every profile:
+
+- `include_symbols` force-adds names even if they fail the normal filters
+- `exclude_symbols` force-removes names without editing generated files by hand
+
+Generated candidate files keep provider-native symbols exactly as written. Symbols with punctuation such as `BRK.B` are preserved in the text output, and the downstream candidate loader and provider calls do not rewrite them.
+
+If you already have an enriched master CSV and only want to re-run profile filters, pass `--master-input` to skip the reference-fetch stage.
+For compatibility, the older screen-only behavior still works if you pass a text or CSV candidate file positionally:
+
+```bash
+investopedia-bot build-universe data/raw/candidate_symbols.txt --as-of 2026-03-17 --format text
+```
 
 ### Generate a manual daily order sheet
 
@@ -319,7 +400,7 @@ This command:
 - combines both into a compact machine-readable alert payload
 - writes `market_monitor.json`, `market_monitor.csv`, and a plain-text `market_monitor.txt` summary for later notification delivery
 
-This is the background-friendly layer for automation. On macOS, prefer `launchd` over `cron`, then hand the JSON or text file to a future email, Discord, Telegram, or other notifier without changing the trading logic itself.
+This is the background-friendly layer for automation. On macOS, prefer `launchd` over `cron` or a constantly running shell loop, then hand the JSON or text file to a future email, Discord, Telegram, or other notifier without changing the trading logic itself.
 
 Typical flow:
 
@@ -407,66 +488,92 @@ You can also pass extra CLI flags after the optional date:
 ./scripts/monitor_market.sh 2026-03-17 --current-drawdown 0.05
 ```
 
-Two example LaunchAgents are provided:
+Three example LaunchAgents are provided:
 
+- `ops/launchd/com.investopedia.bot.monitor-market.market-hours.plist`
 - `ops/launchd/com.investopedia.bot.monitor-market.after-close.plist`
 - `ops/launchd/com.investopedia.bot.monitor-market.market-open.plist`
 
-The examples use `launchd` as the primary macOS scheduler:
+Recommended setup: `com.investopedia.bot.monitor-market.market-hours.plist`.
+It keeps `monitor-market` as a short batch job, but runs it automatically several times per weekday with `StartCalendarInterval` entries at:
 
-- `after-close`: weekdays at `16:15`
+- `09:35`
+- `11:00`
+- `13:00`
+- `15:30`
+- `16:15`
+
+That gives you automatic background monitoring during market hours without redesigning the bot into a permanently running daemon or shell loop.
+
+The single-run examples are still available:
+
 - `market-open`: weekdays at `09:35`
+- `after-close`: weekdays at `16:15`
 
-Each LaunchAgent runs the wrapper after the scheduled time. The wrapper sends Discord alerts after `market_monitor.txt` is written, and it can also send local macOS notifications if `terminal-notifier` is available.
-The example plists also set an explicit `PATH`, `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN`, and a placeholder `INVESTOPEDIA_BOT_DISCORD_WEBHOOK` so the launchd environment is explicit.
+All repo plist examples are templates. They intentionally keep `__REPO_ROOT__` and `REPLACE_ME` placeholders so machine-local paths and secrets do not live in the repo. Customize the copied plist in `~/Library/LaunchAgents/` before loading it.
 
-Install the after-close LaunchAgent:
-
-```bash
-REPO_ROOT="$PWD"
-AGENT_NAME="com.investopedia.bot.monitor-market.after-close"
-mkdir -p "$REPO_ROOT/data/logs/launchd" "$HOME/Library/LaunchAgents"
-cp "$REPO_ROOT/ops/launchd/$AGENT_NAME.plist" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
-perl -0pi -e "s#__REPO_ROOT__#$REPO_ROOT#g" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
-plutil -lint "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
-launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
-launchctl enable "gui/$(id -u)/$AGENT_NAME"
-launchctl kickstart -k "gui/$(id -u)/$AGENT_NAME"
-```
-
-Install the optional market-open LaunchAgent:
+Install the recommended market-hours LaunchAgent:
 
 ```bash
 REPO_ROOT="$PWD"
-AGENT_NAME="com.investopedia.bot.monitor-market.market-open"
+AGENT_NAME="com.investopedia.bot.monitor-market.market-hours"
+PLIST_SRC="$REPO_ROOT/ops/launchd/$AGENT_NAME.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+
 mkdir -p "$REPO_ROOT/data/logs/launchd" "$HOME/Library/LaunchAgents"
-cp "$REPO_ROOT/ops/launchd/$AGENT_NAME.plist" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
-perl -0pi -e "s#__REPO_ROOT__#$REPO_ROOT#g" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
-plutil -lint "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
-launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+cp "$PLIST_SRC" "$PLIST_DST"
+perl -0pi -e "s#__REPO_ROOT__#$REPO_ROOT#g" "$PLIST_DST"
+
+# Edit the copied plist locally before loading it.
+# Replace REPLACE_ME values such as INVESTOPEDIA_BOT_DISCORD_WEBHOOK,
+# or set INVESTOPEDIA_BOT_NOTIFY_DISCORD=false if you do not want Discord alerts.
+
+plutil -lint "$PLIST_DST"
+launchctl bootout "gui/$(id -u)" "$PLIST_DST" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
 launchctl enable "gui/$(id -u)/$AGENT_NAME"
 launchctl kickstart -k "gui/$(id -u)/$AGENT_NAME"
 ```
 
-Reload a LaunchAgent after editing its plist:
+The copied plist in `~/Library/LaunchAgents/` is the live file. Safe values to customize locally include:
+
+- `INVESTOPEDIA_BOT_CANDIDATE_FILE`
+- `INVESTOPEDIA_BOT_PORTFOLIO_FILE`
+- `INVESTOPEDIA_BOT_PRESET_NAMES`
+- `INVESTOPEDIA_BOT_TERMINAL_NOTIFIER_BIN`
+- `INVESTOPEDIA_BOT_DISCORD_WEBHOOK`
+
+If you only want a single checkpoint instead of the full weekday schedule, repeat the same copy/load flow with `AGENT_NAME` set to either `com.investopedia.bot.monitor-market.market-open` or `com.investopedia.bot.monitor-market.after-close`.
+
+Reload the recommended LaunchAgent after editing its schedule or environment variables:
 
 ```bash
-AGENT_NAME="com.investopedia.bot.monitor-market.after-close"
-launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+AGENT_NAME="com.investopedia.bot.monitor-market.market-hours"
+PLIST_DST="$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+plutil -lint "$PLIST_DST"
+launchctl bootout "gui/$(id -u)" "$PLIST_DST" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
 launchctl enable "gui/$(id -u)/$AGENT_NAME"
 launchctl kickstart -k "gui/$(id -u)/$AGENT_NAME"
 ```
 
-Disable or unload either LaunchAgent:
+Disable or unload the recommended LaunchAgent:
 
 ```bash
-AGENT_NAME="com.investopedia.bot.monitor-market.after-close"
-launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+AGENT_NAME="com.investopedia.bot.monitor-market.market-hours"
+PLIST_DST="$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+launchctl bootout "gui/$(id -u)" "$PLIST_DST" 2>/dev/null || true
 launchctl disable "gui/$(id -u)/$AGENT_NAME"
 ```
+
+Change the schedule later by editing the `StartCalendarInterval` array in the copied plist:
+
+1. open `~/Library/LaunchAgents/com.investopedia.bot.monitor-market.market-hours.plist`
+2. add, remove, or adjust weekday `Hour` and `Minute` entries
+3. run `plutil -lint` on the edited plist
+4. reload it with the `launchctl bootout` and `launchctl bootstrap` commands above
+
+Each scheduled time should have one entry per weekday you want it to run. The repo example already includes Monday through Friday entries for all five recommended checkpoints.
 
 Disable notifications without disabling the LaunchAgent:
 
@@ -479,7 +586,8 @@ Outputs and logs:
 
 - monitor outputs: `data/processed/monitor_market/YYYY-MM-DD/market_monitor.json`
 - CSV/text summaries: `data/processed/monitor_market/YYYY-MM-DD/market_monitor.csv` and `market_monitor.txt`
-- launchd stdout/stderr logs: `data/logs/launchd/monitor-market.after-close.out.log`, `monitor-market.after-close.err.log`, `monitor-market.market-open.out.log`, and `monitor-market.market-open.err.log`
+- recommended market-hours logs: `data/logs/launchd/monitor-market.market-hours.out.log` and `monitor-market.market-hours.err.log`
+- optional single-run logs: `data/logs/launchd/monitor-market.after-close.out.log`, `monitor-market.after-close.err.log`, `monitor-market.market-open.out.log`, and `monitor-market.market-open.err.log`
 
 ## Architecture Notes
 
