@@ -8,6 +8,7 @@ import pandas as pd
 from bot.config import RiskConfig, SignalConfig
 from bot.strategy.breakout_momentum import (
     BreakoutMomentumSettings,
+    BreakoutStrategyPreset,
     build_default_breakout_presets,
     compute_breakout_features,
     generate_breakout_signal,
@@ -239,6 +240,34 @@ def test_benchmark_regime_settings_accepts_valid_windows() -> None:
         settings = BenchmarkRegimeSettings("SPY", fast_window=50, slow_window=200, mode=mode)
         assert settings.fast_window == 50
         assert settings.slow_window == 200
+
+
+def test_breakout_strategy_preset_rejects_invalid_regime_filter_mode() -> None:
+    with pytest.raises(ValueError, match="regime_filter_mode"):
+        BreakoutStrategyPreset(
+            name="invalid_regime",
+            breakout_lookback=20,
+            relative_volume_threshold=1.5,
+            initial_stop_atr=2.5,
+            trailing_stop_atr=3.0,
+            risk_per_trade=0.01,
+            regime_filter_mode="unsupported_mode",  # type: ignore[arg-type]
+        )
+
+
+def test_breakout_momentum_settings_reject_invalid_regime_filter_mode() -> None:
+    with pytest.raises(ValueError, match="regime_filter_mode"):
+        BreakoutMomentumSettings(
+            breakout_lookback=3,
+            benchmark_symbol="SPY",
+            benchmark_sma_fast=2,
+            benchmark_sma_slow=3,
+            relative_volume_threshold=1.5,
+            atr_window=2,
+            stop_atr_multiple=2.0,
+            trailing_stop_atr=3.0,
+            regime_filter_mode="unsupported_mode",  # type: ignore[arg-type]
+        )
 
 
 def _settings(

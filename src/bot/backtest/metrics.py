@@ -43,6 +43,7 @@ COMPARISON_PARAMETER_FIELDS = (
     "breakout_lookback",
     "relative_volume_threshold",
     "require_relative_volume_confirmation",
+    "regime_filter_mode",
     "initial_stop_atr",
     "trailing_stop_atr",
     "risk_per_trade",

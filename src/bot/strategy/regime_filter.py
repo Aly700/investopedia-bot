@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 import pandas as pd
 
@@ -12,6 +12,7 @@ from bot.indicators.trend import simple_moving_average
 
 
 RegimeFilterMode = Literal["close_above_slow", "fast_above_slow", "either"]
+VALID_REGIME_FILTER_MODES: frozenset[str] = frozenset(get_args(RegimeFilterMode))
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,11 @@ class BenchmarkRegimeSettings:
                 f"fast_window ({self.fast_window}) must be strictly less than "
                 f"slow_window ({self.slow_window})."
             )
-        if self.mode not in ("close_above_slow", "fast_above_slow", "either"):
-            raise ValueError(f"Unsupported regime filter mode: {self.mode}")
+        if self.mode not in VALID_REGIME_FILTER_MODES:
+            raise ValueError(
+                "Unsupported regime filter mode: "
+                f"{self.mode}. Expected one of {sorted(VALID_REGIME_FILTER_MODES)}."
+            )
 
 
 def benchmark_regime_series(
