@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -231,7 +231,11 @@ def test_portfolio_review_report_to_dict_counts_actions_from_declared_action_lis
             quantity=position.shares,
             average_entry_price=position.average_entry_price,
             current_stop=position.current_stop,
-            suggested_stop=position.current_stop,
+            suggested_stop=(
+                position.current_stop + 1.0
+                if action == "RAISE STOP" and position.current_stop is not None
+                else position.current_stop
+            ),
             latest_close=position.average_entry_price + 5.0,
             unrealized_pl_pct=0.05,
             distance_to_stop_pct=0.10,
@@ -277,6 +281,27 @@ def test_portfolio_review_row_rejects_invalid_suggested_action() -> None:
             suggested_action="TRIM",
             preset_name="standard_breakout",
             rationale="Invalid action for regression coverage.",
+            metadata={},
+        )
+
+
+def test_portfolio_review_row_rejects_raise_stop_at_or_above_latest_close() -> None:
+    with pytest.raises(ValueError, match="remain below latest_close"):
+        PortfolioReviewRow(
+            date=date(2024, 1, 5),
+            symbol="AAPL",
+            quantity=10,
+            average_entry_price=100.0,
+            current_stop=95.0,
+            suggested_stop=110.0,
+            latest_close=110.0,
+            unrealized_pl_pct=0.10,
+            distance_to_stop_pct=(110.0 - 95.0) / 110.0,
+            regime_passed=True,
+            above_entry=True,
+            suggested_action="RAISE STOP",
+            preset_name="standard_breakout",
+            rationale="Invalid stop recommendation for regression coverage.",
             metadata={},
         )
 
@@ -1033,6 +1058,30 @@ def test_run_daily_summary_workflow_uses_full_candidate_file_without_strategy_ca
     assert payload["unique_no_signal_symbol_count"] == 105
 
 
+def test_comparison_warmup_start_accounts_for_relative_volume_window() -> None:
+    presets = (
+        BreakoutStrategyPreset(
+            name="rv_heavy",
+            breakout_lookback=20,
+            relative_volume_threshold=1.5,
+            initial_stop_atr=2.0,
+            trailing_stop_atr=3.0,
+            risk_per_trade=0.01,
+        ),
+    )
+
+    fetch_start = main_module._comparison_warmup_start(
+        start_date=date(2024, 1, 10),
+        atr_window=14,
+        benchmark_sma_slow=50,
+        presets=presets,
+        max_relative_volume_window=80,
+        enable_regime_filter=False,
+    )
+
+    assert fetch_start == date(2024, 1, 10) - timedelta(days=243)
+
+
 def test_handle_generate_orders_uses_full_candidate_file_without_strategy_cap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1113,17 +1162,33 @@ def test_handle_daily_summary_uses_workflow_universe_count(
 
     monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: SimpleNamespace(project_root=tmp_path, data_sources=SimpleNamespace(provider="polygon")))
     monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
-    monkeypatch.setattr(
-        main_module,
-        "_run_daily_summary_workflow",
-        lambda args, *, config, provider: {
+    loaded_positions = [
+        ExistingPosition(
+            symbol="AAPL",
+            shares=5,
+            average_entry_price=100.0,
+            current_stop=95.0,
+            preset_name="aggressive_breakout",
+        )
+    ]
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: loaded_positions)
+    captured_current_positions: dict[str, object] = {}
+
+    def fake_run_daily_summary_workflow(args, *, config, provider, current_positions=None):
+        captured_current_positions["value"] = current_positions
+        return {
             "summary": summary,
             "presets": [preset],
             "preset_selection_source": "named_presets",
-            "current_positions": [],
+            "current_positions": loaded_positions,
             "current_equity": 100_000.0,
             "execution_batch": ManualExecutor().build_execution_batch([], as_of_date=date(2024, 1, 5)),
-        },
+        }
+
+    monkeypatch.setattr(
+        main_module,
+        "_run_daily_summary_workflow",
+        fake_run_daily_summary_workflow,
     )
 
     args = build_parser().parse_args(
@@ -1136,6 +1201,8 @@ def test_handle_daily_summary_uses_workflow_universe_count(
             "data/raw/candidate_symbols.txt",
             "--as-of",
             "2024-01-05",
+            "--portfolio-file",
+            str(tmp_path / "portfolio.csv"),
             "--output-dir",
             str(tmp_path / "daily"),
             "--format",
@@ -1147,7 +1214,10 @@ def test_handle_daily_summary_uses_workflow_universe_count(
     payload = json.loads(capsys.readouterr().out)
 
     assert result == 0
+    assert captured_current_positions["value"] == loaded_positions
     assert payload["universe_count"] == 105
+    assert payload["current_position_count"] == 1
+    assert payload["current_position_symbols"] == ["AAPL"]
     assert Path(payload["outputs"]["daily_summary_json"]).exists()
 
 

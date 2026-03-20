@@ -402,6 +402,7 @@ def walkforward_fetch_start(
     parameter_sets: Sequence[SweepParameterSet],
     atr_window: int,
     benchmark_sma_slow: int,
+    max_relative_volume_window: int,
     enable_regime_filter: bool,
 ) -> date:
     """Return the earliest warmup start required for a walk-forward sweep."""
@@ -415,7 +416,7 @@ def walkforward_fetch_start(
     largest_window = max(
         max_breakout_lookback + 1,
         atr_window,
-        max_breakout_lookback + 1,
+        max_relative_volume_window + 1,
         benchmark_sma_slow if enable_regime_filter else 1,
     )
     return initial_start_date - timedelta(days=max(largest_window * 3, 30))

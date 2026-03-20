@@ -1,6 +1,7 @@
 from dataclasses import replace
 from datetime import date
 import json
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -513,6 +514,93 @@ def test_build_universe_cli_writes_master_and_profile_outputs_from_master_input(
     assert candidate_output.exists()
     assert candidate_output.read_text(encoding="utf-8") == "AAPL\nMSFT\n"
     assert master_output.exists()
+
+
+def test_build_universe_warns_when_master_input_disables_reference_detail_enrichment(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    master_input = tmp_path / "master_input.csv"
+    pd.DataFrame(
+        [
+            _master_row(
+                symbol="NVDA",
+                industry="Semiconductors",
+                sector="Technology",
+                market_cap=2_000_000_000_000,
+                price=120.0,
+                average_daily_volume=5_000_000,
+                dollar_volume=600_000_000,
+            ),
+            _master_row(
+                symbol="MSFT",
+                industry="Application software",
+                sector="Technology",
+                market_cap=3_000_000_000_000,
+                price=400.0,
+                average_daily_volume=3_000_000,
+                dollar_volume=1_200_000_000,
+            ),
+        ]
+    ).to_csv(master_input, index=False)
+    frames_by_symbol = {
+        "NVDA": pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+                "open": [118.0, 119.0, 120.0],
+                "high": [121.0, 122.0, 123.0],
+                "low": [117.0, 118.0, 119.0],
+                "close": [120.0, 121.0, 122.0],
+                "volume": [5_000_000, 5_100_000, 5_200_000],
+                "symbol": ["NVDA", "NVDA", "NVDA"],
+            }
+        ),
+        "MSFT": pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+                "open": [398.0, 399.0, 400.0],
+                "high": [401.0, 402.0, 403.0],
+                "low": [397.0, 398.0, 399.0],
+                "close": [400.0, 401.0, 402.0],
+                "volume": [3_000_000, 3_100_000, 3_200_000],
+                "symbol": ["MSFT", "MSFT", "MSFT"],
+            }
+        ),
+    }
+    fake_provider = FakeDailyBarProvider(frames_by_symbol=frames_by_symbol, cache_dir=tmp_path)
+    runtime_config = replace(
+        load_app_config(),
+        project_root=tmp_path,
+        config_dir=tmp_path / "config",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: runtime_config)
+    monkeypatch.setattr(
+        main_module,
+        "create_daily_bar_provider",
+        lambda config, env_file: fake_provider,
+    )
+
+    args = main_module.build_parser().parse_args(
+        [
+            "build-universe",
+            "--master-input",
+            str(master_input),
+            "--as-of",
+            "2024-01-04",
+            "--profile",
+            "growth_momentum",
+            "--format",
+            "json",
+        ]
+    )
+
+    with caplog.at_level(logging.WARNING):
+        exit_code = main_module._handle_build_universe(args)
+
+    assert exit_code == 0
+    assert "--master-input disables provider-backed reference detail enrichment." in caplog.text
 
 
 def _master_row(

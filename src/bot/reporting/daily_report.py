@@ -455,6 +455,14 @@ class PortfolioReviewRow:
                 f"suggested_action must be one of {PORTFOLIO_REVIEW_ACTIONS}, "
                 f"got '{self.suggested_action}'."
             )
+        if (
+            self.suggested_action == "RAISE STOP"
+            and self.suggested_stop is not None
+            and self.suggested_stop >= self.latest_close
+        ):
+            raise ValueError(
+                "RAISE STOP rows require suggested_stop to remain below latest_close."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation of the review row."""
