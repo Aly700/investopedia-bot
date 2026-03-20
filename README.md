@@ -53,11 +53,49 @@ The repo uses four YAML files under `config/`:
 
 The CLI loads and validates these files through `src/bot/config.py`. Config is kept separate from execution so strategy research, backtests, and order generation can share the same baseline assumptions.
 
+Deployment note: container and cloud runtimes need the full `config/` directory copied alongside the bot runtime, not just the Python package files. If the runtime root is not the current working directory, pass `--config-dir /path/to/config`; the loader will treat that directory's parent as the app root for relative `data/` outputs.
+
 Historical daily-bar data is selected by `config/data_sources.yaml`. Local cache files are written under `data/cache/daily_bars/<provider>/`.
 
 ## CLI Usage
 
 After installation, use either the console script or `python -m bot.main`.
+
+### Developer shortcuts
+
+For normal local use, the repo includes small bash wrappers under `scripts/` plus shared defaults in `scripts/common.sh`.
+
+Start by copying the local template:
+
+```bash
+cp .env.local.example .env.local
+```
+
+Then use the short commands:
+
+```bash
+./scripts/build_quality_universe.sh
+./scripts/monitor_quality.sh
+./scripts/daily_quality_summary.sh
+./scripts/review_portfolio.sh
+./scripts/upsert_position.sh LNG 67 281.87 259.55
+```
+
+You can temporarily override the default date or any other helper variable without editing files:
+
+```bash
+BOT_DATE=2026-03-20 ./scripts/monitor_quality.sh
+```
+
+If you prefer `make`, equivalent shortcuts are available:
+
+```bash
+make build-quality
+make monitor
+make summary
+make review
+make test-fast
+```
 
 ### Show merged config
 

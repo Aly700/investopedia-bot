@@ -33,12 +33,18 @@ from bot.backtest.walkforward import (
 from bot.config import (
     AppConfig,
     ConfigError,
+    UniverseProfileConfig,
     default_config_dir,
     default_env_file,
     load_app_config,
     validate_environment,
 )
-from bot.data.providers import DataProviderConfigurationError, DataProviderError, create_daily_bar_provider
+from bot.data.providers import (
+    DailyBarProvider,
+    DataProviderConfigurationError,
+    DataProviderError,
+    create_daily_bar_provider,
+)
 from bot.data.reference import create_reference_universe_provider
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
 from bot.data.universe_pipeline import (
@@ -1048,6 +1054,20 @@ def _handle_build_universe(args: argparse.Namespace) -> int:
         raise ValueError("lookback_days must be greater than zero.")
 
     profile_names = _resolve_universe_profiles(args.profiles, config)
+    if args.master_input is not None:
+        degraded_profiles = [
+            profile_name
+            for profile_name in profile_names
+            if _profile_uses_reference_detail_filters(config.universe_builder.profiles[profile_name])
+        ]
+        if degraded_profiles:
+            LOGGER.warning(
+                "--master-input disables provider-backed reference detail enrichment. "
+                "Profiles %s rely on market-cap/sector/industry filters and will only use "
+                "metadata already present in %s.",
+                ", ".join(degraded_profiles),
+                args.master_input.resolve(),
+            )
     profile_label = ", ".join(profile_names)
     LOGGER.info(
         "Build-universe starting for profile(s): %s.",
@@ -1665,6 +1685,10 @@ def _handle_walkforward(args: argparse.Namespace) -> int:
         parameter_sets=parameter_sets,
         atr_window=config.strategy.risk.atr_length,
         benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        max_relative_volume_window=max(
+            (parameter_set.breakout_lookback for parameter_set in parameter_sets),
+            default=config.strategy.signals.breakout_lookback,
+        ),
         enable_regime_filter=not args.disable_regime_filter,
     )
 
@@ -1770,6 +1794,12 @@ def _handle_compare_strategies(args: argparse.Namespace) -> int:
         atr_window=config.strategy.risk.atr_length,
         benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
         presets=presets,
+        max_relative_volume_window=_max_resolved_relative_volume_window_for_presets(
+            config=config,
+            presets=presets,
+            require_relative_volume_confirmation=args.require_relative_volume,
+            enable_regime_filter=not args.disable_regime_filter,
+        ),
         enable_regime_filter=not args.disable_regime_filter,
     )
     symbol_frames: dict[str, object] = {}
@@ -1867,7 +1897,13 @@ def _handle_compare_strategies(args: argparse.Namespace) -> int:
 def _handle_daily_summary(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     provider = create_daily_bar_provider(config, env_file=args.env_file)
-    workflow = _run_daily_summary_workflow(args, config=config, provider=provider)
+    current_positions = _load_current_positions(args.portfolio_file)
+    workflow = _run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=provider,
+        current_positions=current_positions,
+    )
     summary = workflow["summary"]
     presets = workflow["presets"]
     preset_selection_source = workflow["preset_selection_source"]
@@ -1941,7 +1977,7 @@ def _run_daily_summary_workflow(
     args: argparse.Namespace,
     *,
     config: AppConfig,
-    provider: object,
+    provider: DailyBarProvider,
     current_positions: list[ExistingPosition] | None = None,
 ) -> dict[str, object]:
     presets, preset_selection_source = _resolve_daily_summary_presets(args, config)
@@ -1978,6 +2014,12 @@ def _run_daily_summary_workflow(
         atr_window=config.strategy.risk.atr_length,
         benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
         presets=presets,
+        max_relative_volume_window=_max_resolved_relative_volume_window_for_presets(
+            config=config,
+            presets=presets,
+            require_relative_volume_confirmation=args.require_relative_volume,
+            enable_regime_filter=not args.disable_regime_filter,
+        ),
         enable_regime_filter=not args.disable_regime_filter,
     )
 
@@ -2159,7 +2201,7 @@ def _run_portfolio_review_workflow(
     args: argparse.Namespace,
     *,
     config: AppConfig,
-    provider: object | None,
+    provider: DailyBarProvider | None,
     current_positions: list[ExistingPosition] | None = None,
 ) -> PortfolioReviewReport:
     resolved_current_positions = (
@@ -2261,7 +2303,7 @@ def _build_portfolio_review_plan(
 def _build_portfolio_review_row(
     plan: dict[str, object],
     *,
-    provider: object,
+    provider: DailyBarProvider,
     as_of_date: date,
     benchmark_frame: pd.DataFrame | None,
     refresh_cache: bool,
@@ -2431,16 +2473,52 @@ def _comparison_warmup_start(
     atr_window: int,
     benchmark_sma_slow: int,
     presets: Sequence[BreakoutStrategyPreset],
+    max_relative_volume_window: int,
     enable_regime_filter: bool,
 ) -> date:
     max_breakout_lookback = max((preset.breakout_lookback for preset in presets), default=1)
     largest_window = max(
         max_breakout_lookback + 1,
         atr_window,
-        max_breakout_lookback + 1,
+        max_relative_volume_window + 1,
         benchmark_sma_slow if enable_regime_filter else 1,
     )
     return start_date - timedelta(days=max(largest_window * 3, 30))
+
+
+def _profile_uses_reference_detail_filters(profile_config: UniverseProfileConfig) -> bool:
+    return (
+        profile_config.min_market_cap is not None
+        or bool(profile_config.allowed_sectors)
+        or bool(profile_config.allowed_industries)
+    )
+
+
+def _max_resolved_relative_volume_window_for_presets(
+    *,
+    config: AppConfig,
+    presets: Sequence[BreakoutStrategyPreset],
+    require_relative_volume_confirmation: bool,
+    enable_regime_filter: bool,
+) -> int:
+    base_settings = BreakoutMomentumSettings.from_configs(
+        config.strategy.signals,
+        config.strategy.risk,
+        require_relative_volume_confirmation=require_relative_volume_confirmation,
+        enable_regime_filter=enable_regime_filter,
+    )
+    return max(
+        (
+            preset.apply_to_settings(
+                base_settings,
+                force_require_relative_volume_confirmation=(
+                    True if require_relative_volume_confirmation else None
+                ),
+            ).resolved_relative_volume_window
+            for preset in presets
+        ),
+        default=base_settings.resolved_relative_volume_window,
+    )
 
 
 def _run_breakout_strategy_comparison(

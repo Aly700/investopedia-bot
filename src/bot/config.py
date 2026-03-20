@@ -14,6 +14,14 @@ class ConfigError(ValueError):
     """Raised when repo configuration files are missing or malformed."""
 
 
+REQUIRED_CONFIG_FILENAMES = (
+    "strategy.yaml",
+    "universe.yaml",
+    "data_sources.yaml",
+    "game_rules.yaml",
+)
+
+
 @dataclass(frozen=True)
 class UniverseConfig:
     """Universe selection parameters for research and signal generation."""
@@ -387,8 +395,12 @@ class EnvironmentValidationResult:
 
 
 def default_project_root() -> Path:
-    """Return the repository root inferred from this module location."""
+    """Return the runtime root that owns the active config bundle."""
 
+    for start in (Path.cwd(), Path(__file__).resolve().parent):
+        discovered_root = _find_project_root(start)
+        if discovered_root is not None:
+            return discovered_root
     return Path(__file__).resolve().parents[2]
 
 
@@ -409,8 +421,12 @@ def default_env_file(project_root: Path | None = None) -> Path:
 def load_app_config(config_dir: Path | None = None) -> AppConfig:
     """Load the full application config from the repo's YAML files."""
 
-    project_root = default_project_root()
-    resolved_config_dir = (config_dir or default_config_dir(project_root)).resolve()
+    if config_dir is None:
+        project_root = default_project_root()
+        resolved_config_dir = default_config_dir(project_root).resolve()
+    else:
+        resolved_config_dir = config_dir.resolve()
+        project_root = resolved_config_dir.parent
     if not resolved_config_dir.exists():
         raise ConfigError(f"Config directory does not exist: {resolved_config_dir}")
 
@@ -496,7 +512,7 @@ def _read_env_file(env_file: Path | None) -> dict[str, str]:
                 f"Invalid environment key in {env_file} at line {line_number}: {raw_line}"
             )
 
-        parsed[cleaned_key] = value.strip().strip("'\"")
+        parsed[cleaned_key] = _strip_paired_quotes(value.strip())
     return parsed
 
 
@@ -510,6 +526,41 @@ def _merge_environment(
     merged = _read_env_file(env_file)
     merged.update(dict(environ or os.environ))
     return merged
+
+
+def _strip_paired_quotes(value: str) -> str:
+    """Strip surrounding quotes only when they form a matching pair."""
+
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
+
+
+def _find_project_root(start: Path) -> Path | None:
+    """Search upward for a directory that contains the full config bundle."""
+
+    resolved_start = start.resolve()
+    candidates = (
+        (resolved_start,)
+        if resolved_start.is_dir()
+        else ()
+    )
+    search_roots = candidates or (resolved_start.parent,)
+    for root in search_roots:
+        for candidate in (root, *root.parents):
+            if _has_required_config_bundle(candidate):
+                return candidate
+    return None
+
+
+def _has_required_config_bundle(project_root: Path) -> bool:
+    """Return whether the path has the full expected config directory."""
+
+    config_dir = project_root / "config"
+    return config_dir.is_dir() and all(
+        (config_dir / filename).is_file()
+        for filename in REQUIRED_CONFIG_FILENAMES
+    )
 
 
 def _as_mapping(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:

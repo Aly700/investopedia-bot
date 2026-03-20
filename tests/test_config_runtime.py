@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from bot.config import load_app_config, validate_environment
+from bot.config import _read_env_file, default_project_root, load_app_config, validate_environment
 
 
 def test_load_app_config_reads_repo_files() -> None:
@@ -40,3 +40,54 @@ def test_validate_environment_reads_env_file(tmp_path: Path) -> None:
     assert result.provider == config.data_sources.provider
     assert result.present == (api_key_env,)
     assert result.missing == ()
+
+
+def test_read_env_file_strips_only_paired_quotes(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        'DOUBLE_QUOTED="double value"\n'
+        "SINGLE_QUOTED='single value'\n"
+        "UNQUOTED=plain-value\n",
+        encoding="utf-8",
+    )
+
+    parsed = _read_env_file(env_file)
+
+    assert parsed["DOUBLE_QUOTED"] == "double value"
+    assert parsed["SINGLE_QUOTED"] == "single value"
+    assert parsed["UNQUOTED"] == "plain-value"
+
+
+def test_load_app_config_uses_explicit_config_dir_parent_as_project_root(tmp_path: Path) -> None:
+    config_dir = _copy_repo_config_bundle(tmp_path / "config")
+
+    config = load_app_config(config_dir=config_dir)
+
+    assert config.config_dir == config_dir.resolve()
+    assert config.project_root == tmp_path.resolve()
+
+
+def test_default_project_root_prefers_runtime_config_bundle_in_cwd(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_dir = _copy_repo_config_bundle(tmp_path / "config")
+    monkeypatch.chdir(tmp_path)
+
+    project_root = default_project_root()
+    config = load_app_config()
+
+    assert project_root == tmp_path.resolve()
+    assert config.project_root == tmp_path.resolve()
+    assert config.config_dir == config_dir.resolve()
+
+
+def _copy_repo_config_bundle(destination: Path) -> Path:
+    source_dir = Path(__file__).resolve().parents[1] / "config"
+    destination.mkdir(parents=True, exist_ok=True)
+    for filename in ("strategy.yaml", "universe.yaml", "data_sources.yaml", "game_rules.yaml"):
+        (destination / filename).write_text(
+            (source_dir / filename).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    return destination
