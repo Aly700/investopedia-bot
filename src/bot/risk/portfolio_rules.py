@@ -394,6 +394,11 @@ def review_existing_long_position(
         current_stop=position.current_stop,
         trailing_stop_candidate=trailing_stop_candidate,
     )
+    # A long protective stop must always be strictly below the latest close.
+    # If the trailing-stop formula produced a value at or above the market price
+    # (e.g. because ATR or a multiplier over-shot), treat it as unusable.
+    if suggested_stop is not None and suggested_stop >= latest_close:
+        suggested_stop = None
     rationale: list[str] = []
 
     if position.current_stop is not None and latest_close <= position.current_stop:

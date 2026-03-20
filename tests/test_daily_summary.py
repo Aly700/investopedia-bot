@@ -919,7 +919,7 @@ def test_run_daily_summary_workflow_treats_held_symbol_as_no_signal(
     monkeypatch.setattr(
         main_module.UniverseBuilder,
         "screen_candidates",
-        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache: [
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
             SimpleNamespace(symbol="AAA")
         ],
     )
@@ -973,6 +973,182 @@ def test_run_daily_summary_workflow_treats_held_symbol_as_no_signal(
     assert payload["candidate_count"] == 0
     assert payload["rejected_count"] == 0
     assert payload["unique_no_signal_symbols"] == ["AAA"]
+
+
+def test_run_daily_summary_workflow_uses_full_candidate_file_without_strategy_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config()
+    candidate_path = tmp_path / "candidates.txt"
+    symbols = [f"SYM{index:03d}" for index in range(105)]
+    candidate_path.write_text("\n".join(symbols) + "\n", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [50.0],
+                    "high": [51.0],
+                    "low": [49.0],
+                    "close": [50.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda *args, **kwargs: None,
+    )
+
+    workflow = main_module._run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=[],
+    )
+    payload = workflow["summary"].to_dict()
+
+    assert payload["universe_count"] == 105
+    assert payload["candidate_count"] == 0
+    assert payload["unique_no_signal_symbol_count"] == 105
+
+
+def test_handle_generate_orders_uses_full_candidate_file_without_strategy_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate_path = tmp_path / "candidates.txt"
+    symbols = [f"SYM{index:03d}" for index in range(105)]
+    candidate_path.write_text("\n".join(symbols) + "\n", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(tmp_path / "orders"),
+            "--format",
+            "json",
+        ]
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [50.0],
+                    "high": [51.0],
+                    "low": [49.0],
+                    "close": [50.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda *args, **kwargs: None,
+    )
+
+    result = main_module._handle_generate_orders(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert payload["universe_count"] == 105
+    assert payload["signal_count"] == 0
+
+
+def test_handle_daily_summary_uses_workflow_universe_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    preset = _selected_presets("aggressive_breakout")[0]
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=ManualExecutor().build_execution_batch([], as_of_date=date(2024, 1, 5)),
+        evaluations=[],
+        selected_presets=[preset],
+        universe_symbols=[f"SYM{index:03d}" for index in range(105)],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={preset.name: tuple(f"SYM{index:03d}" for index in range(105))},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+        current_positions=[],
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: SimpleNamespace(project_root=tmp_path, data_sources=SimpleNamespace(provider="polygon")))
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
+    monkeypatch.setattr(
+        main_module,
+        "_run_daily_summary_workflow",
+        lambda args, *, config, provider: {
+            "summary": summary,
+            "presets": [preset],
+            "preset_selection_source": "named_presets",
+            "current_positions": [],
+            "current_equity": 100_000.0,
+            "execution_batch": ManualExecutor().build_execution_batch([], as_of_date=date(2024, 1, 5)),
+        },
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--config-dir",
+            str(tmp_path / "config"),
+            "--env-file",
+            str(tmp_path / ".env"),
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--output-dir",
+            str(tmp_path / "daily"),
+            "--format",
+            "json",
+        ]
+    )
+
+    result = main_module._handle_daily_summary(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert payload["universe_count"] == 105
+    assert Path(payload["outputs"]["daily_summary_json"]).exists()
 
 
 def test_position_entry_date_returns_date_object() -> None:

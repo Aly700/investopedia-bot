@@ -103,11 +103,11 @@ def test_create_provider_uses_configured_provider() -> None:
 
 def test_load_candidate_symbols_supports_text_and_csv(tmp_path: Path) -> None:
     text_path = tmp_path / "candidates.txt"
-    text_path.write_text("aapl\nmsft, nvda\n# comment\nAAPL\n", encoding="utf-8")
+    text_path.write_text("aapl\nmsft, nvda\nbrk.b\n# comment\nAAPL\n", encoding="utf-8")
     csv_path = tmp_path / "candidates.csv"
     csv_path.write_text("symbol\nspy\nqqq\n", encoding="utf-8")
 
-    assert load_candidate_symbols(text_path) == ["AAPL", "MSFT", "NVDA"]
+    assert load_candidate_symbols(text_path) == ["AAPL", "MSFT", "NVDA", "BRK.B"]
     assert load_candidate_symbols(csv_path) == ["SPY", "QQQ"]
 
 
@@ -172,3 +172,38 @@ def test_universe_builder_filters_and_ranks_symbols(tmp_path: Path) -> None:
     )
 
     assert selected == ["AAA", "DDD"]
+
+
+def test_universe_builder_can_skip_configured_max_symbol_cap(tmp_path: Path) -> None:
+    dates = pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"])
+    symbols = [f"SYM{index:03d}" for index in range(105)]
+    frames_by_symbol = {
+        symbol: pd.DataFrame(
+            {
+                "date": dates,
+                "open": [50.0, 50.0, 50.0],
+                "high": [51.0, 51.0, 51.0],
+                "low": [49.0, 49.0, 49.0],
+                "close": [50.0, 50.0, 50.0],
+                "volume": [2_000_000, 2_000_000, 2_000_000],
+                "symbol": [symbol, symbol, symbol],
+            }
+        )
+        for symbol in symbols
+    }
+    provider = FakeDailyBarProvider(frames_by_symbol=frames_by_symbol, cache_dir=tmp_path)
+    builder = UniverseBuilder(
+        provider,
+        UniverseConfig(min_price=10.0, min_avg_dollar_volume=20_000_000, max_symbols=100),
+    )
+
+    selected = builder.build(
+        symbols,
+        as_of_date=date(2024, 1, 4),
+        lookback_days=3,
+        enforce_max_symbols=False,
+    )
+
+    assert len(selected) == 105
+    assert selected[:3] == ["SYM000", "SYM001", "SYM002"]
+    assert selected[-1] == "SYM104"

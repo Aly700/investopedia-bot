@@ -45,6 +45,7 @@ class UniverseBuilder:
         as_of_date: date,
         lookback_days: int = 20,
         refresh_cache: bool = False,
+        enforce_max_symbols: bool = True,
     ) -> list[str]:
         """Return eligible symbols after filtering and ranking."""
 
@@ -55,6 +56,7 @@ class UniverseBuilder:
                 as_of_date=as_of_date,
                 lookback_days=lookback_days,
                 refresh_cache=refresh_cache,
+                enforce_max_symbols=enforce_max_symbols,
             )
         ]
 
@@ -65,6 +67,7 @@ class UniverseBuilder:
         as_of_date: date,
         lookback_days: int = 20,
         refresh_cache: bool = False,
+        enforce_max_symbols: bool = True,
     ) -> list[UniverseMember]:
         """Return screened universe members with summary metrics."""
 
@@ -114,7 +117,9 @@ class UniverseBuilder:
             )
 
         eligible_members.sort(key=lambda member: (-member.average_dollar_volume, member.symbol))
-        return eligible_members[: self.universe_config.max_symbols]
+        if enforce_max_symbols:
+            return eligible_members[: self.universe_config.max_symbols]
+        return eligible_members
 
 
 def load_candidate_symbols(path: Path) -> list[str]:

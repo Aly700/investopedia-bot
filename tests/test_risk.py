@@ -556,6 +556,69 @@ def test_review_existing_long_position_suggests_exit_candidate() -> None:
     assert "current stop" in " ".join(decision.rationale).lower()
 
 
+def test_review_existing_long_position_trailing_stop_above_latest_close_does_not_raise_stop() -> None:
+    # Regression: trailing_stop_candidate above latest_close must never produce RAISE STOP.
+    # Mirrors the live NET case: close=221.27, bad candidate=228.574.
+    position = ExistingPosition(
+        symbol="NET",
+        shares=10,
+        average_entry_price=200.0,
+        current_stop=210.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=221.27,
+        regime_passed=True,
+        trailing_stop_candidate=228.574,
+    )
+
+    assert decision.suggested_action != "RAISE STOP"
+    assert decision.suggested_stop is None
+
+
+def test_review_existing_long_position_valid_stop_below_latest_close_still_raises_stop() -> None:
+    # Regression: a trailing candidate that is above current_stop AND below latest_close
+    # must still produce RAISE STOP — the fix must not suppress valid stops.
+    position = ExistingPosition(
+        symbol="MSFT",
+        shares=5,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=120.0,
+        regime_passed=True,
+        trailing_stop_candidate=105.0,
+    )
+
+    assert decision.suggested_action == "RAISE STOP"
+    assert decision.suggested_stop == pytest.approx(105.0)
+
+
+def test_review_existing_long_position_raise_stop_suggested_stop_always_below_latest_close() -> None:
+    # Invariant: whenever action is RAISE STOP, suggested_stop must be < latest_close.
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=115.0,
+        regime_passed=True,
+        trailing_stop_candidate=108.0,
+    )
+
+    assert decision.suggested_action == "RAISE STOP"
+    assert decision.suggested_stop is not None
+    assert decision.suggested_stop < decision.latest_close
+
+
 def test_review_existing_long_position_clears_stop_for_weak_regime_exit_candidate() -> None:
     position = ExistingPosition(
         symbol="AAPL",

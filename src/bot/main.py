@@ -39,7 +39,15 @@ from bot.config import (
     validate_environment,
 )
 from bot.data.providers import DataProviderConfigurationError, DataProviderError, create_daily_bar_provider
+from bot.data.reference import create_reference_universe_provider
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
+from bot.data.universe_pipeline import (
+    UniverseProfileBuildResult,
+    apply_universe_filters,
+    enrich_universe_metadata,
+    fetch_master_universe,
+    write_universe_outputs,
+)
 from bot.execution.manual_executor import (
     ManualExecutor,
     ManualOrderError,
@@ -72,6 +80,7 @@ from bot.risk.portfolio_rules import (
     ExistingPosition,
     PortfolioConstraints,
     PortfolioInputError,
+    PORTFOLIO_REVIEW_ACTIONS,
     assess_signal_candidate,
     initialize_portfolio_snapshot,
     load_existing_positions,
@@ -189,35 +198,49 @@ def build_parser() -> argparse.ArgumentParser:
 
     build_universe_parser = subparsers.add_parser(
         "build-universe",
-        help="Build a filtered trading universe from a candidate symbol list.",
+        help="Build profile-based candidate universes from a broad master universe.",
     )
     build_universe_parser.add_argument(
         "candidate_path",
         type=Path,
-        help="Path to a text or CSV file containing candidate symbols.",
+        nargs="?",
+        help="Optional legacy screen-only mode: path to a text or CSV file containing candidate symbols.",
+    )
+    build_universe_parser.add_argument(
+        "--profile",
+        dest="profiles",
+        action="append",
+        default=None,
+        help="Configured universe profile to build. Repeat to build more than one profile. Defaults to all configured profiles.",
+    )
+    build_universe_parser.add_argument(
+        "--master-input",
+        type=Path,
+        default=None,
+        help="Optional existing master universe CSV to load instead of fetching provider reference data.",
     )
     build_universe_parser.add_argument(
         "--as-of",
         type=_parse_iso_date,
         default=date.today(),
-        help="Date used as the right edge of the screening window.",
+        help="Date used as the right edge of the liquidity enrichment window.",
     )
     build_universe_parser.add_argument(
         "--lookback-days",
         type=int,
-        default=20,
-        help="Number of recent daily bars to use when computing average dollar volume.",
+        default=None,
+        help="Optional override for the number of recent daily bars used when computing liquidity metrics.",
     )
     build_universe_parser.add_argument(
         "--format",
-        choices=("text", "json"),
-        default="text",
-        help="Output format for the selected universe.",
+        choices=("text", "yaml", "json"),
+        default="yaml",
+        help="Summary output format. Use text only with the legacy screen-only mode.",
     )
     build_universe_parser.add_argument(
         "--refresh-cache",
         action="store_true",
-        help="Bypass local cache and force provider fetches.",
+        help="Bypass local reference and daily-bar caches.",
     )
     build_universe_parser.set_defaults(handler=_handle_build_universe)
 
@@ -997,30 +1020,168 @@ def _handle_fetch_data(args: argparse.Namespace) -> int:
 
 
 def _handle_build_universe(args: argparse.Namespace) -> int:
+    if args.candidate_path is not None and args.profiles is None and args.master_input is None:
+        return _handle_build_universe_legacy(args)
+
+    if args.candidate_path is not None:
+        raise ValueError(
+            "candidate_path is only supported in legacy screen-only mode. "
+            "Use --profile for master-universe builds."
+        )
+    if args.format == "text":
+        raise ValueError("format=text is only supported in legacy screen-only mode.")
+
+    config = load_app_config(config_dir=args.config_dir)
+    daily_bar_provider = create_daily_bar_provider(config, env_file=args.env_file)
+    reference_provider = (
+        None
+        if args.master_input is not None
+        else create_reference_universe_provider(config, env_file=args.env_file)
+    )
+
+    lookback_days = (
+        config.universe_builder.master.liquidity_lookback_days
+        if args.lookback_days is None
+        else int(args.lookback_days)
+    )
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be greater than zero.")
+
+    profile_names = _resolve_universe_profiles(args.profiles, config)
+    profile_label = ", ".join(profile_names)
+    LOGGER.info(
+        "Build-universe starting for profile(s): %s.",
+        profile_label,
+    )
+    LOGGER.info(
+        "Starting master universe fetch%s.",
+        f" from {args.master_input.resolve()}" if args.master_input is not None else "",
+    )
+    try:
+        raw_reference_frame = fetch_master_universe(
+            master_config=config.universe_builder.master,
+            as_of_date=args.as_of,
+            reference_provider=reference_provider,
+            master_input=args.master_input,
+            refresh_cache=args.refresh_cache,
+        )
+    except DataProviderError as exc:
+        raise DataProviderError(f"Master universe fetch failed: {exc}") from exc
+
+    LOGGER.info("Fetched %s tickers into the master reference universe.", len(raw_reference_frame))
+    LOGGER.info("Starting metadata enrichment.")
+    try:
+        master_frame = enrich_universe_metadata(
+            raw_reference_frame,
+            as_of_date=args.as_of,
+            lookback_days=lookback_days,
+            daily_bar_provider=daily_bar_provider,
+            reference_provider=reference_provider,
+            refresh_cache=args.refresh_cache,
+        )
+    except DataProviderError as exc:
+        raise DataProviderError(f"Metadata enrichment failed: {exc}") from exc
+
+    LOGGER.info(
+        "Metadata enrichment completed for %s symbols. Applying profile filters.",
+        len(master_frame),
+    )
+    profile_results: dict[str, UniverseProfileBuildResult] = {}
+    for profile_name in profile_names:
+        LOGGER.info("Applying filters for profile %s.", profile_name)
+        try:
+            profile_results[profile_name] = apply_universe_filters(
+                master_frame,
+                profile_name=profile_name,
+                profile_config=config.universe_builder.profiles[profile_name],
+                reference_provider=reference_provider,
+                as_of_date=args.as_of,
+                refresh_cache=args.refresh_cache,
+            )
+        except DataProviderError as exc:
+            raise DataProviderError(f"Applying filters failed for profile '{profile_name}': {exc}") from exc
+
+    LOGGER.info("Writing universe outputs.")
+    outputs = write_universe_outputs(
+        project_root=config.project_root,
+        master_config=config.universe_builder.master,
+        raw_reference_frame=raw_reference_frame,
+        master_frame=master_frame,
+        profile_results=profile_results,
+    )
+    for profile_name in profile_names:
+        LOGGER.info(
+            "Profile %s output written to %s.",
+            profile_name,
+            outputs["profiles"][profile_name]["candidate_output_path"],
+        )
+
+    payload = {
+        "provider": config.data_sources.provider,
+        "as_of_date": args.as_of.isoformat(),
+        "lookback_days": lookback_days,
+        "master_input": str(args.master_input.resolve()) if args.master_input is not None else None,
+        "profile_names": list(profile_names),
+        "master_universe_count": int(len(master_frame)),
+        "profiles": {
+            profile_name: {
+                "count": len(result.symbols),
+                "filtered_count": result.summary["filtered_count"],
+                "force_include_count": result.summary["force_include_count"],
+                "missing_force_include_symbols": result.summary["missing_force_include_symbols"],
+                "candidate_output_path": outputs["profiles"][profile_name]["candidate_output_path"],
+                "summary_output_path": outputs["profiles"][profile_name]["summary_output_path"],
+            }
+            for profile_name, result in profile_results.items()
+        },
+        "outputs": outputs,
+    }
+    LOGGER.info(
+        "Build-universe completed. Master universe: %s. Raw reference: %s. Profiles: %s.",
+        outputs["master_universe_output_path"],
+        outputs["raw_reference_output_path"],
+        ", ".join(
+            f"{name}={profile_results[name].summary['output_count']}"
+            for name in profile_names
+        ),
+    )
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_build_universe_legacy(args: argparse.Namespace) -> int:
+    if args.candidate_path is None:
+        raise ValueError("candidate_path is required for legacy screen-only mode.")
+
     config = load_app_config(config_dir=args.config_dir)
     provider = create_daily_bar_provider(config, env_file=args.env_file)
     builder = UniverseBuilder(provider, config.strategy.universe)
+    resolved_lookback_days = (
+        config.universe_builder.master.liquidity_lookback_days
+        if args.lookback_days is None
+        else int(args.lookback_days)
+    )
     members = builder.screen_candidates(
         args.candidate_path,
         as_of_date=args.as_of,
-        lookback_days=args.lookback_days,
+        lookback_days=resolved_lookback_days,
         refresh_cache=args.refresh_cache,
     )
 
-    if args.format == "json":
-        payload = {
-            "provider": config.data_sources.provider,
-            "as_of_date": args.as_of.isoformat(),
-            "lookback_days": args.lookback_days,
-            "count": len(members),
-            "symbols": [member.symbol for member in members],
-            "members": [member.to_dict() for member in members],
-        }
-        print(json.dumps(payload, indent=2, sort_keys=True))
+    if args.format == "text":
+        for member in members:
+            print(member.symbol)
         return 0
 
-    for member in members:
-        print(member.symbol)
+    payload = {
+        "provider": config.data_sources.provider,
+        "as_of_date": args.as_of.isoformat(),
+        "lookback_days": resolved_lookback_days,
+        "count": len(members),
+        "symbols": [member.symbol for member in members],
+        "members": [member.to_dict() for member in members],
+    }
+    _print_structured(payload, output_format=args.format)
     return 0
 
 
@@ -1216,6 +1377,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         as_of_date=args.as_of,
         lookback_days=args.lookback_days,
         refresh_cache=args.refresh_cache,
+        enforce_max_symbols=False,
     )
 
     strategy_settings = BreakoutMomentumSettings.from_configs(
@@ -1712,6 +1874,7 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     current_positions = workflow["current_positions"]
     current_equity = workflow["current_equity"]
     execution_batch = workflow["execution_batch"]
+    summary_payload = summary.to_dict()
 
     output_dir = (
         args.output_dir
@@ -1740,7 +1903,7 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         "recommended_preset": summary.recommended_preset,
         "equity": current_equity,
         "current_drawdown": float(args.current_drawdown),
-        "universe_count": len(universe_members),
+        "universe_count": summary_payload["universe_count"],
         "candidate_count": len(summary.rows),
         "approved_count": sum(row.status == "approved" for row in summary.rows),
         "rejected_count": sum(row.status == "rejected" for row in summary.rows),
@@ -1807,6 +1970,7 @@ def _run_daily_summary_workflow(
         as_of_date=args.as_of,
         lookback_days=args.lookback_days,
         refresh_cache=args.refresh_cache,
+        enforce_max_symbols=False,
     )
 
     fetch_start = _comparison_warmup_start(
@@ -2469,6 +2633,30 @@ def _load_top_preset_name_from_results(results_path: Path) -> str:
     raise ValueError(
         f"Unsupported comparison results format '{resolved_path.suffix}'. Expected CSV or JSON."
     )
+
+
+def _resolve_universe_profiles(
+    raw_profiles: list[str] | None,
+    config: AppConfig,
+) -> tuple[str, ...]:
+    configured_profiles = config.universe_builder.profiles
+    if raw_profiles is None:
+        return tuple(configured_profiles.keys())
+
+    ordered_profiles = tuple(
+        dict.fromkeys(profile.strip() for profile in raw_profiles if profile and profile.strip())
+    )
+    if not ordered_profiles:
+        raise ValueError("At least one non-empty --profile value is required.")
+
+    invalid_profiles = [profile for profile in ordered_profiles if profile not in configured_profiles]
+    if invalid_profiles:
+        valid_profiles = ", ".join(sorted(configured_profiles))
+        invalid_rendered = ", ".join(invalid_profiles)
+        raise ValueError(
+            f"Unknown universe profile(s): {invalid_rendered}. Valid profiles: {valid_profiles}."
+        )
+    return ordered_profiles
 
 
 def _print_structured(payload: dict[str, object], *, output_format: str) -> None:
