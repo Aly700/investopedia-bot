@@ -39,6 +39,12 @@ from bot.config import (
     load_app_config,
     validate_environment,
 )
+from bot.data.earnings import (
+    EarningsRiskContext,
+    build_earnings_risk_contexts,
+    create_earnings_calendar_provider,
+    earnings_context_metadata,
+)
 from bot.data.providers import (
     DailyBarProvider,
     DataProviderConfigurationError,
@@ -1565,6 +1571,15 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
     )
     assessed_candidates = []
     no_signal_symbols: list[str] = []
+    earnings_contexts = _load_earnings_contexts(
+        config=config,
+        env_file=getattr(args, "env_file", None),
+        symbols=[member.symbol for member in universe_members],
+        as_of_date=args.as_of,
+        earnings_watch_days=config.strategy.signals.earnings_watch_days,
+        refresh_cache=args.refresh_cache,
+        log_label="generate-orders",
+    )
 
     for member in universe_members:
         try:
@@ -1594,6 +1609,14 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             no_signal_symbols.append(member.symbol)
             continue
 
+        earnings_context = earnings_contexts.get(member.symbol.strip().upper())
+        signal = replace(
+            signal,
+            metadata={
+                **dict(signal.metadata),
+                **earnings_context_metadata(earnings_context),
+            },
+        )
         assessed_candidates.append(
             assess_signal_candidate(
                 signal,
@@ -1602,6 +1625,17 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
                 constraints=constraints,
                 current_positions=current_positions,
                 current_drawdown=float(args.current_drawdown),
+                earnings_date=(
+                    earnings_context.earnings_date
+                    if earnings_context is not None
+                    else None
+                ),
+                earnings_days_away=(
+                    earnings_context.earnings_days_away
+                    if earnings_context is not None
+                    else None
+                ),
+                earnings_entry_block_days=strategy_settings.earnings_entry_block_days,
             )
         )
 
@@ -2215,6 +2249,15 @@ def _run_daily_summary_workflow(
         preset.name: []
         for preset in presets
     }
+    earnings_contexts = _load_earnings_contexts(
+        config=config,
+        env_file=getattr(args, "env_file", None),
+        symbols=[member.symbol for member in universe_members],
+        as_of_date=args.as_of,
+        earnings_watch_days=config.strategy.signals.earnings_watch_days,
+        refresh_cache=args.refresh_cache,
+        log_label="daily-summary",
+    )
 
     for preset in presets:
         strategy_settings = BreakoutMomentumSettings.from_configs(
@@ -2252,7 +2295,9 @@ def _run_daily_summary_workflow(
                 no_signal_symbols_by_preset[preset.name].append(member.symbol)
                 continue
 
+            earnings_context = earnings_contexts.get(member.symbol.strip().upper())
             signal_metadata = dict(signal.metadata)
+            signal_metadata.update(earnings_context_metadata(earnings_context))
             signal_metadata["preset_name"] = preset.name
             signal_metadata["parameter_id"] = preset.parameter_id
             signal = replace(
@@ -2271,6 +2316,17 @@ def _run_daily_summary_workflow(
                         constraints=constraints,
                         current_positions=resolved_current_positions,
                         current_drawdown=float(args.current_drawdown),
+                        earnings_date=(
+                            earnings_context.earnings_date
+                            if earnings_context is not None
+                            else None
+                        ),
+                        earnings_days_away=(
+                            earnings_context.earnings_days_away
+                            if earnings_context is not None
+                            else None
+                        ),
+                        earnings_entry_block_days=strategy_settings.earnings_entry_block_days,
                     ),
                 )
             )
@@ -2364,6 +2420,16 @@ def _run_portfolio_review_intraday_workflow(
         if not benchmark_frame.empty:
             benchmark_intraday_metrics = _intraday_session_metrics(benchmark_frame)
 
+    earnings_contexts = _load_earnings_contexts(
+        config=config,
+        env_file=getattr(args, "env_file", None),
+        symbols=[position.symbol for position in resolved_current_positions],
+        as_of_date=args.as_of,
+        earnings_watch_days=config.strategy.signals.earnings_watch_days,
+        refresh_cache=False,
+        log_label="review-portfolio-intraday",
+    )
+
     rows: list[PortfolioReviewRow] = []
     for plan in position_plans:
         position = plan.get("position")
@@ -2378,6 +2444,7 @@ def _run_portfolio_review_intraday_workflow(
                     benchmark_symbol=benchmark_symbol,
                     benchmark_intraday_metrics=benchmark_intraday_metrics,
                     refresh_cache=True,
+                    earnings_context=earnings_contexts.get(symbol),
                 )
             )
         except DataProviderConfigurationError:
@@ -2409,6 +2476,7 @@ def _build_portfolio_review_intraday_row(
     benchmark_symbol: str | None,
     benchmark_intraday_metrics: Mapping[str, float | str | None] | None,
     refresh_cache: bool,
+    earnings_context: EarningsRiskContext | None = None,
 ) -> PortfolioReviewRow:
     position = plan["position"]
     preset = plan["preset"]
@@ -2449,6 +2517,13 @@ def _build_portfolio_review_intraday_row(
         intraday_relative_strength_diff=intraday_relative_strength_diff,
         intraday_high_profit_unrealized_pct=settings.intraday_high_profit_unrealized_pct,
         intraday_high_profit_giveback_threshold=settings.intraday_high_profit_giveback_threshold,
+        earnings_date=earnings_context.earnings_date if earnings_context is not None else None,
+        earnings_days_away=(
+            earnings_context.earnings_days_away
+            if earnings_context is not None
+            else None
+        ),
+        earnings_watch_days=settings.earnings_watch_days,
     )
     entry_date_used = _position_entry_date(position)
     return PortfolioReviewRow(
@@ -2665,6 +2740,16 @@ def _run_portfolio_review_workflow(
                 f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
             )
 
+    earnings_contexts = _load_earnings_contexts(
+        config=config,
+        env_file=getattr(args, "env_file", None),
+        symbols=[position.symbol for position in resolved_current_positions],
+        as_of_date=args.as_of,
+        earnings_watch_days=config.strategy.signals.earnings_watch_days,
+        refresh_cache=args.refresh_cache,
+        log_label="review-portfolio",
+    )
+
     rows: list[PortfolioReviewRow] = []
     for plan in position_plans:
         position = plan.get("position")
@@ -2677,6 +2762,7 @@ def _run_portfolio_review_workflow(
                     as_of_date=args.as_of,
                     benchmark_frame=benchmark_frame,
                     refresh_cache=args.refresh_cache,
+                    earnings_context=earnings_contexts.get(symbol),
                 )
             )
         except (DataProviderError, ValueError) as exc:
@@ -2718,6 +2804,7 @@ def _build_portfolio_review_row(
     as_of_date: date,
     benchmark_frame: pd.DataFrame | None,
     refresh_cache: bool,
+    earnings_context: EarningsRiskContext | None = None,
 ) -> PortfolioReviewRow:
     position = plan["position"]
     preset = plan["preset"]
@@ -2782,6 +2869,13 @@ def _build_portfolio_review_row(
         relative_strength_return_diff=relative_strength_metrics.get("relative_strength_return_diff"),
         relative_strength_window=settings.relative_strength_window,
         relative_strength_watch_threshold=settings.relative_strength_watch_threshold,
+        earnings_date=earnings_context.earnings_date if earnings_context is not None else None,
+        earnings_days_away=(
+            earnings_context.earnings_days_away
+            if earnings_context is not None
+            else None
+        ),
+        earnings_watch_days=settings.earnings_watch_days,
     )
     entry_date_used = _position_entry_date(position)
     return PortfolioReviewRow(
@@ -3027,6 +3121,35 @@ def _load_current_positions(portfolio_file: Path | None) -> list[ExistingPositio
         return load_existing_positions(portfolio_file)
     except PortfolioInputError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def _load_earnings_contexts(
+    *,
+    config: AppConfig,
+    env_file: Path | None,
+    symbols: Sequence[str],
+    as_of_date: date,
+    earnings_watch_days: int,
+    refresh_cache: bool,
+    log_label: str,
+) -> dict[str, EarningsRiskContext]:
+    normalized_symbols = sorted({symbol.strip().upper() for symbol in symbols if symbol.strip()})
+    if not normalized_symbols:
+        return {}
+
+    try:
+        provider = create_earnings_calendar_provider(config, env_file=env_file)
+        return build_earnings_risk_contexts(
+            normalized_symbols,
+            as_of_date=as_of_date,
+            provider=provider,
+            risk_window_days=earnings_watch_days,
+            lookahead_calendar_days=max(30, earnings_watch_days + 7),
+            refresh_cache=refresh_cache,
+        )
+    except (DataProviderConfigurationError, DataProviderError, ValueError) as exc:
+        LOGGER.warning("Earnings context unavailable for %s: %s", log_label, exc)
+        return {}
 
 
 def _strategy_warmup_start(

@@ -11,6 +11,8 @@ signals:
   benchmark_sma_fast: 50
   benchmark_sma_slow: 200
   relative_volume_threshold: 1.5
+  earnings_entry_block_days: 3
+  earnings_watch_days: 7
 
 risk:
   risk_per_trade: 0.01

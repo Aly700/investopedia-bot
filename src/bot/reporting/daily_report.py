@@ -1015,6 +1015,7 @@ def build_market_monitor_report(
                         "score": row.score,
                         "score_components": dict(row.metadata.get("score_components", {})),
                         "strategy_name": row.strategy_name,
+                        "signal_metadata": dict(row.metadata.get("signal_metadata", {})),
                     },
                 )
             )

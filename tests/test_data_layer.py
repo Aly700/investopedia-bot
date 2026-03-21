@@ -7,6 +7,11 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from bot.config import UniverseConfig, load_app_config
+from bot.data.earnings import (
+    EarningsCalendarProvider,
+    build_earnings_risk_contexts,
+    trading_days_until,
+)
 from bot.data.normalize import (
     DAILY_BAR_COLUMNS,
     INTRADAY_BAR_COLUMNS,
@@ -66,6 +71,32 @@ class FakeDailyBarProvider(DailyBarProvider):
                 return empty_intraday_bar_frame()
             return raw_frame[min(fetch_index, len(raw_frame) - 1)].copy()
         return raw_frame.copy()
+
+
+class FakeEarningsCalendarProvider(EarningsCalendarProvider):
+    provider_name = "fake"
+
+    def __init__(
+        self,
+        *,
+        records_by_window: dict[tuple[date, date], list[dict[str, object]]],
+        cache_dir: Path,
+    ) -> None:
+        super().__init__(api_key="test-key", cache_dir=cache_dir)
+        self.records_by_window = records_by_window
+        self.fetch_count = 0
+
+    def _fetch_upcoming_earnings_from_api(
+        self,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> list[dict[str, object]]:
+        self.fetch_count += 1
+        return [
+            dict(record)
+            for record in self.records_by_window.get((start_date, end_date), [])
+        ]
 
 
 def test_normalize_daily_bars_enforces_schema_and_ordering() -> None:
@@ -292,6 +323,93 @@ def test_load_provider_environment_uses_paired_quote_parsing(tmp_path: Path) -> 
     assert parsed["DOUBLE_QUOTED"] == "double value"
     assert parsed["SINGLE_QUOTED"] == "single value"
     assert parsed["UNQUOTED"] == "plain-value"
+
+
+def test_earnings_provider_cache_avoids_duplicate_remote_fetches(tmp_path: Path) -> None:
+    provider = FakeEarningsCalendarProvider(
+        records_by_window={
+            (
+                date(2024, 1, 5),
+                date(2024, 2, 4),
+            ): [
+                {"ticker": "AAPL", "date": "2024-01-10", "status": "confirmed"},
+                {"ticker": "MSFT", "date": "2024-01-12", "status": "confirmed"},
+            ]
+        },
+        cache_dir=tmp_path,
+    )
+
+    first = provider.fetch_upcoming_earnings(
+        start_date=date(2024, 1, 5),
+        end_date=date(2024, 2, 4),
+        symbols=("AAPL", "MSFT"),
+    )
+    second = provider.fetch_upcoming_earnings(
+        start_date=date(2024, 1, 5),
+        end_date=date(2024, 2, 4),
+        symbols=("AAPL", "MSFT"),
+    )
+
+    assert provider.fetch_count == 1
+    assert first["AAPL"].earnings_date == date(2024, 1, 10)
+    assert second["MSFT"].earnings_date == date(2024, 1, 12)
+
+
+def test_build_earnings_risk_contexts_computes_trading_days_away(tmp_path: Path) -> None:
+    provider = FakeEarningsCalendarProvider(
+        records_by_window={
+            (
+                date(2024, 1, 5),
+                date(2024, 2, 4),
+            ): [
+                {"ticker": "AAPL", "date": "2024-01-10", "status": "confirmed"},
+            ]
+        },
+        cache_dir=tmp_path,
+    )
+
+    contexts = build_earnings_risk_contexts(
+        ["AAPL", "MSFT"],
+        as_of_date=date(2024, 1, 5),
+        provider=provider,
+        risk_window_days=7,
+        lookahead_calendar_days=30,
+    )
+
+    assert contexts["AAPL"].earnings_days_away == 3
+    assert contexts["AAPL"].is_earnings_risk is True
+    assert contexts["MSFT"].earnings_days_away is None
+    assert contexts["MSFT"].is_earnings_risk is False
+
+
+def test_trading_days_until_accounts_for_nyse_holiday_week() -> None:
+    assert trading_days_until(date(2024, 12, 23), date(2024, 12, 27)) == 3
+
+
+def test_build_earnings_risk_contexts_ignores_past_earnings_dates(tmp_path: Path) -> None:
+    provider = FakeEarningsCalendarProvider(
+        records_by_window={
+            (
+                date(2024, 1, 5),
+                date(2024, 2, 4),
+            ): [
+                {"ticker": "AAPL", "date": "2024-01-03", "status": "confirmed"},
+            ]
+        },
+        cache_dir=tmp_path,
+    )
+
+    contexts = build_earnings_risk_contexts(
+        ["AAPL"],
+        as_of_date=date(2024, 1, 5),
+        provider=provider,
+        risk_window_days=7,
+        lookahead_calendar_days=30,
+    )
+
+    assert contexts["AAPL"].earnings_date is None
+    assert contexts["AAPL"].earnings_days_away is None
+    assert contexts["AAPL"].is_earnings_risk is False
 
 
 def test_create_provider_uses_configured_provider() -> None:

@@ -11,6 +11,7 @@ import pytest
 
 import bot.main as main_module
 from bot.config import load_app_config
+from bot.data.earnings import EarningsRiskContext
 from bot.data.providers import DataProviderError
 from bot.execution.manual_executor import ManualExecutor
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
@@ -1659,6 +1660,97 @@ def test_run_daily_summary_workflow_uses_full_candidate_file_without_strategy_ca
     assert payload["unique_no_signal_symbol_count"] == 105
 
 
+def test_run_daily_summary_workflow_rejects_candidate_near_earnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config()
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts",
+        lambda **kwargs: {
+            "AAPL": EarningsRiskContext(
+                symbol="AAPL",
+                earnings_date=date(2024, 1, 9),
+                earnings_days_away=2,
+                is_earnings_risk=True,
+                status="confirmed",
+                name="Q1 earnings",
+                source="polygon",
+            )
+        },
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=101.0,
+            stop_hint=96.0,
+            metadata={"prior_high": 100.0, "relative_volume": 1.8},
+        ),
+    )
+
+    workflow = main_module._run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=[],
+    )
+    payload = workflow["summary"].to_dict()
+
+    assert payload["candidate_count"] == 1
+    assert payload["approved_count"] == 0
+    assert payload["rejected_count"] == 1
+    assert payload["rejected_candidates"][0]["rejection_reasons"] == [
+        "Upcoming earnings on 2024-01-09 are 2 trading days away; new entries are blocked within 3 trading days."
+    ]
+    assert payload["rejected_candidates"][0]["metadata"]["signal_metadata"]["earnings_days_away"] == 2
+    assert payload["rejected_candidates"][0]["metadata"]["signal_metadata"]["is_earnings_risk"] is True
+
+
 def test_comparison_warmup_start_accounts_for_relative_volume_window() -> None:
     presets = (
         BreakoutStrategyPreset(
@@ -1740,6 +1832,95 @@ def test_handle_generate_orders_uses_full_candidate_file_without_strategy_cap(
     assert result == 0
     assert payload["universe_count"] == 105
     assert payload["signal_count"] == 0
+
+
+def test_handle_generate_orders_blocks_candidate_near_earnings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate_path = tmp_path / "candidates.txt"
+    candidate_path.write_text("AAPL\n", encoding="utf-8")
+    output_dir = tmp_path / "orders"
+    args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(output_dir),
+            "--format",
+            "json",
+        ]
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [99.0],
+                    "high": [101.0],
+                    "low": [98.0],
+                    "close": [100.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts",
+        lambda **kwargs: {
+            "AAPL": EarningsRiskContext(
+                symbol="AAPL",
+                earnings_date=date(2024, 1, 9),
+                earnings_days_away=2,
+                is_earnings_risk=True,
+            )
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda *args, **kwargs: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol="AAPL",
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_high",
+            entry_price_hint=100.0,
+            stop_hint=95.0,
+            metadata={"prior_high": 99.0, "relative_volume": 2.0},
+        ),
+    )
+
+    result = main_module._handle_generate_orders(args)
+    payload = json.loads(capsys.readouterr().out)
+    report_payload = json.loads(
+        Path(payload["outputs"]["daily_signal_report_json"]).read_text(encoding="utf-8")
+    )
+
+    assert result == 0
+    assert payload["signal_count"] == 1
+    assert payload["approved_order_count"] == 0
+    assert payload["rejected_signal_count"] == 1
+    assert report_payload["rows"][0]["status"] == "rejected"
+    assert report_payload["rows"][0]["rejection_reasons"] == [
+        "Upcoming earnings on 2024-01-09 are 2 trading days away; new entries are blocked within 3 trading days."
+    ]
+    assert report_payload["rows"][0]["metadata"]["signal_metadata"]["earnings_days_away"] == 2
 
 
 def test_handle_daily_summary_uses_workflow_universe_count(
@@ -1917,6 +2098,72 @@ def test_build_portfolio_review_row_includes_profit_protection_metadata() -> Non
     assert row.metadata["giveback_pct"] == pytest.approx((130.0 - 114.0) / 130.0)
     assert row.metadata["days_since_new_high"] == 2
     assert row.metadata["failed_breakout_detected"] is False
+
+
+def test_build_portfolio_review_row_includes_earnings_metadata() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    settings = main_module.BreakoutMomentumSettings.from_configs(
+        _signal_config(),
+        _risk_config(),
+        enable_regime_filter=False,
+    )
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+        preset_name=preset.name,
+    )
+    plan = {
+        "position": position,
+        "preset": preset,
+        "preset_resolution": "portfolio_snapshot",
+        "settings": preset.apply_to_settings(settings),
+        "fetch_start": date(2024, 1, 1),
+    }
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-03", "2024-01-04", "2024-01-05"]),
+                    "open": [100.0, 101.0, 102.0],
+                    "high": [101.0, 102.0, 103.0],
+                    "low": [99.0, 100.0, 101.0],
+                    "close": [100.5, 101.5, 102.5],
+                    "volume": [1_000_000.0] * 3,
+                    "symbol": [symbol] * 3,
+                }
+            )
+
+    row = main_module._build_portfolio_review_row(
+        plan,
+        provider=FakeProvider(),
+        as_of_date=date(2024, 1, 5),
+        benchmark_frame=None,
+        refresh_cache=False,
+        earnings_context=EarningsRiskContext(
+            symbol="AAPL",
+            earnings_date=date(2024, 1, 10),
+            earnings_days_away=3,
+            is_earnings_risk=True,
+            status="confirmed",
+            name="Q1 earnings",
+            source="polygon",
+        ),
+    )
+
+    assert row.suggested_action == "WATCH CLOSELY"
+    assert row.metadata["earnings_days_away"] == 3
+    assert row.metadata["is_earnings_risk"] is True
+    assert "upcoming earnings are scheduled on 2024-01-10" in row.rationale.lower()
 
 
 def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:

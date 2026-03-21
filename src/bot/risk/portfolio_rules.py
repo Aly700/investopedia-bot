@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass, field, replace
+from datetime import date
 import json
 from math import isfinite
 from pathlib import Path
@@ -388,6 +389,9 @@ def review_existing_long_position(
     relative_strength_return_diff: float | None = None,
     relative_strength_window: int | None = None,
     relative_strength_watch_threshold: float = -0.05,
+    earnings_date: date | None = None,
+    earnings_days_away: int | None = None,
+    earnings_watch_days: int = 7,
 ) -> PortfolioReviewDecision:
     """Review one long position and suggest a simple management action."""
 
@@ -403,6 +407,10 @@ def review_existing_long_position(
         raise ValueError("days_since_new_high cannot be negative.")
     if relative_strength_window is not None and relative_strength_window <= 0:
         raise ValueError("relative_strength_window must be greater than zero when provided.")
+    if earnings_days_away is not None and earnings_days_away < 0:
+        raise ValueError("earnings_days_away cannot be negative.")
+    if earnings_watch_days <= 0:
+        raise ValueError("earnings_watch_days must be greater than zero.")
 
     unrealized_pl_pct = (latest_close / position.average_entry_price) - 1.0
     above_entry = latest_close >= position.average_entry_price
@@ -426,6 +434,9 @@ def review_existing_long_position(
     weak_relative_strength = (
         relative_strength_return_diff is not None
         and relative_strength_return_diff <= relative_strength_watch_threshold
+    )
+    is_earnings_risk = (
+        earnings_days_away is not None and earnings_days_away <= earnings_watch_days
     )
 
     suggested_stop = suggest_long_stop_update(
@@ -452,6 +463,10 @@ def review_existing_long_position(
         "relative_strength_window": relative_strength_window,
         "relative_strength_watch_threshold": relative_strength_watch_threshold,
         "weak_relative_strength": weak_relative_strength,
+        "earnings_date": earnings_date.isoformat() if earnings_date is not None else None,
+        "earnings_days_away": earnings_days_away,
+        "earnings_watch_days": earnings_watch_days,
+        "is_earnings_risk": is_earnings_risk,
     }
 
     if position.current_stop is not None and latest_close <= position.current_stop:
@@ -511,6 +526,16 @@ def review_existing_long_position(
         rationale.append("Position remains above entry and sufficiently above the current stop.")
         action = "HOLD"
 
+    if is_earnings_risk:
+        rationale.append(_earnings_risk_note(earnings_date, earnings_days_away))
+        if action == "HOLD":
+            rationale.append("Upcoming earnings add event risk to the position.")
+            action = "WATCH CLOSELY"
+        elif action == "RAISE STOP":
+            rationale.append(
+                "Upcoming earnings still increase gap risk even though a higher stop is justified."
+            )
+
     if action == "EXIT CANDIDATE":
         suggested_stop = None
         trailing_stop_candidate = None
@@ -546,6 +571,9 @@ def review_existing_long_position_intraday(
     intraday_relative_strength_watch_threshold: float = -0.02,
     intraday_high_profit_unrealized_pct: float = 0.15,
     intraday_high_profit_giveback_threshold: float = 0.07,
+    earnings_date: date | None = None,
+    earnings_days_away: int | None = None,
+    earnings_watch_days: int = 7,
 ) -> PortfolioReviewDecision:
     """Review one long position using a single intraday session snapshot."""
 
@@ -577,6 +605,10 @@ def review_existing_long_position_intraday(
         raise ValueError("intraday_high_profit_unrealized_pct must be greater than zero.")
     if intraday_high_profit_giveback_threshold <= 0 or intraday_high_profit_giveback_threshold >= 1:
         raise ValueError("intraday_high_profit_giveback_threshold must be between zero and one.")
+    if earnings_days_away is not None and earnings_days_away < 0:
+        raise ValueError("earnings_days_away cannot be negative.")
+    if earnings_watch_days <= 0:
+        raise ValueError("earnings_watch_days must be greater than zero.")
 
     unrealized_pl_pct = (latest_close / position.average_entry_price) - 1.0
     above_entry = latest_close >= position.average_entry_price
@@ -616,6 +648,9 @@ def review_existing_long_position_intraday(
         intraday_relative_strength_diff is not None
         and intraday_relative_strength_diff <= intraday_relative_strength_watch_threshold
     )
+    is_earnings_risk = (
+        earnings_days_away is not None and earnings_days_away <= earnings_watch_days
+    )
     stacked_intraday_weakness = (
         close_vs_vwap_pct is not None
         and close_vs_vwap_pct < 0
@@ -646,6 +681,10 @@ def review_existing_long_position_intraday(
         "stacked_intraday_weakness": stacked_intraday_weakness,
         "intraday_high_profit_unrealized_pct": intraday_high_profit_unrealized_pct,
         "intraday_high_profit_giveback_threshold": intraday_high_profit_giveback_threshold,
+        "earnings_date": earnings_date.isoformat() if earnings_date is not None else None,
+        "earnings_days_away": earnings_days_away,
+        "earnings_watch_days": earnings_watch_days,
+        "is_earnings_risk": is_earnings_risk,
     }
 
     if stop_breached_intraday:
@@ -704,6 +743,16 @@ def review_existing_long_position_intraday(
     else:
         rationale.append("Intraday structure remains healthy and no stop or fade signal is active.")
         action = "HOLD"
+
+    if is_earnings_risk:
+        rationale.append(_earnings_risk_note(earnings_date, earnings_days_away))
+        if action == "HOLD":
+            rationale.append("Upcoming earnings add event risk to the position.")
+            action = "WATCH CLOSELY"
+        elif action == "RAISE STOP":
+            rationale.append(
+                "Upcoming earnings still increase gap risk even though a higher stop is justified."
+            )
 
     return PortfolioReviewDecision(
         latest_close=latest_close,
@@ -782,10 +831,17 @@ def assess_signal_candidate(
     current_positions: Sequence[ExistingPosition] = (),
     current_drawdown: float = 0.0,
     stop_price: float | None = None,
+    earnings_date: date | None = None,
+    earnings_days_away: int | None = None,
+    earnings_entry_block_days: int | None = None,
 ) -> RiskAssessedCandidate:
     """Combine sizing and portfolio rules into one risk-assessed entry candidate."""
 
     existing_position = _find_existing_position(current_positions, signal.symbol)
+    if earnings_days_away is not None and earnings_days_away < 0:
+        raise ValueError("earnings_days_away cannot be negative.")
+    if earnings_entry_block_days is not None and earnings_entry_block_days <= 0:
+        raise ValueError("earnings_entry_block_days must be greater than zero when provided.")
     resolved_stop_price = signal.stop_hint if stop_price is None else stop_price
     adjusted_risk_per_trade = apply_drawdown_risk_adjustment(
         base_risk_per_trade,
@@ -837,6 +893,19 @@ def assess_signal_candidate(
         )
         rejection_reasons.extend(rule_result.reasons)
 
+    if (
+        earnings_days_away is not None
+        and earnings_entry_block_days is not None
+        and earnings_days_away <= earnings_entry_block_days
+    ):
+        rejection_reasons.append(
+            _earnings_entry_block_reason(
+                earnings_date=earnings_date,
+                earnings_days_away=earnings_days_away,
+                earnings_entry_block_days=earnings_entry_block_days,
+            )
+        )
+
     approved = sizing.is_valid and not rejection_reasons
     return RiskAssessedCandidate(
         signal=signal,
@@ -859,6 +928,39 @@ def _find_existing_position(
         if position.symbol.strip().upper() == normalized_symbol:
             return position
     return None
+
+
+def _earnings_risk_note(earnings_date: date | None, earnings_days_away: int | None) -> str:
+    if earnings_date is None or earnings_days_away is None:
+        return "Upcoming earnings add event risk."
+    if earnings_days_away == 0:
+        return f"Upcoming earnings are scheduled on {earnings_date.isoformat()} (today)."
+    return (
+        f"Upcoming earnings are scheduled on {earnings_date.isoformat()} "
+        f"({earnings_days_away} trading days away)."
+    )
+
+
+def _earnings_entry_block_reason(
+    *,
+    earnings_date: date | None,
+    earnings_days_away: int,
+    earnings_entry_block_days: int,
+) -> str:
+    if earnings_date is None:
+        return (
+            f"Upcoming earnings are within {earnings_entry_block_days} trading days; "
+            "new entries are blocked."
+        )
+    if earnings_days_away == 0:
+        return (
+            f"Upcoming earnings on {earnings_date.isoformat()} are scheduled today; "
+            f"new entries are blocked within {earnings_entry_block_days} trading days."
+        )
+    return (
+        f"Upcoming earnings on {earnings_date.isoformat()} are {earnings_days_away} "
+        f"trading days away; new entries are blocked within {earnings_entry_block_days} trading days."
+    )
 
 
 def _validate_finite_non_negative(value: float, *, name: str) -> None:

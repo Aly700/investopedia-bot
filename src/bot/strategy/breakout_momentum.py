@@ -44,6 +44,8 @@ class BreakoutMomentumSettings:
     relative_strength_watch_threshold: float = -0.05
     intraday_high_profit_unrealized_pct: float = 0.15
     intraday_high_profit_giveback_threshold: float = 0.07
+    earnings_entry_block_days: int = 3
+    earnings_watch_days: int = 7
 
     @classmethod
     def from_configs(
@@ -71,6 +73,8 @@ class BreakoutMomentumSettings:
             enable_regime_filter=enable_regime_filter,
             regime_filter_mode=regime_filter_mode,
             relative_volume_window=relative_volume_window,
+            earnings_entry_block_days=signal_config.earnings_entry_block_days,
+            earnings_watch_days=signal_config.earnings_watch_days,
         )
 
     def __post_init__(self) -> None:
@@ -96,6 +100,10 @@ class BreakoutMomentumSettings:
             raise ValueError("intraday_high_profit_unrealized_pct must be greater than zero.")
         if self.intraday_high_profit_giveback_threshold <= 0 or self.intraday_high_profit_giveback_threshold >= 1:
             raise ValueError("intraday_high_profit_giveback_threshold must be between zero and one.")
+        if self.earnings_entry_block_days <= 0:
+            raise ValueError("earnings_entry_block_days must be greater than zero.")
+        if self.earnings_watch_days <= 0:
+            raise ValueError("earnings_watch_days must be greater than zero.")
         if self.regime_filter_mode not in VALID_REGIME_FILTER_MODES:
             raise ValueError(
                 "regime_filter_mode must be one of "
@@ -516,6 +524,22 @@ def build_breakout_rationale(
         else:
             parts.append(f"relative_volume={relative_volume:.2f} ({rv_policy}; {rv_status})")
 
+    earnings_days_away = _metadata_int(metadata.get("earnings_days_away"))
+    earnings_date = _metadata_text(metadata.get("earnings_date"))
+    earnings_watch_days = _metadata_int(metadata.get("earnings_watch_days"))
+    if (
+        earnings_days_away is not None
+        and earnings_date is not None
+        and (
+            bool(metadata.get("is_earnings_risk"))
+            or earnings_watch_days is None
+            or earnings_days_away <= earnings_watch_days
+        )
+    ):
+        parts.append(
+            f"earnings={earnings_date} ({earnings_days_away} trading days)"
+        )
+
     return "; ".join(parts)
 
 
@@ -586,6 +610,8 @@ def _build_signal_metadata(
         "benchmark_symbol": settings.benchmark_symbol,
         "regime_passed": regime_passed,
         "atr": _optional_float(latest_row["atr"]),
+        "earnings_entry_block_days": settings.earnings_entry_block_days,
+        "earnings_watch_days": settings.earnings_watch_days,
     }
 
 
@@ -646,3 +672,18 @@ def _metadata_float(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _metadata_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _metadata_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None

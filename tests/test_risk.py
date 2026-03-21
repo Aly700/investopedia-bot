@@ -183,6 +183,30 @@ def test_portfolio_rules_block_duplicate_existing_holding() -> None:
     )
 
 
+def test_assess_signal_candidate_blocks_entry_near_earnings() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        earnings_date=date(2024, 1, 10),
+        earnings_days_away=3,
+        earnings_entry_block_days=3,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Upcoming earnings on 2024-01-10 are 3 trading days away; new entries are blocked within 3 trading days.",
+    )
+
+
 def test_drawdown_risk_adjustment_reduces_risk_budget() -> None:
     adjusted_risk = apply_drawdown_risk_adjustment(
         0.01,
@@ -739,6 +763,54 @@ def test_review_existing_long_position_marks_stale_weak_relative_strength_as_wat
     joined_rationale = " ".join(decision.rationale).lower()
     assert "trading days without a new closing high" in joined_rationale
     assert "relative strength" in joined_rationale
+
+
+def test_review_existing_long_position_marks_near_earnings_as_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=112.0,
+        regime_passed=True,
+        trailing_stop_candidate=None,
+        earnings_date=date(2024, 1, 10),
+        earnings_days_away=3,
+        earnings_watch_days=7,
+    )
+
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert decision.metadata["earnings_days_away"] == 3
+    assert decision.metadata["is_earnings_risk"] is True
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "upcoming earnings are scheduled on 2024-01-10" in joined_rationale
+    assert "event risk" in joined_rationale
+
+
+def test_review_existing_long_position_reports_earnings_today_cleanly() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=112.0,
+        regime_passed=True,
+        trailing_stop_candidate=None,
+        earnings_date=date(2024, 1, 10),
+        earnings_days_away=0,
+        earnings_watch_days=7,
+    )
+
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "scheduled on 2024-01-10 (today)" in joined_rationale
 
 
 def test_review_existing_long_position_intraday_exits_on_stop_breach() -> None:

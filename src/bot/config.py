@@ -176,16 +176,44 @@ class SignalConfig:
     benchmark_sma_fast: int
     benchmark_sma_slow: int
     relative_volume_threshold: float
+    earnings_entry_block_days: int = 3
+    earnings_watch_days: int = 7
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "SignalConfig":
+        earnings_entry_block_days = _as_optional_int(data, "earnings_entry_block_days")
+        earnings_watch_days = _as_optional_int(data, "earnings_watch_days")
         return cls(
             breakout_lookback=_as_int(data, "breakout_lookback"),
             benchmark_symbol=_as_str(data, "benchmark_symbol"),
             benchmark_sma_fast=_as_int(data, "benchmark_sma_fast"),
             benchmark_sma_slow=_as_int(data, "benchmark_sma_slow"),
             relative_volume_threshold=_as_float(data, "relative_volume_threshold"),
+            earnings_entry_block_days=(
+                earnings_entry_block_days
+                if earnings_entry_block_days is not None
+                else 3
+            ),
+            earnings_watch_days=(
+                earnings_watch_days
+                if earnings_watch_days is not None
+                else 7
+            ),
         )
+
+    def __post_init__(self) -> None:
+        if self.breakout_lookback <= 0:
+            raise ConfigError("Expected 'breakout_lookback' to be greater than zero.")
+        if self.benchmark_sma_fast <= 0:
+            raise ConfigError("Expected 'benchmark_sma_fast' to be greater than zero.")
+        if self.benchmark_sma_slow <= 0:
+            raise ConfigError("Expected 'benchmark_sma_slow' to be greater than zero.")
+        if self.relative_volume_threshold <= 0:
+            raise ConfigError("Expected 'relative_volume_threshold' to be greater than zero.")
+        if self.earnings_entry_block_days <= 0:
+            raise ConfigError("Expected 'earnings_entry_block_days' to be greater than zero.")
+        if self.earnings_watch_days <= 0:
+            raise ConfigError("Expected 'earnings_watch_days' to be greater than zero.")
 
 
 @dataclass(frozen=True)
