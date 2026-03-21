@@ -337,6 +337,12 @@ The brief is the decision-first human-readable layer. It groups names into:
 
 Use it as a market-hours polling job, for example every 15 minutes during the session. Keep the existing daily `review-portfolio` path for end-of-day confirmation and stop-raising logic.
 
+The intraday review is intentionally separate from `monitor-market`:
+
+- `review-portfolio-intraday` is for held-position monitoring only
+- it does not scan for new buy candidates
+- it is suitable for a separate market-hours LaunchAgent that polls existing positions during the session
+
 ### Render manual orders from offline signals
 
 ```bash
@@ -562,6 +568,7 @@ Three example LaunchAgents are provided:
 - `ops/launchd/com.investopedia.bot.monitor-market.market-hours.plist`
 - `ops/launchd/com.investopedia.bot.monitor-market.after-close.plist`
 - `ops/launchd/com.investopedia.bot.monitor-market.market-open.plist`
+- `ops/launchd/com.investopedia.bot.review-portfolio-intraday.market-hours.plist`
 
 Recommended setup: `com.investopedia.bot.monitor-market.market-hours.plist`.
 It keeps `monitor-market` as a short batch job, but runs it automatically several times per weekday with `StartCalendarInterval` entries at:
@@ -657,6 +664,69 @@ Outputs and logs:
 - CSV/text summaries: `data/processed/monitor_market/YYYY-MM-DD/market_monitor.csv`, `market_monitor.txt`, and `market_monitor_brief.txt`
 - recommended market-hours logs: `data/logs/launchd/monitor-market.market-hours.out.log` and `monitor-market.market-hours.err.log`
 - optional single-run logs: `data/logs/launchd/monitor-market.after-close.out.log`, `monitor-market.after-close.err.log`, `monitor-market.market-open.out.log`, and `monitor-market.market-open.err.log`
+
+### Separate intraday portfolio-review wrapper and LaunchAgent
+
+The repo also includes a separate wrapper at `scripts/review_portfolio_intraday.sh`. It is intentionally not merged into `monitor-market`.
+
+It:
+
+- runs `review-portfolio-intraday`
+- defaults the market date using `America/New_York`
+- uses the existing portfolio CSV at `data/processed/portfolio/current_positions.csv`
+- writes outputs under `data/processed/portfolio_review_intraday/YYYY-MM-DD/`
+
+Run it manually:
+
+```bash
+chmod +x scripts/review_portfolio_intraday.sh
+./scripts/review_portfolio_intraday.sh
+BOT_DATE=2026-03-20 ./scripts/review_portfolio_intraday.sh
+PYTHONPATH=src .venv/bin/python -m bot.main review-portfolio-intraday --portfolio-file data/processed/portfolio/current_positions.csv --as-of 2026-03-20 --interval-minutes 15
+```
+
+The separate LaunchAgent template is:
+
+- `ops/launchd/com.investopedia.bot.review-portfolio-intraday.market-hours.plist`
+
+Like the monitor templates, it keeps `__REPO_ROOT__` placeholders in the repo. Replace them only in the copied live plist under `~/Library/LaunchAgents/`.
+
+Install the intraday review LaunchAgent:
+
+```bash
+REPO_ROOT="$PWD"
+AGENT_NAME="com.investopedia.bot.review-portfolio-intraday.market-hours"
+PLIST_SRC="$REPO_ROOT/ops/launchd/$AGENT_NAME.plist"
+PLIST_DST="$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+
+mkdir -p "$REPO_ROOT/data/logs/launchd" "$HOME/Library/LaunchAgents"
+cp "$PLIST_SRC" "$PLIST_DST"
+perl -0pi -e "s#__REPO_ROOT__#$REPO_ROOT#g" "$PLIST_DST"
+
+plutil -lint "$PLIST_DST"
+launchctl bootout "gui/$(id -u)" "$PLIST_DST" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST_DST"
+launchctl enable "gui/$(id -u)/$AGENT_NAME"
+launchctl kickstart -k "gui/$(id -u)/$AGENT_NAME"
+```
+
+Inspect, test, and disable it:
+
+```bash
+AGENT_NAME="com.investopedia.bot.review-portfolio-intraday.market-hours"
+PLIST_DST="$HOME/Library/LaunchAgents/$AGENT_NAME.plist"
+
+plutil -lint "$PLIST_DST"
+launchctl print "gui/$(id -u)/$AGENT_NAME"
+launchctl kickstart -k "gui/$(id -u)/$AGENT_NAME"
+tail -f "$PWD/data/logs/launchd/review-portfolio-intraday.market-hours.out.log" \
+  "$PWD/data/logs/launchd/review-portfolio-intraday.market-hours.err.log"
+
+launchctl bootout "gui/$(id -u)" "$PLIST_DST" 2>/dev/null || true
+launchctl disable "gui/$(id -u)/$AGENT_NAME"
+```
+
+This job is for held-position monitoring only. Keep `monitor-market` as the separate job for buy scans plus portfolio alerts.
 
 ## Architecture Notes
 

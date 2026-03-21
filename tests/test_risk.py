@@ -789,25 +789,29 @@ def test_review_existing_long_position_intraday_exits_on_severe_session_high_giv
 
 
 def test_review_existing_long_position_intraday_marks_fade_as_watch() -> None:
+    # Position entered in a prior session at 90.0; today's intraday move is small (<3% off open)
+    # so failed_intraday_strength stays False, but peak_unrealized is in profit and the session
+    # is giving back enough to trigger intraday_momentum_fade -> WATCH CLOSELY.
     position = ExistingPosition(
         symbol="AAPL",
         shares=10,
-        average_entry_price=100.0,
-        current_stop=90.0,
+        average_entry_price=90.0,
+        current_stop=85.0,
     )
 
     decision = review_existing_long_position_intraday(
         position,
-        session_open=110.0,
-        session_high=116.0,
-        session_low=107.0,
-        latest_close=107.0,
-        latest_low=107.0,
-        session_vwap=111.0,
+        session_open=100.0,
+        session_high=102.0,   # peak_intraday = 2% < early_strength_threshold=3% → failed=False
+        session_low=93.0,
+        latest_close=94.0,    # giveback = (102-94)/102 ≈ 7.8% > watch_threshold=7.5%
+        latest_low=93.5,
+        session_vwap=97.0,    # latest_close < vwap → below_vwap
     )
 
     assert decision.suggested_action == "WATCH CLOSELY"
     assert decision.metadata["intraday_momentum_fade"] is True
+    assert decision.metadata["failed_intraday_strength"] is False
     joined_rationale = " ".join(decision.rationale).lower()
     assert "fading intraday" in joined_rationale
     assert "session vwap" in joined_rationale
@@ -860,6 +864,92 @@ def test_review_existing_long_position_intraday_keeps_healthy_position_on_hold()
     assert decision.suggested_action == "HOLD"
     assert decision.metadata["intraday_momentum_fade"] is False
     assert decision.metadata["stop_breached_intraday"] is False
+
+
+def test_review_existing_long_position_intraday_exits_on_stacked_weakness() -> None:
+    # Three corroborating weak signals: below VWAP + giveback >= watch_threshold + underperforms benchmark.
+    position = ExistingPosition(
+        symbol="WDC",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=105.0,
+        session_high=108.0,   # peak_unrealized = (108/100)-1 = 8% >= meaningful_profit=5%
+        session_low=100.0,
+        latest_close=101.7,   # giveback = (108-101.7)/108 ≈ 5.8% >= meaningful_profit=5%; < exit=10%
+        latest_low=101.0,
+        session_vwap=104.0,   # latest_close < vwap → below_vwap
+        session_high_giveback_exit_threshold=0.10,
+        # 5.8% is below the 10% exit and below the 7.5% watch threshold, but three
+        # corroborating signals (below VWAP + giveback >= meaningful + weak benchmark) → EXIT
+        intraday_relative_strength_diff=-0.03,  # underperforms benchmark
+        intraday_relative_strength_watch_threshold=-0.02,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["stacked_intraday_weakness"] is True
+    assert decision.metadata["weak_intraday_relative_strength"] is True
+    assert "three corroborating" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_intraday_exits_on_high_profit_giveback() -> None:
+    # Position in >15% unrealized profit gives back >7% from session high → exits at tighter threshold.
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=80.0,
+        current_stop=75.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=100.0,
+        session_high=112.0,   # peak_unrealized = (112/80)-1 = 40% >= high_profit_unrealized=15%
+        session_low=97.0,
+        latest_close=103.0,   # session_high_giveback = (112-103)/112 ≈ 8.0% >= high_profit_giveback=7%
+        latest_low=102.0,
+        session_vwap=107.0,
+        session_high_giveback_exit_threshold=0.10,  # 8.0% < 10% → would be WATCH at normal threshold
+        intraday_high_profit_unrealized_pct=0.15,
+        intraday_high_profit_giveback_threshold=0.07,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["peak_unrealized_pct"] >= 0.15
+    assert decision.metadata["session_high_giveback_pct"] >= 0.07
+    assert "protecting profit" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_intraday_exits_failed_strength_at_watch_threshold() -> None:
+    # failed_intraday_strength + giveback >= watch_threshold (not the higher exit threshold) → EXIT CANDIDATE.
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=120.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=100.0,
+        session_high=105.0,   # peak_intraday = 5% >= early_strength_threshold=3% → failed candidate
+        session_low=96.0,
+        latest_close=97.0,    # giveback = (105-97)/105 ≈ 7.6% > watch_threshold≈7.5%; < exit_threshold=10%
+        latest_low=96.5,
+        session_vwap=101.0,   # latest_close < vwap → confirms failed_intraday_strength
+        session_high_giveback_exit_threshold=0.10,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["failed_intraday_strength"] is True
+    # giveback is below the main exit threshold (10%) but above the watch threshold
+    assert decision.metadata["session_high_giveback_pct"] < 0.10
+    assert decision.metadata["session_high_giveback_pct"] >= decision.metadata["session_high_giveback_watch_threshold"]
+    assert "failed to hold" in " ".join(decision.rationale).lower()
 
 
 def test_review_existing_long_position_clears_stop_for_weak_regime_exit_candidate() -> None:

@@ -1314,7 +1314,9 @@ def test_build_portfolio_review_intraday_row_uses_provider_and_metrics() -> None
         }
     ]
     assert row.symbol == "AAPL"
-    assert row.suggested_action == "WATCH CLOSELY"
+    # Session: AAPL close -2.7% from open, below VWAP, underperforms benchmark +1% by ~3.7%,
+    # and gives back 7.8% from the session high — stacked weakness escalates to EXIT CANDIDATE.
+    assert row.suggested_action == "EXIT CANDIDATE"
     assert row.metadata["position_source"] == "manual"
     assert row.metadata["position_metadata"] == {"note": "starter"}
     assert row.metadata["session_high"] == 116.0
@@ -1409,8 +1411,9 @@ def test_handle_review_portfolio_intraday_writes_outputs(
 
     assert result == 0
     assert payload["interval_minutes"] == 15
-    assert payload["watch_closely_count"] == 1
-    assert payload["exit_candidate_count"] == 0
+    # AAPL: -2.7% from open, below VWAP, underperforms benchmark, 7.8% giveback → EXIT CANDIDATE
+    assert payload["watch_closely_count"] == 0
+    assert payload["exit_candidate_count"] == 1
     assert Path(payload["outputs"]["portfolio_review_intraday_json"]).exists()
     assert Path(payload["outputs"]["portfolio_review_intraday_csv"]).exists()
     assert Path(payload["outputs"]["portfolio_review_intraday_brief"]).exists()

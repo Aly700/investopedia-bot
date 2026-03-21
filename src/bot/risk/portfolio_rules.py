@@ -544,6 +544,8 @@ def review_existing_long_position_intraday(
     early_strength_threshold: float = 0.03,
     intraday_relative_strength_diff: float | None = None,
     intraday_relative_strength_watch_threshold: float = -0.02,
+    intraday_high_profit_unrealized_pct: float = 0.15,
+    intraday_high_profit_giveback_threshold: float = 0.07,
 ) -> PortfolioReviewDecision:
     """Review one long position using a single intraday session snapshot."""
 
@@ -571,6 +573,10 @@ def review_existing_long_position_intraday(
         raise ValueError("meaningful_profit_pct must be greater than zero.")
     if early_strength_threshold <= 0:
         raise ValueError("early_strength_threshold must be greater than zero.")
+    if intraday_high_profit_unrealized_pct <= 0:
+        raise ValueError("intraday_high_profit_unrealized_pct must be greater than zero.")
+    if intraday_high_profit_giveback_threshold <= 0 or intraday_high_profit_giveback_threshold >= 1:
+        raise ValueError("intraday_high_profit_giveback_threshold must be between zero and one.")
 
     unrealized_pl_pct = (latest_close / position.average_entry_price) - 1.0
     above_entry = latest_close >= position.average_entry_price
@@ -610,6 +616,12 @@ def review_existing_long_position_intraday(
         intraday_relative_strength_diff is not None
         and intraday_relative_strength_diff <= intraday_relative_strength_watch_threshold
     )
+    stacked_intraday_weakness = (
+        close_vs_vwap_pct is not None
+        and close_vs_vwap_pct < 0
+        and session_high_giveback_pct >= meaningful_profit_pct
+        and weak_intraday_relative_strength
+    )
 
     rationale: list[str] = []
     metadata = {
@@ -631,6 +643,9 @@ def review_existing_long_position_intraday(
         "intraday_relative_strength_diff": intraday_relative_strength_diff,
         "intraday_relative_strength_watch_threshold": intraday_relative_strength_watch_threshold,
         "weak_intraday_relative_strength": weak_intraday_relative_strength,
+        "stacked_intraday_weakness": stacked_intraday_weakness,
+        "intraday_high_profit_unrealized_pct": intraday_high_profit_unrealized_pct,
+        "intraday_high_profit_giveback_threshold": intraday_high_profit_giveback_threshold,
     }
 
     if stop_breached_intraday:
@@ -645,7 +660,24 @@ def review_existing_long_position_intraday(
             f"{session_high_giveback_pct:.1%} from the session high of {session_high:.2f}."
         )
         action = "EXIT CANDIDATE"
-    elif failed_intraday_strength and session_high_giveback_pct >= session_high_giveback_exit_threshold:
+    elif stacked_intraday_weakness:
+        rationale.append(
+            "Three corroborating weakness signals: below VWAP, "
+            f"{session_high_giveback_pct:.1%} giveback from session high, "
+            "and underperforming the benchmark intraday."
+        )
+        action = "EXIT CANDIDATE"
+    elif (
+        peak_unrealized_pct >= intraday_high_profit_unrealized_pct
+        and session_high_giveback_pct >= intraday_high_profit_giveback_threshold
+    ):
+        rationale.append(
+            f"Position has unrealized gains of {peak_unrealized_pct:.1%} but has given back "
+            f"{session_high_giveback_pct:.1%} from the session high of {session_high:.2f}; "
+            "protecting profit at a tighter threshold."
+        )
+        action = "EXIT CANDIDATE"
+    elif failed_intraday_strength and session_high_giveback_pct >= session_high_giveback_watch_threshold:
         rationale.append("Strong intraday move failed to hold into the latest bar.")
         if session_vwap is not None and latest_close < session_vwap:
             rationale.append(

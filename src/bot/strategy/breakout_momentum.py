@@ -42,6 +42,8 @@ class BreakoutMomentumSettings:
     stale_high_watch_days: int = 15
     relative_strength_window: int = 20
     relative_strength_watch_threshold: float = -0.05
+    intraday_high_profit_unrealized_pct: float = 0.15
+    intraday_high_profit_giveback_threshold: float = 0.07
 
     @classmethod
     def from_configs(
@@ -90,6 +92,10 @@ class BreakoutMomentumSettings:
             raise ValueError("stale_high_watch_days must be greater than zero.")
         if self.relative_strength_window <= 0:
             raise ValueError("relative_strength_window must be greater than zero.")
+        if self.intraday_high_profit_unrealized_pct <= 0:
+            raise ValueError("intraday_high_profit_unrealized_pct must be greater than zero.")
+        if self.intraday_high_profit_giveback_threshold <= 0 or self.intraday_high_profit_giveback_threshold >= 1:
+            raise ValueError("intraday_high_profit_giveback_threshold must be between zero and one.")
         if self.regime_filter_mode not in VALID_REGIME_FILTER_MODES:
             raise ValueError(
                 "regime_filter_mode must be one of "

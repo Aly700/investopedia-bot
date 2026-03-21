@@ -2447,6 +2447,8 @@ def _build_portfolio_review_intraday_row(
         session_vwap=_mapping_float_or_none(intraday_metrics, "session_vwap"),
         session_high_giveback_exit_threshold=settings.profit_giveback_threshold,
         intraday_relative_strength_diff=intraday_relative_strength_diff,
+        intraday_high_profit_unrealized_pct=settings.intraday_high_profit_unrealized_pct,
+        intraday_high_profit_giveback_threshold=settings.intraday_high_profit_giveback_threshold,
     )
     entry_date_used = _position_entry_date(position)
     return PortfolioReviewRow(
