@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 import json
 from datetime import date, timedelta
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 import bot.main as main_module
 from bot.config import load_app_config
 from bot.data.earnings import EarningsRiskContext
+from bot.data.sector_context import SectorFeatureContext
 from bot.data.providers import DataProviderError
 from bot.execution.manual_executor import ManualExecutor
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
@@ -136,6 +138,77 @@ def test_daily_research_summary_reports_counts_and_rejections() -> None:
     assert payload["unique_no_signal_symbol_count"] == 1
     assert payload["rejected_candidates"][0]["rejection_reasons"] == ["Max concurrent positions reached."]
     assert payload["suggested_order_sheet"]["order_count"] == 1
+
+
+def test_build_daily_research_summary_uses_candidate_memory_to_break_score_ties() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    persistent = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=40,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    )
+    fresh = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=True,
+        shares=40,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    )
+    persistent = replace(
+        persistent,
+        candidate=replace(
+            persistent.candidate,
+            signal=replace(
+                persistent.candidate.signal,
+                metadata={
+                    **dict(persistent.candidate.signal.metadata),
+                    "setup_quality_score": 0.9,
+                    "setup_persistence_days": 4,
+                    "days_approved": 2,
+                    "repeated_high_quality_signal": True,
+                },
+            ),
+        ),
+    )
+    fresh = replace(
+        fresh,
+        candidate=replace(
+            fresh.candidate,
+            signal=replace(
+                fresh.candidate.signal,
+                metadata={
+                    **dict(fresh.candidate.signal.metadata),
+                    "setup_quality_score": 0.0,
+                },
+            ),
+        ),
+    )
+
+    execution_batch = ManualExecutor().build_execution_batch(
+        [persistent.candidate, fresh.candidate],
+        as_of_date=date(2024, 1, 5),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[fresh, persistent],
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={preset.name: ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+
+    assert [row.symbol for row in summary.rows] == ["AAA", "BBB"]
+    assert summary.rows[0].metadata["score_components"]["candidate_memory_score"] == pytest.approx(0.9)
+    assert "setup=high-confidence repeat signal, persisted for 4 sessions, approved on 2 sessions" in summary.rows[0].rationale
 
 
 def test_daily_research_summary_handles_empty_no_signal_days(tmp_path: Path) -> None:
@@ -1751,6 +1824,356 @@ def test_run_daily_summary_workflow_rejects_candidate_near_earnings(
     assert payload["rejected_candidates"][0]["metadata"]["signal_metadata"]["is_earnings_risk"] is True
 
 
+def test_run_daily_summary_workflow_rejects_candidate_on_weak_sector_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config()
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts",
+        lambda **kwargs: {
+            "AAPL": SectorFeatureContext(
+                symbol="AAPL",
+                sector_name="Technology",
+                industry_name="Application software",
+                sector_etf_symbol="XLK",
+                sector_regime_passed=False,
+                sector_return=-0.04,
+                symbol_return=-0.08,
+                relative_strength_vs_sector=-0.04,
+                relative_strength_window=20,
+                sector_trend_state="weak",
+                mapping_source="test",
+            )
+        },
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=101.0,
+            stop_hint=96.0,
+            metadata={"prior_high": 100.0, "relative_volume": 1.8},
+        ),
+    )
+
+    workflow = main_module._run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=[],
+    )
+    payload = workflow["summary"].to_dict()
+
+    assert payload["approved_count"] == 0
+    assert payload["rejected_count"] == 1
+    assert payload["rejected_candidates"][0]["rejection_reasons"] == [
+        "Sector ETF XLK is below its trend filter; new entries require sector support."
+    ]
+    assert payload["rejected_candidates"][0]["metadata"]["signal_metadata"]["sector_etf_symbol"] == "XLK"
+    assert "sector=XLK (below trend filter, lags by 4.0% over 20d)" in payload["rejected_candidates"][0]["rationale"]
+
+
+def test_run_daily_summary_workflow_warns_and_proceeds_without_sector_context(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = load_app_config()
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=101.0,
+            stop_hint=96.0,
+            metadata={"prior_high": 100.0, "relative_volume": 1.8},
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        workflow = main_module._run_daily_summary_workflow(
+            args,
+            config=config,
+            provider=FakeProvider(),
+            current_positions=[],
+        )
+
+    payload = workflow["summary"].to_dict()
+
+    assert payload["approved_count"] == 1
+    assert payload["rejected_count"] == 0
+    assert "Sector regime enforcement is enabled but sector context is unavailable for AAPL during daily-summary:standard_breakout; proceeding without sector gate." in caplog.text
+
+
+def test_run_daily_summary_workflow_updates_candidate_score_journal_across_days(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [102.0],
+                    "low": [99.0],
+                    "close": [101.0],
+                    "volume": [1_500_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=101.0,
+            stop_hint=96.0,
+            metadata={"prior_high": 100.0, "relative_volume": 1.9},
+        ),
+    )
+
+    first_workflow = main_module._run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=[],
+    )
+    first_journal_path = Path(first_workflow["candidate_score_journal_path"])
+    first_payload = json.loads(first_journal_path.read_text(encoding="utf-8"))
+
+    second_args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-08",
+            "--disable-regime-filter",
+        ]
+    )
+    second_workflow = main_module._run_daily_summary_workflow(
+        second_args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=[],
+    )
+    second_payload = json.loads(first_journal_path.read_text(encoding="utf-8"))
+    second_summary = second_workflow["summary"].to_dict()
+
+    assert first_journal_path.exists()
+    assert first_payload["symbols"]["AAPL"]["days_near_breakout"] == 1
+    assert first_payload["symbols"]["AAPL"]["days_approved"] == 1
+    assert second_payload["symbols"]["AAPL"]["days_near_breakout"] == 2
+    assert second_payload["symbols"]["AAPL"]["days_approved"] == 2
+    assert second_payload["symbols"]["AAPL"]["last_rank"] == 1
+    assert second_summary["approved_candidates"][0]["metadata"]["signal_metadata"]["setup_persistence_days"] == 2
+    assert "setup=high-confidence repeat signal, persisted for 2 sessions, approved on 2 sessions" in second_summary["approved_candidates"][0]["rationale"]
+
+
+def test_run_daily_summary_workflow_ignores_corrupt_candidate_score_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    journal_path = tmp_path / "data" / "processed" / "state" / "candidate_scores.json"
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{bad-json", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [102.0],
+                    "low": [99.0],
+                    "close": [101.0],
+                    "volume": [1_500_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=101.0,
+            stop_hint=96.0,
+            metadata={"prior_high": 100.0, "relative_volume": 1.9},
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        workflow = main_module._run_daily_summary_workflow(
+            args,
+            config=config,
+            provider=FakeProvider(),
+            current_positions=[],
+        )
+
+    payload = workflow["summary"].to_dict()
+    rewritten_payload = json.loads(journal_path.read_text(encoding="utf-8"))
+
+    assert payload["approved_count"] == 1
+    assert rewritten_payload["symbols"]["AAPL"]["days_near_breakout"] == 1
+    assert "Ignoring candidate score journal" in caplog.text
+
+
 def test_comparison_warmup_start_accounts_for_relative_volume_window() -> None:
     presets = (
         BreakoutStrategyPreset(
@@ -1769,6 +2192,7 @@ def test_comparison_warmup_start_accounts_for_relative_volume_window() -> None:
         benchmark_sma_slow=50,
         presets=presets,
         max_relative_volume_window=80,
+        max_sector_relative_strength_window=20,
         enable_regime_filter=False,
     )
 
@@ -2164,6 +2588,77 @@ def test_build_portfolio_review_row_includes_earnings_metadata() -> None:
     assert row.metadata["earnings_days_away"] == 3
     assert row.metadata["is_earnings_risk"] is True
     assert "upcoming earnings are scheduled on 2024-01-10" in row.rationale.lower()
+
+
+def test_build_portfolio_review_row_includes_sector_context() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    settings = main_module.BreakoutMomentumSettings.from_configs(
+        _signal_config(),
+        _risk_config(),
+        enable_regime_filter=False,
+    )
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+        preset_name=preset.name,
+    )
+    plan = {
+        "position": position,
+        "preset": preset,
+        "preset_resolution": "portfolio_snapshot",
+        "settings": preset.apply_to_settings(settings),
+        "fetch_start": date(2024, 1, 1),
+    }
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-03", "2024-01-04", "2024-01-05"]),
+                    "open": [100.0, 101.0, 102.0],
+                    "high": [101.0, 102.0, 103.0],
+                    "low": [99.0, 100.0, 101.0],
+                    "close": [100.5, 101.5, 102.5],
+                    "volume": [1_000_000.0] * 3,
+                    "symbol": [symbol] * 3,
+                }
+            )
+
+    row = main_module._build_portfolio_review_row(
+        plan,
+        provider=FakeProvider(),
+        as_of_date=date(2024, 1, 5),
+        benchmark_frame=None,
+        refresh_cache=False,
+        sector_context=SectorFeatureContext(
+            symbol="AAPL",
+            sector_name="Technology",
+            industry_name="Application software",
+            sector_etf_symbol="XLK",
+            sector_regime_passed=False,
+            sector_return=-0.02,
+            symbol_return=-0.08,
+            relative_strength_vs_sector=-0.06,
+            relative_strength_window=20,
+            sector_trend_state="weak",
+            mapping_source="test",
+        ),
+    )
+
+    assert row.suggested_action == "WATCH CLOSELY"
+    assert row.metadata["sector_etf_symbol"] == "XLK"
+    assert row.metadata["lagging_sector"] is True
+    assert "sector etf xlk is below its trend filter" in row.rationale.lower()
+    assert "lagging xlk by 6.0% over 20 trading days" in row.rationale.lower()
 
 
 def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:

@@ -13,6 +13,10 @@ signals:
   relative_volume_threshold: 1.5
   earnings_entry_block_days: 3
   earnings_watch_days: 7
+  require_sector_regime_for_entries: true
+  sector_relative_strength_window: 20
+  sector_relative_strength_entry_reject_threshold: -0.05
+  sector_relative_strength_watch_threshold: -0.05
 
 risk:
   risk_per_trade: 0.01

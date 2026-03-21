@@ -39,11 +39,27 @@ from bot.config import (
     load_app_config,
     validate_environment,
 )
+from bot.data.candidate_journal import (
+    CandidateScoreJournal,
+    CandidateJournalObservation,
+    build_candidate_memory_features,
+    default_candidate_score_journal_path,
+    load_candidate_score_journal,
+    update_candidate_score_journal,
+    write_candidate_score_journal,
+)
 from bot.data.earnings import (
     EarningsRiskContext,
     build_earnings_risk_contexts,
     create_earnings_calendar_provider,
     earnings_context_metadata,
+)
+from bot.data.sector_context import (
+    SectorFeatureContext,
+    build_sector_feature_contexts,
+    load_symbol_sector_classifications,
+    sector_context_history_start,
+    sector_context_metadata,
 )
 from bot.data.providers import (
     DailyBarProvider,
@@ -66,6 +82,12 @@ from bot.execution.manual_executor import (
     load_orders_from_csv,
     write_execution_batch,
     write_manual_order_sheet,
+)
+from bot.features import (
+    build_candidate_features,
+    build_intraday_position_features,
+    build_market_context,
+    build_position_features,
 )
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
@@ -1493,11 +1515,21 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
     )
     report_payload = monitor_report.to_dict()
     summary_payload = summary.to_dict()
+    candidate_score_journal_path = summary_result.get("candidate_score_journal_path")
     category_counts = report_payload["category_counts"]
     flat_category_counts = {
         market_monitor_flat_count_key(category): count
         for category, count in category_counts.items()
     }
+    outputs = {
+        "market_monitor_json": str(alert_json_path),
+        "market_monitor_csv": str(alert_csv_path),
+        "market_monitor_text": str(alert_text_path),
+        "market_monitor_brief": str(alert_brief_path),
+    }
+    if candidate_score_journal_path is not None:
+        outputs["candidate_score_journal"] = str(candidate_score_journal_path)
+
     payload = {
         "as_of_date": args.as_of.isoformat(),
         "portfolio_file": str(args.portfolio_file.resolve()) if args.portfolio_file else None,
@@ -1507,12 +1539,7 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         "rejected_count": summary_payload["rejected_count"],
         "alert_count": report_payload["alert_count"],
         **flat_category_counts,
-        "outputs": {
-            "market_monitor_json": str(alert_json_path),
-            "market_monitor_csv": str(alert_csv_path),
-            "market_monitor_text": str(alert_text_path),
-            "market_monitor_brief": str(alert_brief_path),
-        },
+        "outputs": outputs,
     }
     _print_structured(payload, output_format=args.format)
     return 0
@@ -1550,6 +1577,15 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         raise ValueError("equity must be greater than zero.")
     if args.current_drawdown < 0:
         raise ValueError("current_drawdown must be non-negative.")
+    market_context = build_market_context(
+        as_of_date=args.as_of,
+        benchmark_symbol=(
+            strategy_settings.benchmark_symbol
+            if strategy_settings.enable_regime_filter
+            else None
+        ),
+        regime_filter_mode=strategy_settings.regime_filter_mode,
+    )
 
     benchmark_frame = None
     fetch_start = _strategy_warmup_start(args.as_of, strategy_settings)
@@ -1571,6 +1607,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
     )
     assessed_candidates = []
     no_signal_symbols: list[str] = []
+    symbol_frames: dict[str, pd.DataFrame] = {}
     earnings_contexts = _load_earnings_contexts(
         config=config,
         env_file=getattr(args, "env_file", None),
@@ -1579,6 +1616,11 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         earnings_watch_days=config.strategy.signals.earnings_watch_days,
         refresh_cache=args.refresh_cache,
         log_label="generate-orders",
+    )
+    sector_history_start = sector_context_history_start(
+        args.as_of,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        relative_strength_window=config.strategy.signals.sector_relative_strength_window,
     )
 
     for member in universe_members:
@@ -1598,6 +1640,29 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             no_signal_symbols.append(member.symbol)
             continue
 
+        symbol_frames[member.symbol] = bars
+
+    sector_contexts = _load_sector_contexts(
+        config=config,
+        env_file=getattr(args, "env_file", None),
+        provider=provider,
+        symbol_frames=symbol_frames,
+        as_of_date=args.as_of,
+        history_start=sector_history_start,
+        benchmark_sma_fast=config.strategy.signals.benchmark_sma_fast,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+        refresh_cache=args.refresh_cache,
+        log_label="generate-orders",
+    )
+
+    for member in universe_members:
+        bars = symbol_frames.get(member.symbol)
+        if bars is None or bars.empty:
+            continue
+        # Candidate journal memory is intentionally not applied here. generate-orders is a
+        # pure execution path, while daily-summary/monitor-market own the memory-enhanced
+        # research ranking layer.
         signal = generate_breakout_signal(
             bars,
             settings=strategy_settings,
@@ -1610,12 +1675,26 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             continue
 
         earnings_context = earnings_contexts.get(member.symbol.strip().upper())
+        sector_context = sector_contexts.get(member.symbol.strip().upper())
+        if strategy_settings.require_sector_regime_for_entries and sector_context is None:
+            _warn_missing_sector_context_for_entry(
+                member.symbol,
+                log_label="generate-orders",
+            )
         signal = replace(
             signal,
             metadata={
                 **dict(signal.metadata),
                 **earnings_context_metadata(earnings_context),
+                **sector_context_metadata(sector_context),
             },
+        )
+        candidate_features = build_candidate_features(
+            signal,
+            as_of_date=args.as_of,
+            earnings_context=earnings_context,
+            sector_context=sector_context,
+            market_context=market_context,
         )
         assessed_candidates.append(
             assess_signal_candidate(
@@ -1623,6 +1702,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
                 current_equity=current_equity,
                 base_risk_per_trade=config.strategy.risk.risk_per_trade,
                 constraints=constraints,
+                candidate_features=candidate_features,
                 current_positions=current_positions,
                 current_drawdown=float(args.current_drawdown),
                 earnings_date=(
@@ -1636,6 +1716,37 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
                     else None
                 ),
                 earnings_entry_block_days=strategy_settings.earnings_entry_block_days,
+                sector_name=(
+                    sector_context.sector_name
+                    if sector_context is not None
+                    else None
+                ),
+                sector_etf_symbol=(
+                    sector_context.sector_etf_symbol
+                    if sector_context is not None
+                    else None
+                ),
+                sector_regime_passed=(
+                    sector_context.sector_regime_passed
+                    if sector_context is not None
+                    else None
+                ),
+                relative_strength_vs_sector=(
+                    sector_context.relative_strength_vs_sector
+                    if sector_context is not None
+                    else None
+                ),
+                sector_relative_strength_window=(
+                    sector_context.relative_strength_window
+                    if sector_context is not None
+                    else None
+                ),
+                require_sector_regime_for_entries=(
+                    strategy_settings.require_sector_regime_for_entries
+                ),
+                sector_relative_strength_entry_reject_threshold=(
+                    strategy_settings.sector_relative_strength_entry_reject_threshold
+                ),
             )
         )
 
@@ -1959,6 +2070,9 @@ def _handle_compare_strategies(args: argparse.Namespace) -> int:
             require_relative_volume_confirmation=args.require_relative_volume,
             enable_regime_filter=not args.disable_regime_filter,
         ),
+        max_sector_relative_strength_window=(
+            config.strategy.signals.sector_relative_strength_window
+        ),
         enable_regime_filter=not args.disable_regime_filter,
     )
     symbol_frames: dict[str, object] = {}
@@ -2070,6 +2184,7 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     current_equity = workflow["current_equity"]
     execution_batch = workflow["execution_batch"]
     summary_payload = summary.to_dict()
+    candidate_score_journal_path = workflow.get("candidate_score_journal_path")
 
     output_dir = (
         args.output_dir
@@ -2092,11 +2207,25 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         "suggested_order_sheet_json": str(orders_json_path),
         "daily_summary_brief": str((output_dir / "daily_summary_brief.txt").resolve()),
     }
+    if candidate_score_journal_path is not None:
+        brief_output_paths["candidate_score_journal"] = str(candidate_score_journal_path)
     brief_text_path = write_daily_research_brief(
         summary,
         output_dir / "daily_summary_brief.txt",
         output_paths=brief_output_paths,
     )
+
+    outputs = {
+        "daily_summary_json": str(summary_json_path),
+        "ranked_opportunities_csv": str(opportunities_csv_path),
+        "preset_rankings_csv": str(preset_csv_path),
+        "preset_rankings_json": str(preset_json_path),
+        "suggested_order_sheet_csv": str(orders_csv_path),
+        "suggested_order_sheet_json": str(orders_json_path),
+        "daily_summary_brief": str(brief_text_path),
+    }
+    if candidate_score_journal_path is not None:
+        outputs["candidate_score_journal"] = str(candidate_score_journal_path)
 
     payload = {
         "provider": config.data_sources.provider,
@@ -2118,15 +2247,7 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         "rejected_count": sum(row.status == "rejected" for row in summary.rows),
         "order_count": len(execution_batch.orders),
         "top_opportunities": [row.to_dict() for row in summary.rows[:5]],
-        "outputs": {
-            "daily_summary_json": str(summary_json_path),
-            "ranked_opportunities_csv": str(opportunities_csv_path),
-            "preset_rankings_csv": str(preset_csv_path),
-            "preset_rankings_json": str(preset_json_path),
-            "suggested_order_sheet_csv": str(orders_csv_path),
-            "suggested_order_sheet_json": str(orders_json_path),
-            "daily_summary_brief": str(brief_text_path),
-        },
+        "outputs": outputs,
     }
     _print_structured(payload, output_format=args.format)
     return 0
@@ -2198,6 +2319,9 @@ def _run_daily_summary_workflow(
             require_relative_volume_confirmation=args.require_relative_volume,
             enable_regime_filter=not args.disable_regime_filter,
         ),
+        max_sector_relative_strength_window=(
+            config.strategy.signals.sector_relative_strength_window
+        ),
         enable_regime_filter=not args.disable_regime_filter,
     )
 
@@ -2258,6 +2382,25 @@ def _run_daily_summary_workflow(
         refresh_cache=args.refresh_cache,
         log_label="daily-summary",
     )
+    sector_contexts = _load_sector_contexts(
+        config=config,
+        env_file=getattr(args, "env_file", None),
+        provider=provider,
+        symbol_frames=symbol_frames,
+        as_of_date=args.as_of,
+        history_start=sector_context_history_start(
+            args.as_of,
+            benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+            relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+        ),
+        benchmark_sma_fast=config.strategy.signals.benchmark_sma_fast,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+        refresh_cache=args.refresh_cache,
+        log_label="daily-summary",
+    )
+    journal_path = default_candidate_score_journal_path(config.project_root)
+    candidate_score_journal = load_candidate_score_journal(journal_path)
 
     for preset in presets:
         strategy_settings = BreakoutMomentumSettings.from_configs(
@@ -2277,6 +2420,15 @@ def _run_daily_summary_workflow(
                 strategy_settings,
                 benchmark_symbol=benchmark_override,
             )
+        market_context = build_market_context(
+            as_of_date=args.as_of,
+            benchmark_symbol=(
+                strategy_settings.benchmark_symbol
+                if strategy_settings.enable_regime_filter
+                else None
+            ),
+            regime_filter_mode=strategy_settings.regime_filter_mode,
+        )
 
         for member in universe_members:
             bars = symbol_frames.get(member.symbol)
@@ -2296,14 +2448,29 @@ def _run_daily_summary_workflow(
                 continue
 
             earnings_context = earnings_contexts.get(member.symbol.strip().upper())
+            sector_context = sector_contexts.get(member.symbol.strip().upper())
+            if strategy_settings.require_sector_regime_for_entries and sector_context is None:
+                _warn_missing_sector_context_for_entry(
+                    member.symbol,
+                    log_label="daily-summary",
+                    preset_name=preset.name,
+                )
             signal_metadata = dict(signal.metadata)
             signal_metadata.update(earnings_context_metadata(earnings_context))
+            signal_metadata.update(sector_context_metadata(sector_context))
             signal_metadata["preset_name"] = preset.name
             signal_metadata["parameter_id"] = preset.parameter_id
             signal = replace(
                 signal,
                 strategy_name=f"{signal.strategy_name}:{preset.name}",
                 metadata=signal_metadata,
+            )
+            candidate_features = build_candidate_features(
+                signal,
+                as_of_date=args.as_of,
+                earnings_context=earnings_context,
+                sector_context=sector_context,
+                market_context=market_context,
             )
             evaluations.append(
                 PresetCandidateEvaluation(
@@ -2314,6 +2481,7 @@ def _run_daily_summary_workflow(
                         current_equity=current_equity,
                         base_risk_per_trade=preset.risk_per_trade,
                         constraints=constraints,
+                        candidate_features=candidate_features,
                         current_positions=resolved_current_positions,
                         current_drawdown=float(args.current_drawdown),
                         earnings_date=(
@@ -2327,14 +2495,62 @@ def _run_daily_summary_workflow(
                             else None
                         ),
                         earnings_entry_block_days=strategy_settings.earnings_entry_block_days,
+                        sector_name=(
+                            sector_context.sector_name
+                            if sector_context is not None
+                            else None
+                        ),
+                        sector_etf_symbol=(
+                            sector_context.sector_etf_symbol
+                            if sector_context is not None
+                            else None
+                        ),
+                        sector_regime_passed=(
+                            sector_context.sector_regime_passed
+                            if sector_context is not None
+                            else None
+                        ),
+                        relative_strength_vs_sector=(
+                            sector_context.relative_strength_vs_sector
+                            if sector_context is not None
+                            else None
+                        ),
+                        sector_relative_strength_window=(
+                            sector_context.relative_strength_window
+                            if sector_context is not None
+                            else None
+                        ),
+                        require_sector_regime_for_entries=(
+                            strategy_settings.require_sector_regime_for_entries
+                        ),
+                        sector_relative_strength_entry_reject_threshold=(
+                            strategy_settings.sector_relative_strength_entry_reject_threshold
+                        ),
                     ),
                 )
             )
 
+    symbol_observations = _candidate_journal_observations(evaluations)
+    evaluations = _apply_candidate_memory_to_evaluations(
+        evaluations,
+        observations=symbol_observations,
+        candidate_score_journal=candidate_score_journal,
+        as_of_date=args.as_of,
+    )
     ranked_evaluations = rank_preset_candidate_evaluations(
         evaluations,
         current_equity=current_equity,
     )
+    ranked_symbol_observations = _candidate_journal_observations(
+        ranked_evaluations,
+        include_ranks=True,
+    )
+    candidate_score_journal = update_candidate_score_journal(
+        candidate_score_journal,
+        observations=ranked_symbol_observations,
+        as_of_date=args.as_of,
+    )
+    journal_path = write_candidate_score_journal(candidate_score_journal, journal_path)
     execution_batch = ManualExecutor().build_execution_batch(
         [evaluation.candidate for evaluation in ranked_evaluations],
         as_of_date=args.as_of,
@@ -2359,7 +2575,139 @@ def _run_daily_summary_workflow(
         "preset_selection_source": preset_selection_source,
         "current_positions": resolved_current_positions,
         "current_equity": current_equity,
+        "candidate_score_journal_path": journal_path,
     }
+
+
+def _candidate_journal_observations(
+    evaluations: Sequence[PresetCandidateEvaluation],
+    *,
+    include_ranks: bool = False,
+) -> dict[str, CandidateJournalObservation]:
+    observations: dict[str, CandidateJournalObservation] = {}
+    ranked_positions: dict[str, int] = {}
+
+    if include_ranks:
+        for rank, evaluation in enumerate(evaluations, start=1):
+            symbol = evaluation.candidate.signal.symbol.strip().upper()
+            ranked_positions[symbol] = min(rank, ranked_positions.get(symbol, rank))
+
+    for evaluation in evaluations:
+        candidate = evaluation.candidate
+        signal = candidate.signal
+        symbol = signal.symbol.strip().upper()
+        existing_observation = observations.get(symbol)
+        breakout_strength = _signal_breakout_strength(candidate)
+        relative_volume = _optional_float(signal.metadata.get("relative_volume"))
+        sector_etf_symbol = _optional_text(signal.metadata.get("sector_etf_symbol"))
+        sector_regime_passed = _optional_bool(signal.metadata.get("sector_regime_passed"))
+        if existing_observation is None:
+            observations[symbol] = CandidateJournalObservation(
+                symbol=symbol,
+                approved_today=candidate.approved,
+                breakout_strength=breakout_strength,
+                relative_volume=relative_volume,
+                sector_etf_symbol=sector_etf_symbol,
+                sector_regime_passed=sector_regime_passed,
+                best_rank_today=ranked_positions.get(symbol),
+            )
+            continue
+
+        observations[symbol] = CandidateJournalObservation(
+            symbol=symbol,
+            approved_today=(existing_observation.approved_today or candidate.approved),
+            breakout_strength=_peak_optional_float(
+                existing_observation.breakout_strength,
+                breakout_strength,
+            ),
+            relative_volume=_peak_optional_float(
+                existing_observation.relative_volume,
+                relative_volume,
+            ),
+            sector_etf_symbol=sector_etf_symbol or existing_observation.sector_etf_symbol,
+            sector_regime_passed=(
+                sector_regime_passed
+                if sector_regime_passed is not None
+                else existing_observation.sector_regime_passed
+            ),
+            best_rank_today=ranked_positions.get(symbol, existing_observation.best_rank_today),
+        )
+
+    return observations
+
+
+def _apply_candidate_memory_to_evaluations(
+    evaluations: Sequence[PresetCandidateEvaluation],
+    *,
+    observations: Mapping[str, CandidateJournalObservation],
+    candidate_score_journal: CandidateScoreJournal,
+    as_of_date: date,
+) -> list[PresetCandidateEvaluation]:
+    enriched_evaluations: list[PresetCandidateEvaluation] = []
+    for evaluation in evaluations:
+        candidate = evaluation.candidate
+        signal = candidate.signal
+        symbol = signal.symbol.strip().upper()
+        observation = observations.get(symbol)
+        if observation is None:
+            enriched_evaluations.append(evaluation)
+            continue
+        memory_features = build_candidate_memory_features(
+            candidate_score_journal.entries.get(symbol),
+            observation=observation,
+            as_of_date=as_of_date,
+        )
+        enriched_signal = replace(
+            signal,
+            metadata={**dict(signal.metadata), **memory_features},
+        )
+        enriched_evaluations.append(
+            replace(
+                evaluation,
+                candidate=replace(candidate, signal=enriched_signal),
+            )
+        )
+    return enriched_evaluations
+
+
+def _signal_breakout_strength(candidate: RiskAssessedCandidate) -> float | None:
+    entry_price = _optional_float(candidate.entry_price)
+    if entry_price is None or entry_price <= 0:
+        return None
+    prior_high = _optional_float(candidate.signal.metadata.get("prior_high"))
+    if prior_high is None or prior_high <= 0:
+        return None
+    return max((entry_price - prior_high) / prior_high, 0.0)
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _peak_optional_float(existing_value: float | None, new_value: float | None) -> float | None:
+    if existing_value is None:
+        return new_value
+    if new_value is None:
+        return existing_value
+    return max(existing_value, new_value)
+
+
+def _optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 def _run_portfolio_review_intraday_workflow(
@@ -2429,6 +2777,44 @@ def _run_portfolio_review_intraday_workflow(
         refresh_cache=False,
         log_label="review-portfolio-intraday",
     )
+    intraday_sector_history_start = sector_context_history_start(
+        args.as_of,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+    )
+    sector_contexts: dict[str, SectorFeatureContext] = {}
+    if hasattr(provider, "fetch_daily_bars"):
+        intraday_sector_symbol_frames: dict[str, pd.DataFrame] = {}
+        for position in resolved_current_positions:
+            try:
+                bars = provider.fetch_daily_bars(
+                    position.symbol,
+                    intraday_sector_history_start,
+                    args.as_of,
+                    refresh_cache=False,
+                )
+            except DataProviderError as exc:
+                LOGGER.warning(
+                    "Skipping sector context for held symbol %s due to provider error: %s",
+                    position.symbol,
+                    exc,
+                )
+                continue
+            if not bars.empty:
+                intraday_sector_symbol_frames[position.symbol] = bars
+        sector_contexts = _load_sector_contexts(
+            config=config,
+            env_file=getattr(args, "env_file", None),
+            provider=provider,
+            symbol_frames=intraday_sector_symbol_frames,
+            as_of_date=args.as_of,
+            history_start=intraday_sector_history_start,
+            benchmark_sma_fast=config.strategy.signals.benchmark_sma_fast,
+            benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+            relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+            refresh_cache=False,
+            log_label="review-portfolio-intraday",
+        )
 
     rows: list[PortfolioReviewRow] = []
     for plan in position_plans:
@@ -2445,6 +2831,7 @@ def _run_portfolio_review_intraday_workflow(
                     benchmark_intraday_metrics=benchmark_intraday_metrics,
                     refresh_cache=True,
                     earnings_context=earnings_contexts.get(symbol),
+                    sector_context=sector_contexts.get(symbol),
                 )
             )
         except DataProviderConfigurationError:
@@ -2477,6 +2864,7 @@ def _build_portfolio_review_intraday_row(
     benchmark_intraday_metrics: Mapping[str, float | str | None] | None,
     refresh_cache: bool,
     earnings_context: EarningsRiskContext | None = None,
+    sector_context: SectorFeatureContext | None = None,
 ) -> PortfolioReviewRow:
     position = plan["position"]
     preset = plan["preset"]
@@ -2505,8 +2893,45 @@ def _build_portfolio_review_intraday_row(
         intraday_metrics,
         benchmark_intraday_metrics,
     )
+    market_context = build_market_context(
+        as_of_date=as_of_date,
+        benchmark_symbol=benchmark_symbol,
+        benchmark_intraday_return_vs_open=(
+            _mapping_float_or_none(benchmark_intraday_metrics, "intraday_return_vs_open")
+            if benchmark_intraday_metrics is not None
+            else None
+        ),
+    )
+    position_features = build_intraday_position_features(
+        symbol=position.symbol,
+        as_of_date=as_of_date,
+        average_entry_price=position.average_entry_price,
+        current_stop=position.current_stop,
+        session_open=float(intraday_metrics["session_open"]),
+        session_high=float(intraday_metrics["session_high"]),
+        session_low=float(intraday_metrics["session_low"]),
+        latest_close=float(intraday_metrics["latest_close"]),
+        latest_low=float(intraday_metrics["latest_low"]),
+        session_vwap=_mapping_float_or_none(intraday_metrics, "session_vwap"),
+        intraday_return_vs_benchmark=intraday_relative_strength_diff,
+        earnings_context=earnings_context,
+        earnings_watch_days=settings.earnings_watch_days,
+        sector_context=sector_context,
+        early_strength_threshold=0.03,
+        meaningful_profit_pct=0.05,
+        session_high_giveback_watch_threshold=max(
+            0.04,
+            settings.profit_giveback_threshold * 0.75,
+        ),
+        intraday_relative_strength_watch_threshold=-0.02,
+        sector_relative_strength_watch_threshold=(
+            settings.sector_relative_strength_watch_threshold
+        ),
+        market_context=market_context,
+    )
     decision = review_existing_long_position_intraday(
         position,
+        position_features=position_features,
         session_open=float(intraday_metrics["session_open"]),
         session_high=float(intraday_metrics["session_high"]),
         session_low=float(intraday_metrics["session_low"]),
@@ -2524,6 +2949,34 @@ def _build_portfolio_review_intraday_row(
             else None
         ),
         earnings_watch_days=settings.earnings_watch_days,
+        sector_name=(
+            sector_context.sector_name
+            if sector_context is not None
+            else None
+        ),
+        sector_etf_symbol=(
+            sector_context.sector_etf_symbol
+            if sector_context is not None
+            else None
+        ),
+        sector_regime_passed=(
+            sector_context.sector_regime_passed
+            if sector_context is not None
+            else None
+        ),
+        relative_strength_vs_sector=(
+            sector_context.relative_strength_vs_sector
+            if sector_context is not None
+            else None
+        ),
+        sector_relative_strength_window=(
+            sector_context.relative_strength_window
+            if sector_context is not None
+            else None
+        ),
+        sector_relative_strength_watch_threshold=(
+            settings.sector_relative_strength_watch_threshold
+        ),
     )
     entry_date_used = _position_entry_date(position)
     return PortfolioReviewRow(
@@ -2644,6 +3097,17 @@ def _mapping_float_or_none(data: Mapping[str, object], key: str) -> float | None
     return None
 
 
+def _mapping_int_or_none(data: Mapping[str, object], key: str) -> int | None:
+    value = data.get(key)
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
 def _portfolio_review_preset_catalog(
     args: argparse.Namespace,
     config: AppConfig,
@@ -2749,6 +3213,44 @@ def _run_portfolio_review_workflow(
         refresh_cache=args.refresh_cache,
         log_label="review-portfolio",
     )
+    daily_sector_history_start = sector_context_history_start(
+        args.as_of,
+        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+        relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+    )
+    sector_contexts: dict[str, SectorFeatureContext] = {}
+    if hasattr(provider, "fetch_daily_bars"):
+        daily_sector_symbol_frames: dict[str, pd.DataFrame] = {}
+        for position in resolved_current_positions:
+            try:
+                bars = provider.fetch_daily_bars(
+                    position.symbol,
+                    daily_sector_history_start,
+                    args.as_of,
+                    refresh_cache=args.refresh_cache,
+                )
+            except DataProviderError as exc:
+                LOGGER.warning(
+                    "Skipping sector context for held symbol %s due to provider error: %s",
+                    position.symbol,
+                    exc,
+                )
+                continue
+            if not bars.empty:
+                daily_sector_symbol_frames[position.symbol] = bars
+        sector_contexts = _load_sector_contexts(
+            config=config,
+            env_file=getattr(args, "env_file", None),
+            provider=provider,
+            symbol_frames=daily_sector_symbol_frames,
+            as_of_date=args.as_of,
+            history_start=daily_sector_history_start,
+            benchmark_sma_fast=config.strategy.signals.benchmark_sma_fast,
+            benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
+            relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+            refresh_cache=args.refresh_cache,
+            log_label="review-portfolio",
+        )
 
     rows: list[PortfolioReviewRow] = []
     for plan in position_plans:
@@ -2763,6 +3265,7 @@ def _run_portfolio_review_workflow(
                     benchmark_frame=benchmark_frame,
                     refresh_cache=args.refresh_cache,
                     earnings_context=earnings_contexts.get(symbol),
+                    sector_context=sector_contexts.get(symbol),
                 )
             )
         except (DataProviderError, ValueError) as exc:
@@ -2805,6 +3308,7 @@ def _build_portfolio_review_row(
     benchmark_frame: pd.DataFrame | None,
     refresh_cache: bool,
     earnings_context: EarningsRiskContext | None = None,
+    sector_context: SectorFeatureContext | None = None,
 ) -> PortfolioReviewRow:
     position = plan["position"]
     preset = plan["preset"]
@@ -2855,19 +3359,58 @@ def _build_portfolio_review_row(
             )
         regime_passed = regime_is_bullish(benchmark_frame, settings.regime_settings)
 
+    breakout_failure_reference = _portfolio_review_breakout_failure_reference(position)
+    market_context = build_market_context(
+        as_of_date=as_of_date,
+        benchmark_symbol=(
+            settings.benchmark_symbol if settings.enable_regime_filter else None
+        ),
+        regime_filter_mode=settings.regime_filter_mode,
+        regime_passed=regime_passed,
+        benchmark_return=_mapping_float_or_none(relative_strength_metrics, "benchmark_return"),
+    )
+    position_features = build_position_features(
+        symbol=position.symbol,
+        as_of_date=as_of_date,
+        average_entry_price=position.average_entry_price,
+        latest_close=latest_close,
+        current_stop=position.current_stop,
+        regime_passed=regime_passed,
+        trailing_stop_candidate=trailing_stop_candidate,
+        high_water_close=_mapping_float_or_none(high_water_metrics, "high_water_close"),
+        breakout_failure_reference=breakout_failure_reference,
+        days_since_new_high=_mapping_int_or_none(high_water_metrics, "days_since_new_high"),
+        stale_high_watch_days=settings.stale_high_watch_days,
+        relative_strength_return_diff=_mapping_float_or_none(
+            relative_strength_metrics,
+            "relative_strength_return_diff",
+        ),
+        relative_strength_window=_mapping_int_or_none(
+            relative_strength_metrics,
+            "relative_strength_window",
+        ),
+        earnings_context=earnings_context,
+        earnings_watch_days=settings.earnings_watch_days,
+        sector_context=sector_context,
+        sector_relative_strength_watch_threshold=(
+            settings.sector_relative_strength_watch_threshold
+        ),
+        market_context=market_context,
+    )
     decision = review_existing_long_position(
         position,
+        position_features=position_features,
         latest_close=latest_close,
         regime_passed=regime_passed,
         trailing_stop_candidate=trailing_stop_candidate,
-        high_water_close=high_water_metrics.get("high_water_close"),
+        high_water_close=position_features.high_water_close,
         profit_giveback_threshold=settings.profit_giveback_threshold,
         profit_giveback_min_unrealized_pct=settings.profit_giveback_min_unrealized_pct,
-        breakout_failure_reference=_portfolio_review_breakout_failure_reference(position),
-        days_since_new_high=high_water_metrics.get("days_since_new_high"),
+        breakout_failure_reference=breakout_failure_reference,
+        days_since_new_high=position_features.days_since_new_high,
         stale_high_watch_days=settings.stale_high_watch_days,
-        relative_strength_return_diff=relative_strength_metrics.get("relative_strength_return_diff"),
-        relative_strength_window=settings.relative_strength_window,
+        relative_strength_return_diff=position_features.relative_strength_return_diff,
+        relative_strength_window=position_features.relative_strength_window,
         relative_strength_watch_threshold=settings.relative_strength_watch_threshold,
         earnings_date=earnings_context.earnings_date if earnings_context is not None else None,
         earnings_days_away=(
@@ -2876,6 +3419,34 @@ def _build_portfolio_review_row(
             else None
         ),
         earnings_watch_days=settings.earnings_watch_days,
+        sector_name=(
+            sector_context.sector_name
+            if sector_context is not None
+            else None
+        ),
+        sector_etf_symbol=(
+            sector_context.sector_etf_symbol
+            if sector_context is not None
+            else None
+        ),
+        sector_regime_passed=(
+            sector_context.sector_regime_passed
+            if sector_context is not None
+            else None
+        ),
+        relative_strength_vs_sector=(
+            sector_context.relative_strength_vs_sector
+            if sector_context is not None
+            else None
+        ),
+        sector_relative_strength_window=(
+            sector_context.relative_strength_window
+            if sector_context is not None
+            else None
+        ),
+        sector_relative_strength_watch_threshold=(
+            settings.sector_relative_strength_watch_threshold
+        ),
     )
     entry_date_used = _position_entry_date(position)
     return PortfolioReviewRow(
@@ -3152,6 +3723,66 @@ def _load_earnings_contexts(
         return {}
 
 
+def _load_sector_contexts(
+    *,
+    config: AppConfig,
+    env_file: Path | None,
+    provider: DailyBarProvider,
+    symbol_frames: Mapping[str, pd.DataFrame],
+    as_of_date: date,
+    history_start: date,
+    benchmark_sma_fast: int,
+    benchmark_sma_slow: int,
+    relative_strength_window: int,
+    refresh_cache: bool,
+    log_label: str,
+) -> dict[str, SectorFeatureContext]:
+    normalized_symbol_frames = {
+        symbol.strip().upper(): frame
+        for symbol, frame in symbol_frames.items()
+        if symbol.strip() and not frame.empty
+    }
+    if not normalized_symbol_frames:
+        return {}
+
+    try:
+        classifications = load_symbol_sector_classifications(
+            tuple(normalized_symbol_frames),
+            config=config,
+            env_file=env_file,
+            as_of_date=as_of_date,
+            refresh_cache=refresh_cache,
+        )
+        return build_sector_feature_contexts(
+            normalized_symbol_frames,
+            provider=provider,
+            as_of_date=as_of_date,
+            history_start=history_start,
+            sector_classifications=classifications,
+            benchmark_sma_fast=benchmark_sma_fast,
+            benchmark_sma_slow=benchmark_sma_slow,
+            relative_strength_window=relative_strength_window,
+            refresh_cache=refresh_cache,
+        )
+    except (DataProviderConfigurationError, DataProviderError, ValueError) as exc:
+        LOGGER.warning("Sector context unavailable for %s: %s", log_label, exc)
+        return {}
+
+
+def _warn_missing_sector_context_for_entry(
+    symbol: str,
+    *,
+    log_label: str,
+    preset_name: str | None = None,
+) -> None:
+    context_label = f"{log_label}:{preset_name}" if preset_name is not None else log_label
+    LOGGER.warning(
+        "Sector regime enforcement is enabled but sector context is unavailable for %s during %s; proceeding without sector gate.",
+        symbol,
+        context_label,
+    )
+
+
 def _strategy_warmup_start(
     as_of_date: date,
     settings: BreakoutMomentumSettings,
@@ -3162,6 +3793,7 @@ def _strategy_warmup_start(
         settings.resolved_relative_volume_window + 1,
         settings.stale_high_watch_days + 1,
         settings.relative_strength_window + 1,
+        settings.sector_relative_strength_window + 1,
         settings.benchmark_sma_slow if settings.enable_regime_filter else 1,
     )
     return as_of_date - timedelta(days=max(largest_window * 3, 30))
@@ -3174,6 +3806,7 @@ def _comparison_warmup_start(
     benchmark_sma_slow: int,
     presets: Sequence[BreakoutStrategyPreset],
     max_relative_volume_window: int,
+    max_sector_relative_strength_window: int,
     enable_regime_filter: bool,
 ) -> date:
     max_breakout_lookback = max((preset.breakout_lookback for preset in presets), default=1)
@@ -3181,6 +3814,7 @@ def _comparison_warmup_start(
         max_breakout_lookback + 1,
         atr_window,
         max_relative_volume_window + 1,
+        max_sector_relative_strength_window + 1,
         benchmark_sma_slow if enable_regime_filter else 1,
     )
     return start_date - timedelta(days=max(largest_window * 3, 30))

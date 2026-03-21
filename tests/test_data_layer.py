@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 from datetime import date
+import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from pandas.testing import assert_frame_equal
 
 from bot.config import UniverseConfig, load_app_config
+from bot.data.candidate_journal import (
+    CandidateJournalEntry,
+    CandidateJournalObservation,
+    build_candidate_memory_features,
+    default_candidate_score_journal_path,
+    load_candidate_score_journal,
+    update_candidate_score_journal,
+    write_candidate_score_journal,
+)
 from bot.data.earnings import (
     EarningsCalendarProvider,
     build_earnings_risk_contexts,
     trading_days_until,
+)
+from bot.data.sector_context import (
+    SymbolSectorClassification,
+    build_sector_feature_contexts,
 )
 from bot.data.normalize import (
     DAILY_BAR_COLUMNS,
@@ -412,6 +427,115 @@ def test_build_earnings_risk_contexts_ignores_past_earnings_dates(tmp_path: Path
     assert contexts["AAPL"].is_earnings_risk is False
 
 
+def test_build_sector_feature_contexts_fetches_shared_sector_etf_once(tmp_path: Path) -> None:
+    symbol_dates = pd.date_range("2024-01-02", periods=25, freq="B")
+    sector_dates = pd.date_range("2023-03-01", periods=240, freq="B")
+    provider = FakeDailyBarProvider(
+        frames_by_symbol={
+            "XLK": pd.DataFrame(
+                {
+                    "date": sector_dates,
+                    "open": [100.0 + index for index in range(len(sector_dates))],
+                    "high": [101.0 + index for index in range(len(sector_dates))],
+                    "low": [99.0 + index for index in range(len(sector_dates))],
+                    "close": [100.0 + index for index in range(len(sector_dates))],
+                    "volume": [1_000_000 for _ in range(len(sector_dates))],
+                    "symbol": ["XLK" for _ in range(len(sector_dates))],
+                }
+            ),
+        },
+        cache_dir=tmp_path,
+    )
+    symbol_frames = {
+        "AAPL": pd.DataFrame(
+            {
+                "date": symbol_dates,
+                "open": [100.0 + index for index in range(len(symbol_dates))],
+                "high": [101.0 + index for index in range(len(symbol_dates))],
+                "low": [99.0 + index for index in range(len(symbol_dates))],
+                "close": [100.0 + index for index in range(len(symbol_dates))],
+                "volume": [1_000_000 for _ in range(len(symbol_dates))],
+                "symbol": ["AAPL" for _ in range(len(symbol_dates))],
+            }
+        ),
+        "MSFT": pd.DataFrame(
+            {
+                "date": symbol_dates,
+                "open": [120.0 + index for index in range(len(symbol_dates))],
+                "high": [121.0 + index for index in range(len(symbol_dates))],
+                "low": [119.0 + index for index in range(len(symbol_dates))],
+                "close": [120.0 + index for index in range(len(symbol_dates))],
+                "volume": [1_200_000 for _ in range(len(symbol_dates))],
+                "symbol": ["MSFT" for _ in range(len(symbol_dates))],
+            }
+        ),
+    }
+    sector_classifications = {
+        "AAPL": SymbolSectorClassification(
+            symbol="AAPL",
+            sector="Technology",
+            industry="Consumer electronics",
+            sector_etf_symbol="XLK",
+            mapping_source="test",
+        ),
+        "MSFT": SymbolSectorClassification(
+            symbol="MSFT",
+            sector="Technology",
+            industry="Application software",
+            sector_etf_symbol="XLK",
+            mapping_source="test",
+        ),
+    }
+
+    contexts = build_sector_feature_contexts(
+        symbol_frames,
+        provider=provider,
+        as_of_date=date(2024, 2, 5),
+        history_start=date(2023, 3, 1),
+        sector_classifications=sector_classifications,
+        benchmark_sma_fast=50,
+        benchmark_sma_slow=200,
+        relative_strength_window=20,
+    )
+
+    assert provider.fetch_count == 1
+    assert contexts["AAPL"].sector_etf_symbol == "XLK"
+    assert contexts["MSFT"].sector_etf_symbol == "XLK"
+    assert contexts["AAPL"].sector_regime_passed is True
+
+
+def test_build_sector_feature_contexts_degrades_gracefully_without_mappings(tmp_path: Path) -> None:
+    symbol_dates = pd.date_range("2024-01-02", periods=25, freq="B")
+    provider = FakeDailyBarProvider(frames_by_symbol={}, cache_dir=tmp_path)
+    symbol_frames = {
+        "AAPL": pd.DataFrame(
+            {
+                "date": symbol_dates,
+                "open": [100.0 + index for index in range(len(symbol_dates))],
+                "high": [101.0 + index for index in range(len(symbol_dates))],
+                "low": [99.0 + index for index in range(len(symbol_dates))],
+                "close": [100.0 + index for index in range(len(symbol_dates))],
+                "volume": [1_000_000 for _ in range(len(symbol_dates))],
+                "symbol": ["AAPL" for _ in range(len(symbol_dates))],
+            }
+        ),
+    }
+
+    contexts = build_sector_feature_contexts(
+        symbol_frames,
+        provider=provider,
+        as_of_date=date(2024, 2, 5),
+        history_start=date(2024, 1, 2),
+        sector_classifications={},
+        benchmark_sma_fast=50,
+        benchmark_sma_slow=200,
+        relative_strength_window=20,
+    )
+
+    assert contexts == {}
+    assert provider.fetch_count == 0
+
+
 def test_create_provider_uses_configured_provider() -> None:
     config = load_app_config()
     api_key_env = config.data_sources.active_provider().api_key_env
@@ -422,6 +546,206 @@ def test_create_provider_uses_configured_provider() -> None:
     )
 
     assert provider.provider_name == config.data_sources.provider.lower()
+
+
+def test_candidate_score_journal_updates_and_persists_repeated_candidates(
+    tmp_path: Path,
+) -> None:
+    journal_path = default_candidate_score_journal_path(tmp_path)
+    journal = load_candidate_score_journal(journal_path)
+    first_observation = CandidateJournalObservation(
+        symbol="AAPL",
+        approved_today=False,
+        breakout_strength=0.02,
+        relative_volume=1.8,
+        sector_etf_symbol="XLK",
+        sector_regime_passed=True,
+    )
+
+    first_features = build_candidate_memory_features(
+        None,
+        observation=first_observation,
+        as_of_date=date(2024, 1, 5),
+    )
+    journal = update_candidate_score_journal(
+        journal,
+        observations={"AAPL": first_observation},
+        as_of_date=date(2024, 1, 5),
+    )
+    write_candidate_score_journal(journal, journal_path)
+    reloaded = load_candidate_score_journal(journal_path)
+
+    second_observation = CandidateJournalObservation(
+        symbol="AAPL",
+        approved_today=True,
+        breakout_strength=0.03,
+        relative_volume=2.1,
+        sector_etf_symbol="XLK",
+        sector_regime_passed=True,
+        best_rank_today=2,
+    )
+    second_features = build_candidate_memory_features(
+        reloaded.entries["AAPL"],
+        observation=second_observation,
+        as_of_date=date(2024, 1, 8),
+    )
+    updated = update_candidate_score_journal(
+        reloaded,
+        observations={"AAPL": second_observation},
+        as_of_date=date(2024, 1, 8),
+    )
+    payload = json.loads(write_candidate_score_journal(updated, journal_path).read_text(encoding="utf-8"))
+
+    assert first_features["setup_persistence_days"] == 1
+    assert first_features["days_approved"] == 0
+    assert second_features["setup_persistence_days"] == 2
+    assert second_features["days_approved"] == 1
+    assert second_features["setup_quality_score"] > first_features["setup_quality_score"]
+    assert updated.entries["AAPL"] == CandidateJournalEntry(
+        symbol="AAPL",
+        last_seen_date=date(2024, 1, 8),
+        days_near_breakout=2,
+        days_approved=1,
+        last_rank=2,
+        best_rank=2,
+        peak_relative_volume=2.1,
+        peak_breakout_strength=0.03,
+        last_sector_etf_symbol="XLK",
+        last_sector_regime_passed=True,
+        last_approved_date=date(2024, 1, 8),
+    )
+    assert payload["symbols"]["AAPL"]["days_near_breakout"] == 2
+
+
+def test_candidate_score_journal_same_day_rerun_is_idempotent() -> None:
+    journal = update_candidate_score_journal(
+        load_candidate_score_journal(Path("/tmp/does-not-exist.json"), stale_after_days=30),
+        observations={
+            "AAPL": CandidateJournalObservation(
+                symbol="AAPL",
+                approved_today=True,
+                breakout_strength=0.02,
+                relative_volume=1.8,
+            )
+        },
+        as_of_date=date(2024, 1, 5),
+    )
+
+    rerun = update_candidate_score_journal(
+        journal,
+        observations={
+            "AAPL": CandidateJournalObservation(
+                symbol="AAPL",
+                approved_today=True,
+                breakout_strength=0.03,
+                relative_volume=2.0,
+            )
+        },
+        as_of_date=date(2024, 1, 5),
+    )
+
+    assert rerun.entries["AAPL"].days_near_breakout == 1
+    assert rerun.entries["AAPL"].days_approved == 1
+    assert rerun.entries["AAPL"].peak_relative_volume == 2.0
+    assert rerun.entries["AAPL"].peak_breakout_strength == 0.03
+
+
+def test_candidate_score_journal_five_day_gap_preserves_setup_streak() -> None:
+    journal = update_candidate_score_journal(
+        load_candidate_score_journal(Path("/tmp/does-not-exist.json"), stale_after_days=30),
+        observations={
+            "AAPL": CandidateJournalObservation(
+                symbol="AAPL",
+                approved_today=False,
+                breakout_strength=0.02,
+                relative_volume=1.8,
+            )
+        },
+        as_of_date=date(2024, 1, 5),
+    )
+
+    updated = update_candidate_score_journal(
+        journal,
+        observations={
+            "AAPL": CandidateJournalObservation(
+                symbol="AAPL",
+                approved_today=False,
+                breakout_strength=0.02,
+                relative_volume=1.8,
+            )
+        },
+        as_of_date=date(2024, 1, 10),
+    )
+
+    assert updated.entries["AAPL"].days_near_breakout == 2
+
+
+def test_candidate_score_journal_six_day_gap_resets_setup_streak() -> None:
+    journal = update_candidate_score_journal(
+        load_candidate_score_journal(Path("/tmp/does-not-exist.json"), stale_after_days=30),
+        observations={
+            "AAPL": CandidateJournalObservation(
+                symbol="AAPL",
+                approved_today=False,
+                breakout_strength=0.02,
+                relative_volume=1.8,
+            )
+        },
+        as_of_date=date(2024, 1, 5),
+    )
+
+    updated = update_candidate_score_journal(
+        journal,
+        observations={
+            "AAPL": CandidateJournalObservation(
+                symbol="AAPL",
+                approved_today=False,
+                breakout_strength=0.02,
+                relative_volume=1.8,
+            )
+        },
+        as_of_date=date(2024, 1, 11),
+    )
+
+    assert updated.entries["AAPL"].days_near_breakout == 1
+
+
+def test_candidate_score_journal_ages_out_stale_symbols() -> None:
+    journal = update_candidate_score_journal(
+        load_candidate_score_journal(Path("/tmp/does-not-exist.json"), stale_after_days=30),
+        observations={
+            "AAPL": CandidateJournalObservation(
+                symbol="AAPL",
+                approved_today=False,
+                breakout_strength=0.02,
+                relative_volume=1.6,
+            )
+        },
+        as_of_date=date(2024, 1, 5),
+    )
+
+    pruned = update_candidate_score_journal(
+        journal,
+        observations={},
+        as_of_date=date(2024, 2, 10),
+    )
+
+    assert pruned.entries == {}
+
+
+def test_candidate_score_journal_ignores_corrupt_files(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    journal_path = default_candidate_score_journal_path(tmp_path)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{not-json", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        journal = load_candidate_score_journal(journal_path)
+
+    assert journal.entries == {}
+    assert "Ignoring candidate score journal" in caplog.text
 
 
 def test_load_candidate_symbols_supports_text_and_csv(tmp_path: Path) -> None:

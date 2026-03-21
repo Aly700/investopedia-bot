@@ -178,11 +178,24 @@ class SignalConfig:
     relative_volume_threshold: float
     earnings_entry_block_days: int = 3
     earnings_watch_days: int = 7
+    require_sector_regime_for_entries: bool = True
+    sector_relative_strength_window: int = 20
+    sector_relative_strength_entry_reject_threshold: float = -0.05
+    sector_relative_strength_watch_threshold: float = -0.05
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "SignalConfig":
         earnings_entry_block_days = _as_optional_int(data, "earnings_entry_block_days")
         earnings_watch_days = _as_optional_int(data, "earnings_watch_days")
+        sector_relative_strength_window = _as_optional_int(data, "sector_relative_strength_window")
+        sector_relative_strength_entry_reject_threshold = _as_optional_float(
+            data,
+            "sector_relative_strength_entry_reject_threshold",
+        )
+        sector_relative_strength_watch_threshold = _as_optional_float(
+            data,
+            "sector_relative_strength_watch_threshold",
+        )
         return cls(
             breakout_lookback=_as_int(data, "breakout_lookback"),
             benchmark_symbol=_as_str(data, "benchmark_symbol"),
@@ -199,6 +212,26 @@ class SignalConfig:
                 if earnings_watch_days is not None
                 else 7
             ),
+            require_sector_regime_for_entries=_as_bool(
+                data,
+                "require_sector_regime_for_entries",
+                default=True,
+            ),
+            sector_relative_strength_window=(
+                sector_relative_strength_window
+                if sector_relative_strength_window is not None
+                else 20
+            ),
+            sector_relative_strength_entry_reject_threshold=(
+                sector_relative_strength_entry_reject_threshold
+                if sector_relative_strength_entry_reject_threshold is not None
+                else -0.05
+            ),
+            sector_relative_strength_watch_threshold=(
+                sector_relative_strength_watch_threshold
+                if sector_relative_strength_watch_threshold is not None
+                else -0.05
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -214,6 +247,18 @@ class SignalConfig:
             raise ConfigError("Expected 'earnings_entry_block_days' to be greater than zero.")
         if self.earnings_watch_days <= 0:
             raise ConfigError("Expected 'earnings_watch_days' to be greater than zero.")
+        if self.sector_relative_strength_window <= 0:
+            raise ConfigError(
+                "Expected 'sector_relative_strength_window' to be greater than zero."
+            )
+        if self.sector_relative_strength_entry_reject_threshold > 0:
+            raise ConfigError(
+                "Expected 'sector_relative_strength_entry_reject_threshold' to be less than or equal to zero."
+            )
+        if self.sector_relative_strength_watch_threshold > 0:
+            raise ConfigError(
+                "Expected 'sector_relative_strength_watch_threshold' to be less than or equal to zero."
+            )
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,13 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from bot.config import RiskConfig, RulesConfig
+from bot.features import (
+    CandidateFeatures,
+    PositionFeatures,
+    build_candidate_features,
+    build_intraday_position_features,
+    build_position_features,
+)
 from bot.risk.position_sizing import PositionSizingResult, size_position
 from bot.strategy.signal_models import StrategySignal
 
@@ -166,6 +173,7 @@ class RiskAssessedCandidate:
     approved: bool
     rejection_reasons: tuple[str, ...] = ()
     existing_position: ExistingPosition | None = None
+    features: CandidateFeatures | None = None
 
 
 @dataclass(frozen=True)
@@ -376,6 +384,7 @@ def suggest_long_stop_update(
 def review_existing_long_position(
     position: ExistingPosition,
     *,
+    position_features: PositionFeatures | None = None,
     latest_close: float,
     regime_passed: bool | None,
     trailing_stop_candidate: float | None = None,
@@ -392,6 +401,13 @@ def review_existing_long_position(
     earnings_date: date | None = None,
     earnings_days_away: int | None = None,
     earnings_watch_days: int = 7,
+    sector_name: str | None = None,
+    industry_name: str | None = None,
+    sector_etf_symbol: str | None = None,
+    sector_regime_passed: bool | None = None,
+    relative_strength_vs_sector: float | None = None,
+    sector_relative_strength_window: int | None = None,
+    sector_relative_strength_watch_threshold: float = -0.05,
 ) -> PortfolioReviewDecision:
     """Review one long position and suggest a simple management action."""
 
@@ -411,123 +427,172 @@ def review_existing_long_position(
         raise ValueError("earnings_days_away cannot be negative.")
     if earnings_watch_days <= 0:
         raise ValueError("earnings_watch_days must be greater than zero.")
-
-    unrealized_pl_pct = (latest_close / position.average_entry_price) - 1.0
-    above_entry = latest_close >= position.average_entry_price
-    distance_to_stop_pct: float | None = None
-    if position.current_stop is not None:
-        distance_to_stop_pct = (latest_close - position.current_stop) / latest_close
-
-    giveback_pct: float | None = None
+    if sector_relative_strength_window is not None and sector_relative_strength_window <= 0:
+        raise ValueError(
+            "sector_relative_strength_window must be greater than zero when provided."
+        )
+    if sector_relative_strength_watch_threshold > 0:
+        raise ValueError(
+            "sector_relative_strength_watch_threshold must be less than or equal to zero."
+        )
     if high_water_close is not None:
         _validate_finite_positive(high_water_close, name="high_water_close")
-        giveback_pct = max((high_water_close - latest_close) / high_water_close, 0.0)
 
-    failed_breakout = (
-        breakout_failure_reference is not None
-        and latest_close < breakout_failure_reference
+    features = position_features or build_position_features(
+        symbol=position.symbol,
+        as_of_date=date.today(),
+        average_entry_price=position.average_entry_price,
+        latest_close=latest_close,
+        current_stop=position.current_stop,
+        regime_passed=regime_passed,
+        trailing_stop_candidate=trailing_stop_candidate,
+        high_water_close=high_water_close,
+        breakout_failure_reference=breakout_failure_reference,
+        days_since_new_high=days_since_new_high,
+        relative_strength_return_diff=relative_strength_return_diff,
+        relative_strength_window=relative_strength_window,
+        earnings_date=earnings_date,
+        earnings_days_away=earnings_days_away,
+        sector_name=sector_name,
+        industry_name=industry_name,
+        sector_etf_symbol=sector_etf_symbol,
+        sector_regime_passed=sector_regime_passed,
+        relative_strength_vs_sector=relative_strength_vs_sector,
+        sector_relative_strength_window=sector_relative_strength_window,
+        earnings_watch_days=earnings_watch_days,
+        sector_relative_strength_watch_threshold=sector_relative_strength_watch_threshold,
+        stale_high_watch_days=stale_high_watch_days,
     )
-    stale_position = (
-        days_since_new_high is not None
-        and days_since_new_high >= stale_high_watch_days
+    return _review_existing_long_position_from_features(
+        position,
+        features=features,
+        watch_distance_pct=watch_distance_pct,
+        profit_giveback_threshold=profit_giveback_threshold,
+        profit_giveback_min_unrealized_pct=profit_giveback_min_unrealized_pct,
+        stale_high_watch_days=stale_high_watch_days,
+        relative_strength_watch_threshold=relative_strength_watch_threshold,
+        earnings_watch_days=earnings_watch_days,
+        sector_relative_strength_watch_threshold=sector_relative_strength_watch_threshold,
     )
+
+
+def _review_existing_long_position_from_features(
+    position: ExistingPosition,
+    *,
+    features: PositionFeatures,
+    watch_distance_pct: float,
+    profit_giveback_threshold: float,
+    profit_giveback_min_unrealized_pct: float,
+    stale_high_watch_days: int,
+    relative_strength_watch_threshold: float,
+    earnings_watch_days: int,
+    sector_relative_strength_watch_threshold: float,
+) -> PortfolioReviewDecision:
     weak_relative_strength = (
-        relative_strength_return_diff is not None
-        and relative_strength_return_diff <= relative_strength_watch_threshold
+        features.relative_strength_return_diff is not None
+        and features.relative_strength_return_diff <= relative_strength_watch_threshold
     )
-    is_earnings_risk = (
-        earnings_days_away is not None and earnings_days_away <= earnings_watch_days
-    )
+    weak_sector_regime = features.sector_regime_passed is False
 
     suggested_stop = suggest_long_stop_update(
         current_stop=position.current_stop,
-        trailing_stop_candidate=trailing_stop_candidate,
+        trailing_stop_candidate=features.trailing_stop_candidate,
     )
-    # A long protective stop must always be strictly below the latest close.
-    # If the trailing-stop formula produced a value at or above the market price
-    # (e.g. because ATR or a multiplier over-shot), treat it as unusable.
-    if suggested_stop is not None and suggested_stop >= latest_close:
+    if suggested_stop is not None and suggested_stop >= features.latest_close:
         suggested_stop = None
+
     rationale: list[str] = []
     metadata = {
-        "high_water_close": high_water_close,
-        "giveback_pct": giveback_pct,
+        "high_water_close": features.high_water_close,
+        "giveback_pct": features.giveback_pct,
         "profit_giveback_threshold": profit_giveback_threshold,
         "profit_giveback_min_unrealized_pct": profit_giveback_min_unrealized_pct,
-        "breakout_failure_reference": breakout_failure_reference,
-        "failed_breakout_detected": failed_breakout,
-        "days_since_new_high": days_since_new_high,
+        "breakout_failure_reference": features.breakout_failure_reference,
+        "failed_breakout_detected": features.failed_breakout,
+        "days_since_new_high": features.days_since_new_high,
         "stale_high_watch_days": stale_high_watch_days,
-        "stale_position": stale_position,
-        "relative_strength_return_diff": relative_strength_return_diff,
-        "relative_strength_window": relative_strength_window,
+        "stale_position": features.stale_position,
+        "relative_strength_return_diff": features.relative_strength_return_diff,
+        "relative_strength_window": features.relative_strength_window,
         "relative_strength_watch_threshold": relative_strength_watch_threshold,
         "weak_relative_strength": weak_relative_strength,
-        "earnings_date": earnings_date.isoformat() if earnings_date is not None else None,
-        "earnings_days_away": earnings_days_away,
+        "earnings_date": (
+            features.earnings_date.isoformat() if features.earnings_date is not None else None
+        ),
+        "earnings_days_away": features.earnings_days_away,
         "earnings_watch_days": earnings_watch_days,
-        "is_earnings_risk": is_earnings_risk,
+        "is_earnings_risk": features.is_earnings_risk,
+        "sector_name": features.sector_name,
+        "industry_name": features.industry_name,
+        "sector_etf_symbol": features.sector_etf_symbol,
+        "sector_regime_passed": features.sector_regime_passed,
+        "relative_strength_vs_sector": features.relative_strength_vs_sector,
+        "sector_relative_strength_window": features.sector_relative_strength_window,
+        "sector_relative_strength_watch_threshold": sector_relative_strength_watch_threshold,
+        "weak_sector_regime": weak_sector_regime,
+        "lagging_sector": features.lagging_sector,
     }
 
-    if position.current_stop is not None and latest_close <= position.current_stop:
+    if position.current_stop is not None and features.latest_close <= position.current_stop:
         rationale.append("Latest close is at or below the current stop.")
         action = "EXIT CANDIDATE"
-    elif regime_passed is False and not above_entry:
+    elif features.regime_passed is False and not features.above_entry:
         rationale.append("Benchmark regime is weak and the position is below the average entry price.")
         action = "EXIT CANDIDATE"
     elif (
-        giveback_pct is not None
-        and unrealized_pl_pct > profit_giveback_min_unrealized_pct
-        and giveback_pct > profit_giveback_threshold
+        features.giveback_pct is not None
+        and features.unrealized_pl_pct > profit_giveback_min_unrealized_pct
+        and features.giveback_pct > profit_giveback_threshold
+        and features.high_water_close is not None
     ):
         rationale.append(
             "Profitable position has given back "
-            f"{giveback_pct:.1%} from the high-water close of {high_water_close:.2f}."
+            f"{features.giveback_pct:.1%} from the high-water close of {features.high_water_close:.2f}."
         )
         action = "EXIT CANDIDATE"
-    elif failed_breakout:
+    elif features.failed_breakout and features.breakout_failure_reference is not None:
         rationale.append(
             "Latest close has fallen back below the breakout reference of "
-            f"{breakout_failure_reference:.2f}."
+            f"{features.breakout_failure_reference:.2f}."
         )
         action = "EXIT CANDIDATE"
     elif suggested_stop is not None:
         rationale.append("Trailing-stop logic supports a higher stop without lowering risk control.")
         action = "RAISE STOP"
     elif (
-        (distance_to_stop_pct is not None and distance_to_stop_pct <= watch_distance_pct)
-        or regime_passed is False
-        or not above_entry
-        or stale_position
+        (features.distance_to_stop_pct is not None and features.distance_to_stop_pct <= watch_distance_pct)
+        or features.regime_passed is False
+        or not features.above_entry
+        or features.stale_position
         or weak_relative_strength
     ):
-        if distance_to_stop_pct is not None and distance_to_stop_pct <= watch_distance_pct:
+        if features.distance_to_stop_pct is not None and features.distance_to_stop_pct <= watch_distance_pct:
             rationale.append("Latest close is close to the current stop.")
-        if regime_passed is False:
+        if features.regime_passed is False:
             rationale.append("Benchmark regime filter is not currently passing.")
-        if not above_entry:
+        if not features.above_entry:
             rationale.append("Position is below the average entry price.")
-        if stale_position and days_since_new_high is not None:
+        if features.stale_position and features.days_since_new_high is not None:
             rationale.append(
-                f"Position has gone {days_since_new_high} trading days without a new closing high."
+                f"Position has gone {features.days_since_new_high} trading days without a new closing high."
             )
-        if weak_relative_strength and relative_strength_return_diff is not None:
-            if relative_strength_window is not None:
+        if weak_relative_strength and features.relative_strength_return_diff is not None:
+            if features.relative_strength_window is not None:
                 rationale.append(
-                    f"Relative strength vs benchmark over {relative_strength_window} trading days is "
-                    f"{relative_strength_return_diff:.1%}."
+                    f"Relative strength vs benchmark over {features.relative_strength_window} trading days is "
+                    f"{features.relative_strength_return_diff:.1%}."
                 )
             else:
                 rationale.append(
-                    f"Relative strength vs benchmark is {relative_strength_return_diff:.1%}."
+                    f"Relative strength vs benchmark is {features.relative_strength_return_diff:.1%}."
                 )
         action = "WATCH CLOSELY"
     else:
         rationale.append("Position remains above entry and sufficiently above the current stop.")
         action = "HOLD"
 
-    if is_earnings_risk:
-        rationale.append(_earnings_risk_note(earnings_date, earnings_days_away))
+    if features.is_earnings_risk:
+        rationale.append(_earnings_risk_note(features.earnings_date, features.earnings_days_away))
         if action == "HOLD":
             rationale.append("Upcoming earnings add event risk to the position.")
             action = "WATCH CLOSELY"
@@ -536,19 +601,39 @@ def review_existing_long_position(
                 "Upcoming earnings still increase gap risk even though a higher stop is justified."
             )
 
+    if weak_sector_regime or features.lagging_sector:
+        if weak_sector_regime:
+            rationale.append(_sector_regime_note(features.sector_etf_symbol, features.sector_name))
+        if features.lagging_sector and features.relative_strength_vs_sector is not None:
+            rationale.append(
+                _sector_lag_note(
+                    features.sector_etf_symbol,
+                    sector_name=features.sector_name,
+                    relative_strength_vs_sector=features.relative_strength_vs_sector,
+                    window=features.sector_relative_strength_window,
+                )
+            )
+        if action == "HOLD":
+            action = "WATCH CLOSELY"
+        elif action == "RAISE STOP":
+            rationale.append(
+                "Weak sector context still argues for caution, but raising the stop improves risk control."
+            )
+
     if action == "EXIT CANDIDATE":
         suggested_stop = None
-        trailing_stop_candidate = None
 
     return PortfolioReviewDecision(
-        latest_close=latest_close,
-        unrealized_pl_pct=unrealized_pl_pct,
-        distance_to_stop_pct=distance_to_stop_pct,
-        regime_passed=regime_passed,
-        above_entry=above_entry,
+        latest_close=features.latest_close,
+        unrealized_pl_pct=features.unrealized_pl_pct,
+        distance_to_stop_pct=features.distance_to_stop_pct,
+        regime_passed=features.regime_passed,
+        above_entry=features.above_entry,
         suggested_action=action,
         suggested_stop=suggested_stop,
-        trailing_stop_candidate=trailing_stop_candidate,
+        trailing_stop_candidate=(
+            None if action == "EXIT CANDIDATE" else features.trailing_stop_candidate
+        ),
         rationale=tuple(rationale),
         metadata=metadata,
     )
@@ -557,6 +642,7 @@ def review_existing_long_position(
 def review_existing_long_position_intraday(
     position: ExistingPosition,
     *,
+    position_features: PositionFeatures | None = None,
     session_open: float,
     session_high: float,
     session_low: float,
@@ -574,6 +660,13 @@ def review_existing_long_position_intraday(
     earnings_date: date | None = None,
     earnings_days_away: int | None = None,
     earnings_watch_days: int = 7,
+    sector_name: str | None = None,
+    industry_name: str | None = None,
+    sector_etf_symbol: str | None = None,
+    sector_regime_passed: bool | None = None,
+    relative_strength_vs_sector: float | None = None,
+    sector_relative_strength_window: int | None = None,
+    sector_relative_strength_watch_threshold: float = -0.05,
 ) -> PortfolioReviewDecision:
     """Review one long position using a single intraday session snapshot."""
 
@@ -609,143 +702,184 @@ def review_existing_long_position_intraday(
         raise ValueError("earnings_days_away cannot be negative.")
     if earnings_watch_days <= 0:
         raise ValueError("earnings_watch_days must be greater than zero.")
-
-    unrealized_pl_pct = (latest_close / position.average_entry_price) - 1.0
-    above_entry = latest_close >= position.average_entry_price
-    distance_to_stop_pct: float | None = None
-    if position.current_stop is not None:
-        distance_to_stop_pct = (latest_close - position.current_stop) / latest_close
-
-    intraday_return_vs_open = (latest_close / session_open) - 1.0
-    peak_intraday_return_vs_open = (session_high / session_open) - 1.0
-    peak_unrealized_pct = (session_high / position.average_entry_price) - 1.0
-    session_high_giveback_pct = max((session_high - latest_close) / session_high, 0.0)
-    close_vs_vwap_pct = (
-        (latest_close - session_vwap) / session_vwap
-        if session_vwap is not None
-        else None
-    )
-    stop_breached_intraday = (
-        position.current_stop is not None
-        and session_low <= position.current_stop
-    )
-    failed_intraday_strength = (
-        peak_intraday_return_vs_open >= early_strength_threshold
-        and (
-            (session_vwap is not None and latest_close < session_vwap)
-            or latest_close <= session_open
+    if sector_relative_strength_window is not None and sector_relative_strength_window <= 0:
+        raise ValueError(
+            "sector_relative_strength_window must be greater than zero when provided."
         )
-    )
-    intraday_momentum_fade = (
-        peak_unrealized_pct >= meaningful_profit_pct
-        and session_high_giveback_pct >= session_high_giveback_watch_threshold
-        and (
-            (session_vwap is not None and latest_close < session_vwap)
-            or intraday_return_vs_open < 0
+    if sector_relative_strength_watch_threshold > 0:
+        raise ValueError(
+            "sector_relative_strength_watch_threshold must be less than or equal to zero."
         )
+    features = position_features or build_intraday_position_features(
+        symbol=position.symbol,
+        as_of_date=date.today(),
+        average_entry_price=position.average_entry_price,
+        current_stop=position.current_stop,
+        session_open=session_open,
+        session_high=session_high,
+        session_low=session_low,
+        latest_close=latest_close,
+        latest_low=latest_low,
+        session_vwap=session_vwap,
+        intraday_return_vs_benchmark=intraday_relative_strength_diff,
+        earnings_date=earnings_date,
+        earnings_days_away=earnings_days_away,
+        sector_name=sector_name,
+        industry_name=industry_name,
+        sector_etf_symbol=sector_etf_symbol,
+        sector_regime_passed=sector_regime_passed,
+        relative_strength_vs_sector=relative_strength_vs_sector,
+        sector_relative_strength_window=sector_relative_strength_window,
+        earnings_watch_days=earnings_watch_days,
+        early_strength_threshold=early_strength_threshold,
+        meaningful_profit_pct=meaningful_profit_pct,
+        session_high_giveback_watch_threshold=session_high_giveback_watch_threshold,
+        intraday_relative_strength_watch_threshold=intraday_relative_strength_watch_threshold,
+        sector_relative_strength_watch_threshold=sector_relative_strength_watch_threshold,
     )
-    weak_intraday_relative_strength = (
-        intraday_relative_strength_diff is not None
-        and intraday_relative_strength_diff <= intraday_relative_strength_watch_threshold
+    return _review_existing_long_position_intraday_from_features(
+        features=features,
+        session_high_giveback_exit_threshold=session_high_giveback_exit_threshold,
+        session_high_giveback_watch_threshold=session_high_giveback_watch_threshold,
+        meaningful_profit_pct=meaningful_profit_pct,
+        intraday_relative_strength_watch_threshold=intraday_relative_strength_watch_threshold,
+        intraday_high_profit_unrealized_pct=intraday_high_profit_unrealized_pct,
+        intraday_high_profit_giveback_threshold=intraday_high_profit_giveback_threshold,
+        earnings_watch_days=earnings_watch_days,
+        sector_relative_strength_watch_threshold=sector_relative_strength_watch_threshold,
     )
-    is_earnings_risk = (
-        earnings_days_away is not None and earnings_days_away <= earnings_watch_days
-    )
-    stacked_intraday_weakness = (
-        close_vs_vwap_pct is not None
-        and close_vs_vwap_pct < 0
-        and session_high_giveback_pct >= meaningful_profit_pct
-        and weak_intraday_relative_strength
-    )
+
+
+def _review_existing_long_position_intraday_from_features(
+    *,
+    features: PositionFeatures,
+    session_high_giveback_exit_threshold: float,
+    session_high_giveback_watch_threshold: float,
+    meaningful_profit_pct: float,
+    intraday_relative_strength_watch_threshold: float,
+    intraday_high_profit_unrealized_pct: float,
+    intraday_high_profit_giveback_threshold: float,
+    earnings_watch_days: int,
+    sector_relative_strength_watch_threshold: float,
+) -> PortfolioReviewDecision:
+    weak_sector_regime = features.sector_regime_passed is False
 
     rationale: list[str] = []
     metadata = {
-        "session_open": session_open,
-        "session_high": session_high,
-        "session_low": session_low,
-        "latest_low": latest_low,
-        "session_vwap": session_vwap,
-        "intraday_return_vs_open": intraday_return_vs_open,
-        "peak_intraday_return_vs_open": peak_intraday_return_vs_open,
-        "peak_unrealized_pct": peak_unrealized_pct,
-        "session_high_giveback_pct": session_high_giveback_pct,
+        "session_open": features.session_open,
+        "session_high": features.session_high,
+        "session_low": features.session_low,
+        "latest_low": features.latest_low,
+        "session_vwap": features.session_vwap,
+        "intraday_return_vs_open": features.intraday_return_vs_open,
+        "peak_intraday_return_vs_open": features.peak_intraday_return_vs_open,
+        "peak_unrealized_pct": features.peak_unrealized_pct,
+        "session_high_giveback_pct": features.session_high_giveback_pct,
         "session_high_giveback_watch_threshold": session_high_giveback_watch_threshold,
         "session_high_giveback_exit_threshold": session_high_giveback_exit_threshold,
-        "close_vs_vwap_pct": close_vs_vwap_pct,
-        "stop_breached_intraday": stop_breached_intraday,
-        "failed_intraday_strength": failed_intraday_strength,
-        "intraday_momentum_fade": intraday_momentum_fade,
-        "intraday_relative_strength_diff": intraday_relative_strength_diff,
+        "close_vs_vwap_pct": features.close_vs_vwap_pct,
+        "stop_breached_intraday": features.stop_breached_intraday,
+        "failed_intraday_strength": features.failed_intraday_strength,
+        "intraday_momentum_fade": features.intraday_momentum_fade,
+        "intraday_relative_strength_diff": features.intraday_return_vs_benchmark,
         "intraday_relative_strength_watch_threshold": intraday_relative_strength_watch_threshold,
-        "weak_intraday_relative_strength": weak_intraday_relative_strength,
-        "stacked_intraday_weakness": stacked_intraday_weakness,
+        "weak_intraday_relative_strength": features.weak_intraday_relative_strength,
+        "stacked_intraday_weakness": features.stacked_intraday_weakness,
         "intraday_high_profit_unrealized_pct": intraday_high_profit_unrealized_pct,
         "intraday_high_profit_giveback_threshold": intraday_high_profit_giveback_threshold,
-        "earnings_date": earnings_date.isoformat() if earnings_date is not None else None,
-        "earnings_days_away": earnings_days_away,
+        "earnings_date": (
+            features.earnings_date.isoformat() if features.earnings_date is not None else None
+        ),
+        "earnings_days_away": features.earnings_days_away,
         "earnings_watch_days": earnings_watch_days,
-        "is_earnings_risk": is_earnings_risk,
+        "is_earnings_risk": features.is_earnings_risk,
+        "sector_name": features.sector_name,
+        "industry_name": features.industry_name,
+        "sector_etf_symbol": features.sector_etf_symbol,
+        "sector_regime_passed": features.sector_regime_passed,
+        "relative_strength_vs_sector": features.relative_strength_vs_sector,
+        "sector_relative_strength_window": features.sector_relative_strength_window,
+        "sector_relative_strength_watch_threshold": sector_relative_strength_watch_threshold,
+        "weak_sector_regime": weak_sector_regime,
+        "lagging_sector": features.lagging_sector,
     }
 
-    if stop_breached_intraday:
+    if features.stop_breached_intraday:
         rationale.append("An intraday bar traded through the current stop.")
         action = "EXIT CANDIDATE"
     elif (
-        peak_unrealized_pct >= meaningful_profit_pct
-        and session_high_giveback_pct >= session_high_giveback_exit_threshold
+        features.peak_unrealized_pct is not None
+        and features.session_high_giveback_pct is not None
+        and features.peak_unrealized_pct >= meaningful_profit_pct
+        and features.session_high_giveback_pct >= session_high_giveback_exit_threshold
+        and features.session_high is not None
     ):
         rationale.append(
             "Profitable position has given back "
-            f"{session_high_giveback_pct:.1%} from the session high of {session_high:.2f}."
+            f"{features.session_high_giveback_pct:.1%} from the session high of {features.session_high:.2f}."
         )
         action = "EXIT CANDIDATE"
-    elif stacked_intraday_weakness:
+    elif features.stacked_intraday_weakness and features.session_high_giveback_pct is not None:
         rationale.append(
             "Three corroborating weakness signals: below VWAP, "
-            f"{session_high_giveback_pct:.1%} giveback from session high, "
+            f"{features.session_high_giveback_pct:.1%} giveback from session high, "
             "and underperforming the benchmark intraday."
         )
         action = "EXIT CANDIDATE"
     elif (
-        peak_unrealized_pct >= intraday_high_profit_unrealized_pct
-        and session_high_giveback_pct >= intraday_high_profit_giveback_threshold
+        features.peak_unrealized_pct is not None
+        and features.session_high_giveback_pct is not None
+        and features.session_high is not None
+        and features.peak_unrealized_pct >= intraday_high_profit_unrealized_pct
+        and features.session_high_giveback_pct >= intraday_high_profit_giveback_threshold
     ):
         rationale.append(
-            f"Position has unrealized gains of {peak_unrealized_pct:.1%} but has given back "
-            f"{session_high_giveback_pct:.1%} from the session high of {session_high:.2f}; "
+            f"Position has unrealized gains of {features.peak_unrealized_pct:.1%} but has given back "
+            f"{features.session_high_giveback_pct:.1%} from the session high of {features.session_high:.2f}; "
             "protecting profit at a tighter threshold."
         )
         action = "EXIT CANDIDATE"
-    elif failed_intraday_strength and session_high_giveback_pct >= session_high_giveback_watch_threshold:
+    elif (
+        features.failed_intraday_strength
+        and features.session_high_giveback_pct is not None
+        and features.session_high_giveback_pct >= session_high_giveback_watch_threshold
+    ):
         rationale.append("Strong intraday move failed to hold into the latest bar.")
-        if session_vwap is not None and latest_close < session_vwap:
+        if features.session_vwap is not None and features.latest_close < features.session_vwap:
             rationale.append(
-                f"Latest close is below session VWAP ({session_vwap:.2f})."
+                f"Latest close is below session VWAP ({features.session_vwap:.2f})."
             )
         action = "EXIT CANDIDATE"
-    elif intraday_momentum_fade or weak_intraday_relative_strength or failed_intraday_strength:
-        if intraday_momentum_fade:
+    elif (
+        features.intraday_momentum_fade
+        or features.weak_intraday_relative_strength
+        or features.failed_intraday_strength
+    ):
+        if features.intraday_momentum_fade:
             rationale.append(
                 "Profitable position is fading intraday after a strong session high."
             )
-        if failed_intraday_strength:
+        if features.failed_intraday_strength:
             rationale.append("Strong intraday move is no longer holding the session range.")
-        if session_vwap is not None and latest_close < session_vwap:
+        if features.session_vwap is not None and features.latest_close < features.session_vwap:
             rationale.append(
-                f"Latest close is below session VWAP ({session_vwap:.2f})."
+                f"Latest close is below session VWAP ({features.session_vwap:.2f})."
             )
-        if weak_intraday_relative_strength and intraday_relative_strength_diff is not None:
+        if (
+            features.weak_intraday_relative_strength
+            and features.intraday_return_vs_benchmark is not None
+        ):
             rationale.append(
                 "Intraday return vs benchmark is "
-                f"{intraday_relative_strength_diff:.1%}."
+                f"{features.intraday_return_vs_benchmark:.1%}."
             )
         action = "WATCH CLOSELY"
     else:
         rationale.append("Intraday structure remains healthy and no stop or fade signal is active.")
         action = "HOLD"
 
-    if is_earnings_risk:
-        rationale.append(_earnings_risk_note(earnings_date, earnings_days_away))
+    if features.is_earnings_risk:
+        rationale.append(_earnings_risk_note(features.earnings_date, features.earnings_days_away))
         if action == "HOLD":
             rationale.append("Upcoming earnings add event risk to the position.")
             action = "WATCH CLOSELY"
@@ -754,12 +888,27 @@ def review_existing_long_position_intraday(
                 "Upcoming earnings still increase gap risk even though a higher stop is justified."
             )
 
+    if weak_sector_regime or features.lagging_sector:
+        if weak_sector_regime:
+            rationale.append(_sector_regime_note(features.sector_etf_symbol, features.sector_name))
+        if features.lagging_sector and features.relative_strength_vs_sector is not None:
+            rationale.append(
+                _sector_lag_note(
+                    features.sector_etf_symbol,
+                    sector_name=features.sector_name,
+                    relative_strength_vs_sector=features.relative_strength_vs_sector,
+                    window=features.sector_relative_strength_window,
+                )
+            )
+        if action == "HOLD":
+            action = "WATCH CLOSELY"
+
     return PortfolioReviewDecision(
-        latest_close=latest_close,
-        unrealized_pl_pct=unrealized_pl_pct,
-        distance_to_stop_pct=distance_to_stop_pct,
-        regime_passed=None,
-        above_entry=above_entry,
+        latest_close=features.latest_close,
+        unrealized_pl_pct=features.unrealized_pl_pct,
+        distance_to_stop_pct=features.distance_to_stop_pct,
+        regime_passed=features.regime_passed,
+        above_entry=features.above_entry,
         suggested_action=action,
         suggested_stop=None,
         trailing_stop_candidate=None,
@@ -828,26 +977,49 @@ def assess_signal_candidate(
     current_equity: float,
     base_risk_per_trade: float,
     constraints: PortfolioConstraints,
+    candidate_features: CandidateFeatures | None = None,
     current_positions: Sequence[ExistingPosition] = (),
     current_drawdown: float = 0.0,
     stop_price: float | None = None,
     earnings_date: date | None = None,
     earnings_days_away: int | None = None,
     earnings_entry_block_days: int | None = None,
+    sector_name: str | None = None,
+    industry_name: str | None = None,
+    sector_etf_symbol: str | None = None,
+    sector_regime_passed: bool | None = None,
+    relative_strength_vs_sector: float | None = None,
+    sector_relative_strength_window: int | None = None,
+    require_sector_regime_for_entries: bool = False,
+    sector_relative_strength_entry_reject_threshold: float | None = None,
 ) -> RiskAssessedCandidate:
     """Combine sizing and portfolio rules into one risk-assessed entry candidate."""
 
     existing_position = _find_existing_position(current_positions, signal.symbol)
-    if earnings_days_away is not None and earnings_days_away < 0:
-        raise ValueError("earnings_days_away cannot be negative.")
-    if earnings_entry_block_days is not None and earnings_entry_block_days <= 0:
-        raise ValueError("earnings_entry_block_days must be greater than zero when provided.")
     resolved_stop_price = signal.stop_hint if stop_price is None else stop_price
     adjusted_risk_per_trade = apply_drawdown_risk_adjustment(
         base_risk_per_trade,
         current_drawdown=current_drawdown,
         threshold=constraints.drawdown_risk_reduction_threshold,
         reduction_factor=constraints.drawdown_risk_reduction_factor,
+    )
+    features = candidate_features or build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        stop_hint=resolved_stop_price,
+        earnings_date=earnings_date,
+        earnings_days_away=earnings_days_away,
+        is_earnings_risk=bool(
+            earnings_days_away is not None
+            and earnings_entry_block_days is not None
+            and earnings_days_away <= earnings_entry_block_days
+        ),
+        sector_name=sector_name,
+        industry_name=industry_name,
+        sector_etf_symbol=sector_etf_symbol,
+        sector_regime_passed=sector_regime_passed,
+        relative_strength_vs_sector=relative_strength_vs_sector,
+        sector_relative_strength_window=sector_relative_strength_window,
     )
 
     if resolved_stop_price is None:
@@ -871,13 +1043,63 @@ def assess_signal_candidate(
             approved=False,
             rejection_reasons=(sizing.rejection_reason,),
             existing_position=existing_position,
+            features=features,
+        )
+    return _assess_signal_candidate_from_features(
+        signal,
+        features=features,
+        current_equity=current_equity,
+        adjusted_risk_per_trade=adjusted_risk_per_trade,
+        constraints=constraints,
+        current_positions=current_positions,
+        existing_position=existing_position,
+        stop_price=resolved_stop_price,
+        earnings_entry_block_days=earnings_entry_block_days,
+        require_sector_regime_for_entries=require_sector_regime_for_entries,
+        sector_relative_strength_entry_reject_threshold=(
+            sector_relative_strength_entry_reject_threshold
+        ),
+    )
+
+
+def _assess_signal_candidate_from_features(
+    signal: StrategySignal,
+    *,
+    features: CandidateFeatures,
+    current_equity: float,
+    adjusted_risk_per_trade: float,
+    constraints: PortfolioConstraints,
+    current_positions: Sequence[ExistingPosition],
+    existing_position: ExistingPosition | None,
+    stop_price: float,
+    earnings_entry_block_days: int | None,
+    require_sector_regime_for_entries: bool,
+    sector_relative_strength_entry_reject_threshold: float | None,
+) -> RiskAssessedCandidate:
+    if features.earnings_days_away is not None and features.earnings_days_away < 0:
+        raise ValueError("earnings_days_away cannot be negative.")
+    if earnings_entry_block_days is not None and earnings_entry_block_days <= 0:
+        raise ValueError("earnings_entry_block_days must be greater than zero when provided.")
+    if (
+        features.sector_relative_strength_window is not None
+        and features.sector_relative_strength_window <= 0
+    ):
+        raise ValueError(
+            "sector_relative_strength_window must be greater than zero when provided."
+        )
+    if (
+        sector_relative_strength_entry_reject_threshold is not None
+        and sector_relative_strength_entry_reject_threshold > 0
+    ):
+        raise ValueError(
+            "sector_relative_strength_entry_reject_threshold must be less than or equal to zero when provided."
         )
 
     sizing = size_position(
         current_equity=current_equity,
         risk_per_trade=adjusted_risk_per_trade,
         entry_price=signal.entry_price_hint,
-        stop_price=resolved_stop_price,
+        stop_price=stop_price,
         max_position_pct_equity=constraints.max_position_pct_equity,
     )
 
@@ -894,15 +1116,37 @@ def assess_signal_candidate(
         rejection_reasons.extend(rule_result.reasons)
 
     if (
-        earnings_days_away is not None
+        features.earnings_days_away is not None
         and earnings_entry_block_days is not None
-        and earnings_days_away <= earnings_entry_block_days
+        and features.earnings_days_away <= earnings_entry_block_days
     ):
         rejection_reasons.append(
             _earnings_entry_block_reason(
-                earnings_date=earnings_date,
-                earnings_days_away=earnings_days_away,
+                earnings_date=features.earnings_date,
+                earnings_days_away=features.earnings_days_away,
                 earnings_entry_block_days=earnings_entry_block_days,
+            )
+        )
+
+    if require_sector_regime_for_entries and features.sector_regime_passed is False:
+        rejection_reasons.append(
+            _sector_entry_regime_reject_reason(
+                features.sector_etf_symbol,
+                features.sector_name,
+            )
+        )
+
+    if (
+        features.relative_strength_vs_sector is not None
+        and sector_relative_strength_entry_reject_threshold is not None
+        and features.relative_strength_vs_sector <= sector_relative_strength_entry_reject_threshold
+    ):
+        rejection_reasons.append(
+            _sector_entry_lag_reject_reason(
+                features.sector_etf_symbol,
+                sector_name=features.sector_name,
+                relative_strength_vs_sector=features.relative_strength_vs_sector,
+                window=features.sector_relative_strength_window,
             )
         )
 
@@ -910,12 +1154,13 @@ def assess_signal_candidate(
     return RiskAssessedCandidate(
         signal=signal,
         entry_price=signal.entry_price_hint,
-        stop_price=resolved_stop_price,
+        stop_price=stop_price,
         adjusted_risk_per_trade=adjusted_risk_per_trade,
         sizing=sizing,
         approved=approved,
         rejection_reasons=tuple(rejection_reasons),
         existing_position=existing_position,
+        features=features,
     )
 
 
@@ -960,6 +1205,54 @@ def _earnings_entry_block_reason(
     return (
         f"Upcoming earnings on {earnings_date.isoformat()} are {earnings_days_away} "
         f"trading days away; new entries are blocked within {earnings_entry_block_days} trading days."
+    )
+
+
+def _sector_regime_note(sector_etf_symbol: str | None, sector_name: str | None) -> str:
+    if sector_etf_symbol is not None:
+        return f"Sector ETF {sector_etf_symbol} is below its trend filter."
+    if sector_name is not None:
+        return f"Sector context for {sector_name} is weak."
+    return "Sector context is weak."
+
+
+def _sector_lag_note(
+    sector_etf_symbol: str | None,
+    *,
+    sector_name: str | None,
+    relative_strength_vs_sector: float,
+    window: int | None,
+) -> str:
+    target = sector_etf_symbol or sector_name or "its sector"
+    window_text = f" over {window} trading days" if window is not None else ""
+    return (
+        f"Stock is lagging {target} by {abs(relative_strength_vs_sector):.1%}{window_text}."
+    )
+
+
+def _sector_entry_regime_reject_reason(
+    sector_etf_symbol: str | None,
+    sector_name: str | None,
+) -> str:
+    if sector_etf_symbol is not None:
+        return f"Sector ETF {sector_etf_symbol} is below its trend filter; new entries require sector support."
+    if sector_name is not None:
+        return f"Sector context for {sector_name} is weak; new entries require sector support."
+    return "Sector context is weak; new entries require sector support."
+
+
+def _sector_entry_lag_reject_reason(
+    sector_etf_symbol: str | None,
+    *,
+    sector_name: str | None,
+    relative_strength_vs_sector: float,
+    window: int | None,
+) -> str:
+    target = sector_etf_symbol or sector_name or "its sector"
+    window_text = f" over {window} trading days" if window is not None else ""
+    return (
+        f"Stock is lagging {target} by {abs(relative_strength_vs_sector):.1%}{window_text}; "
+        "new entries require sector-relative strength."
     )
 
 

@@ -207,6 +207,80 @@ def test_assess_signal_candidate_blocks_entry_near_earnings() -> None:
     )
 
 
+def test_assess_signal_candidate_rejects_weak_sector_regime() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        sector_name="Technology",
+        sector_etf_symbol="XLK",
+        sector_regime_passed=False,
+        require_sector_regime_for_entries=True,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Sector ETF XLK is below its trend filter; new entries require sector support.",
+    )
+
+
+def test_assess_signal_candidate_rejects_symbol_lagging_sector() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        sector_name="Technology",
+        sector_etf_symbol="XLK",
+        relative_strength_vs_sector=-0.062,
+        sector_relative_strength_window=20,
+        sector_relative_strength_entry_reject_threshold=-0.05,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Stock is lagging XLK by 6.2% over 20 trading days; new entries require sector-relative strength.",
+    )
+
+
+def test_assess_signal_candidate_does_not_block_unknown_sector_regime() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        sector_name="Technology",
+        sector_etf_symbol="XLK",
+        sector_regime_passed=None,
+        require_sector_regime_for_entries=True,
+    )
+
+    assert candidate.approved is True
+    assert candidate.rejection_reasons == ()
+
+
 def test_drawdown_risk_adjustment_reduces_risk_budget() -> None:
     adjusted_risk = apply_drawdown_risk_adjustment(
         0.01,
@@ -791,6 +865,57 @@ def test_review_existing_long_position_marks_near_earnings_as_watch() -> None:
     assert "event risk" in joined_rationale
 
 
+def test_review_existing_long_position_marks_sector_lag_as_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=112.0,
+        regime_passed=True,
+        trailing_stop_candidate=None,
+        sector_name="Technology",
+        sector_etf_symbol="XLK",
+        sector_regime_passed=True,
+        relative_strength_vs_sector=-0.062,
+        sector_relative_strength_window=20,
+        sector_relative_strength_watch_threshold=-0.05,
+    )
+
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert decision.metadata["lagging_sector"] is True
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "lagging xlk by 6.2% over 20 trading days" in joined_rationale
+
+
+def test_review_existing_long_position_raise_stop_notes_weak_sector_context() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=112.0,
+        regime_passed=True,
+        trailing_stop_candidate=101.0,
+        sector_name="Technology",
+        sector_etf_symbol="XLK",
+        sector_regime_passed=False,
+    )
+
+    assert decision.suggested_action == "RAISE STOP"
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "sector etf xlk is below its trend filter" in joined_rationale
+    assert "raising the stop improves risk control" in joined_rationale
+
+
 def test_review_existing_long_position_reports_earnings_today_cleanly() -> None:
     position = ExistingPosition(
         symbol="AAPL",
@@ -834,6 +959,35 @@ def test_review_existing_long_position_intraday_exits_on_stop_breach() -> None:
     assert decision.suggested_action == "EXIT CANDIDATE"
     assert decision.metadata["stop_breached_intraday"] is True
     assert "traded through the current stop" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_intraday_marks_sector_lag_as_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=100.0,
+        session_high=101.2,
+        session_low=99.7,
+        latest_close=100.9,
+        latest_low=100.6,
+        session_vwap=100.5,
+        relative_strength_vs_sector=-0.061,
+        sector_etf_symbol="XLK",
+        sector_name="Technology",
+        sector_relative_strength_window=20,
+        sector_relative_strength_watch_threshold=-0.05,
+    )
+
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert decision.metadata["lagging_sector"] is True
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "lagging xlk by 6.1% over 20 trading days" in joined_rationale
 
 
 def test_review_existing_long_position_intraday_exits_on_severe_session_high_giveback() -> None:

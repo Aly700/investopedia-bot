@@ -1369,12 +1369,24 @@ def score_risk_candidate_opportunity(
 ) -> tuple[float, dict[str, float]]:
     """Return a deterministic score and its components for a risk candidate."""
 
-    prior_high = _optional_float(candidate.signal.metadata.get("prior_high"))
-    relative_volume = _optional_float(candidate.signal.metadata.get("relative_volume"))
+    prior_high = (
+        candidate.features.prior_high
+        if candidate.features is not None
+        else _optional_float(candidate.signal.metadata.get("prior_high"))
+    )
+    relative_volume = (
+        candidate.features.relative_volume
+        if candidate.features is not None
+        else _optional_float(candidate.signal.metadata.get("relative_volume"))
+    )
     relative_volume_threshold = _optional_float(candidate.signal.metadata.get("relative_volume_threshold"))
 
-    breakout_pct = 0.0
-    if prior_high is not None and prior_high > 0 and candidate.entry_price > 0:
+    breakout_pct = (
+        candidate.features.breakout_strength
+        if candidate.features is not None and candidate.features.breakout_strength is not None
+        else 0.0
+    )
+    if breakout_pct == 0.0 and prior_high is not None and prior_high > 0 and candidate.entry_price > 0:
         breakout_pct = max((candidate.entry_price - prior_high) / prior_high, 0.0)
 
     relative_volume_ratio = 0.0
@@ -1389,15 +1401,26 @@ def score_risk_candidate_opportunity(
         if current_equity > 0
         else 0.0
     )
+    candidate_memory_score = max(
+        (
+            candidate.features.setup_quality_score
+            if candidate.features is not None
+            else _optional_float(candidate.signal.metadata.get("setup_quality_score"))
+        )
+        or 0.0,
+        0.0,
+    )
     score = (
         breakout_pct * 1000.0
         + relative_volume_ratio * 100.0
         + position_pct_equity * 25.0
+        + candidate_memory_score * 15.0
     )
     return score, {
         "breakout_pct": breakout_pct,
         "relative_volume_ratio": relative_volume_ratio,
         "position_pct_equity": position_pct_equity,
+        "candidate_memory_score": candidate_memory_score,
     }
 
 

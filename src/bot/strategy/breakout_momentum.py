@@ -46,6 +46,10 @@ class BreakoutMomentumSettings:
     intraday_high_profit_giveback_threshold: float = 0.07
     earnings_entry_block_days: int = 3
     earnings_watch_days: int = 7
+    require_sector_regime_for_entries: bool = True
+    sector_relative_strength_window: int = 20
+    sector_relative_strength_entry_reject_threshold: float = -0.05
+    sector_relative_strength_watch_threshold: float = -0.05
 
     @classmethod
     def from_configs(
@@ -75,6 +79,14 @@ class BreakoutMomentumSettings:
             relative_volume_window=relative_volume_window,
             earnings_entry_block_days=signal_config.earnings_entry_block_days,
             earnings_watch_days=signal_config.earnings_watch_days,
+            require_sector_regime_for_entries=signal_config.require_sector_regime_for_entries,
+            sector_relative_strength_window=signal_config.sector_relative_strength_window,
+            sector_relative_strength_entry_reject_threshold=(
+                signal_config.sector_relative_strength_entry_reject_threshold
+            ),
+            sector_relative_strength_watch_threshold=(
+                signal_config.sector_relative_strength_watch_threshold
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -104,6 +116,16 @@ class BreakoutMomentumSettings:
             raise ValueError("earnings_entry_block_days must be greater than zero.")
         if self.earnings_watch_days <= 0:
             raise ValueError("earnings_watch_days must be greater than zero.")
+        if self.sector_relative_strength_window <= 0:
+            raise ValueError("sector_relative_strength_window must be greater than zero.")
+        if self.sector_relative_strength_entry_reject_threshold > 0:
+            raise ValueError(
+                "sector_relative_strength_entry_reject_threshold must be less than or equal to zero."
+            )
+        if self.sector_relative_strength_watch_threshold > 0:
+            raise ValueError(
+                "sector_relative_strength_watch_threshold must be less than or equal to zero."
+            )
         if self.regime_filter_mode not in VALID_REGIME_FILTER_MODES:
             raise ValueError(
                 "regime_filter_mode must be one of "
@@ -540,6 +562,45 @@ def build_breakout_rationale(
             f"earnings={earnings_date} ({earnings_days_away} trading days)"
         )
 
+    setup_persistence_days = _metadata_int(metadata.get("setup_persistence_days"))
+    days_approved = _metadata_int(metadata.get("days_approved"))
+    setup_notes: list[str] = []
+    if bool(metadata.get("repeated_high_quality_signal")):
+        setup_notes.append("high-confidence repeat signal")
+    if setup_persistence_days is not None and setup_persistence_days > 1:
+        setup_notes.append(f"persisted for {setup_persistence_days} sessions")
+    if days_approved is not None and days_approved > 1:
+        setup_notes.append(f"approved on {days_approved} sessions")
+    if setup_notes:
+        parts.append(f"setup={', '.join(setup_notes)}")
+
+    sector_etf_symbol = _metadata_text(metadata.get("sector_etf_symbol"))
+    sector_regime_passed = metadata.get("sector_regime_passed")
+    relative_strength_vs_sector = _metadata_float(metadata.get("relative_strength_vs_sector"))
+    sector_relative_strength_window = _metadata_int(
+        metadata.get("sector_relative_strength_window")
+    )
+    if sector_etf_symbol is not None:
+        sector_notes: list[str] = []
+        if sector_regime_passed is True:
+            sector_notes.append("trend supportive")
+        elif sector_regime_passed is False:
+            sector_notes.append("below trend filter")
+        if relative_strength_vs_sector is not None:
+            window_label = (
+                f" over {sector_relative_strength_window}d"
+                if sector_relative_strength_window is not None
+                else ""
+            )
+            if relative_strength_vs_sector > 0:
+                sector_notes.append(f"leads by {relative_strength_vs_sector:.1%}{window_label}")
+            elif relative_strength_vs_sector < 0:
+                sector_notes.append(
+                    f"lags by {abs(relative_strength_vs_sector):.1%}{window_label}"
+                )
+        if sector_notes:
+            parts.append(f"sector={sector_etf_symbol} ({', '.join(sector_notes)})")
+
     return "; ".join(parts)
 
 
@@ -612,6 +673,14 @@ def _build_signal_metadata(
         "atr": _optional_float(latest_row["atr"]),
         "earnings_entry_block_days": settings.earnings_entry_block_days,
         "earnings_watch_days": settings.earnings_watch_days,
+        "require_sector_regime_for_entries": settings.require_sector_regime_for_entries,
+        "sector_relative_strength_window": settings.sector_relative_strength_window,
+        "sector_relative_strength_entry_reject_threshold": (
+            settings.sector_relative_strength_entry_reject_threshold
+        ),
+        "sector_relative_strength_watch_threshold": (
+            settings.sector_relative_strength_watch_threshold
+        ),
     }
 
 
