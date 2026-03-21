@@ -1088,11 +1088,12 @@ def test_run_portfolio_review_workflow_skips_symbols_with_value_errors(
     assert payload["reviewed_symbol_count"] == 1
 
 
-def test_intraday_portfolio_review_brief_separates_pressure_and_healthy_holdings(
+def test_intraday_portfolio_review_brief_avoids_duplicate_exit_rows_across_sections(
     tmp_path: Path,
 ) -> None:
     current_positions = [
         ExistingPosition(symbol="AAPL", shares=10, average_entry_price=100.0, current_stop=95.0, preset_name="standard_breakout"),
+        ExistingPosition(symbol="ABNB", shares=7, average_entry_price=100.0, current_stop=91.0, preset_name="standard_breakout"),
         ExistingPosition(symbol="AMD", shares=8, average_entry_price=100.0, current_stop=90.0, preset_name="standard_breakout"),
         ExistingPosition(symbol="MSFT", shares=6, average_entry_price=100.0, current_stop=95.0, preset_name="standard_breakout"),
     ]
@@ -1123,6 +1124,29 @@ def test_intraday_portfolio_review_brief_separates_pressure_and_healthy_holdings
                     "session_vwap": 108.0,
                     "session_high": 112.0,
                     "session_high_giveback_pct": 0.143,
+                },
+            ),
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="ABNB",
+                quantity=7,
+                average_entry_price=100.0,
+                current_stop=91.0,
+                suggested_stop=None,
+                latest_close=104.0,
+                unrealized_pl_pct=0.04,
+                distance_to_stop_pct=(104.0 - 91.0) / 104.0,
+                regime_passed=None,
+                above_entry=True,
+                suggested_action="WATCH CLOSELY",
+                preset_name="standard_breakout",
+                rationale="Strong intraday move is no longer holding the session range.",
+                metadata={
+                    "failed_intraday_strength": False,
+                    "session_vwap": 106.0,
+                    "session_high": 109.0,
+                    "session_high_giveback_pct": (109.0 - 104.0) / 109.0,
+                    "session_high_giveback_exit_threshold": 0.10,
                 },
             ),
             PortfolioReviewRow(
@@ -1180,16 +1204,22 @@ def test_intraday_portfolio_review_brief_separates_pressure_and_healthy_holdings
     assert "Urgent intraday actions" in text
     assert "Current holdings under pressure" in text
     assert "Holdings still healthy" in text
+    assert text.count("AAPL") == 1
     urgent_section = text.split("Urgent intraday actions\n", 1)[1].split("\n\nCurrent holdings under pressure", 1)[0]
     pressure_section = text.split("Current holdings under pressure\n", 1)[1].split("\n\nHoldings still healthy", 1)[0]
     healthy_section = text.split("Holdings still healthy\n", 1)[1]
     assert "AAPL" in urgent_section
     assert "AMD" not in urgent_section
-    assert "AAPL" in pressure_section
+    assert pressure_section.count("AAPL") == 0
+    assert "ABNB" in pressure_section
     assert "AMD" in pressure_section
     assert "MSFT" not in pressure_section
     assert "MSFT" in healthy_section
     assert "AAPL" not in healthy_section
+    assert healthy_section.count("MSFT") == 1
+    pressure_lines = [line for line in pressure_section.splitlines() if line.startswith("- ")]
+    assert "| ABNB |" in pressure_lines[0]
+    assert "| AMD |" in pressure_lines[1]
 
 
 def test_intraday_session_metrics_uses_full_multi_bar_session() -> None:

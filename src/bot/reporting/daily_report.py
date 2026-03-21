@@ -667,15 +667,16 @@ class IntradayPortfolioReviewReport:
                 )
             )
         ]
+        urgent_row_ids = {id(row) for row in urgent_rows}
         pressure_rows = [
             row
             for row in sorted_rows
-            if row.suggested_action in {"EXIT CANDIDATE", "WATCH CLOSELY"}
+            if row.suggested_action == "WATCH CLOSELY" and id(row) not in urgent_row_ids
         ]
         healthy_rows = [
             row
             for row in sorted_rows
-            if row.suggested_action in {"HOLD", "RAISE STOP"}
+            if row.suggested_action == "HOLD"
         ]
 
         exit_count = sum(row.suggested_action == "EXIT CANDIDATE" for row in self.rows)
