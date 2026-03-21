@@ -117,6 +117,8 @@ MARKET_MONITOR_CATEGORIES = (
 MARKET_MONITOR_CATEGORY_PRIORITY = {
     category: priority for priority, category in enumerate(MARKET_MONITOR_CATEGORIES)
 }
+MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT = 5
+MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT = 5
 
 
 def market_monitor_flat_count_key(category: str) -> str:
@@ -671,6 +673,8 @@ class MarketMonitorReport:
     preset_names: tuple[str, ...]
     benchmark_symbol: str | None
     alerts: tuple[MarketMonitorAlertRow, ...]
+    ranked_opportunity_rows: tuple[DailyResearchOpportunityRow, ...] = ()
+    portfolio_review_rows: tuple[PortfolioReviewRow, ...] = ()
 
     @property
     def category_counts(self) -> dict[str, int]:
@@ -734,27 +738,31 @@ class MarketMonitorReport:
         """Return a human-readable trader brief for the monitor run."""
 
         counts = self.category_counts
-        actionable_alerts = [
-            alert
-            for alert in self.alerts
-            if alert.category in {"EXIT CANDIDATE", "RAISE STOP", "BUY CANDIDATE"}
+        approved_buy_rows = [
+            row for row in self.ranked_opportunity_rows if row.status == "approved"
         ]
-        holding_alerts = [
-            alert
-            for alert in self.alerts
-            if alert.category in {"EXIT CANDIDATE", "RAISE STOP", "WATCH CLOSELY", "HOLD"}
+        lower_priority_buy_rows = list(approved_buy_rows[MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT:]) + [
+            row for row in self.ranked_opportunity_rows if row.status != "approved"
         ]
-        buy_alerts = [alert for alert in self.alerts if alert.category == "BUY CANDIDATE"]
-        lower_priority_alerts = [
-            alert
-            for alert in self.alerts
-            if alert.category in {"WATCH CLOSELY", "HOLD", "NO ACTION"}
+        top_buy_rows = approved_buy_rows[:MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT]
+        holding_rows = sorted(
+            self.portfolio_review_rows,
+            key=lambda row: (
+                MARKET_MONITOR_CATEGORY_PRIORITY.get(row.suggested_action, 99),
+                row.symbol,
+                row.preset_name or "",
+            ),
+        )
+        urgent_holding_rows = [
+            row
+            for row in holding_rows
+            if row.suggested_action in {"EXIT CANDIDATE", "RAISE STOP"}
         ]
 
         lines = [f"Market monitor brief for {self.as_of_date.isoformat()}", "", "Headline"]
         lines.append(
-            f"Actionable now: {len(actionable_alerts)} | "
-            f"Buys: {counts['BUY CANDIDATE']} | "
+            f"Actionable now: {len(top_buy_rows) + len(urgent_holding_rows)} | "
+            f"Top buys shown: {len(top_buy_rows)} | "
             f"Raise stop: {counts['RAISE STOP']} | "
             f"Exit: {counts['EXIT CANDIDATE']} | "
             f"Watch: {counts['WATCH CLOSELY']}"
@@ -765,32 +773,46 @@ class MarketMonitorReport:
         )
 
         lines.extend(("", "Best actions now"))
-        if actionable_alerts:
-            for alert in actionable_alerts:
-                lines.append(_market_monitor_brief_line(alert))
-        else:
+        if not urgent_holding_rows and not top_buy_rows:
             lines.append("No immediate action is required.")
+        else:
+            if urgent_holding_rows:
+                lines.append(
+                    "- Urgent holdings: "
+                    + ", ".join(
+                        f"{row.symbol} ({row.suggested_action})"
+                        for row in urgent_holding_rows
+                    )
+                )
+            if top_buy_rows:
+                lines.append(
+                    "- Best buys: "
+                    + ", ".join(row.symbol for row in top_buy_rows)
+                )
 
         lines.extend(("", "Current holdings"))
-        if holding_alerts:
-            for alert in holding_alerts:
-                lines.append(_market_monitor_brief_line(alert))
+        if holding_rows:
+            for row in holding_rows:
+                lines.append(_portfolio_review_brief_line(row))
         else:
             lines.append("No held positions were reviewed.")
 
         lines.extend(("", "Top buy candidates"))
-        if buy_alerts:
-            for alert in buy_alerts[:5]:
-                lines.append(_market_monitor_brief_line(alert))
+        if top_buy_rows:
+            for row in top_buy_rows:
+                lines.append(_daily_research_monitor_brief_line(row))
         else:
             lines.append("No approved buy candidates.")
 
         lines.extend(("", "Lower-priority names"))
-        if lower_priority_alerts:
-            for alert in lower_priority_alerts:
-                lines.append(_market_monitor_brief_line(alert))
+        if lower_priority_buy_rows:
+            for row in lower_priority_buy_rows[:MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT]:
+                lines.append(_daily_research_monitor_brief_line(row))
+            remaining_count = len(lower_priority_buy_rows) - MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT
+            if remaining_count > 0:
+                lines.append(f"- {remaining_count} more lower-priority buy candidates not shown.")
         else:
-            lines.append("No lower-priority names.")
+            lines.append("No lower-priority buy candidates.")
 
         return "\n".join(lines).rstrip() + "\n"
 
@@ -909,6 +931,16 @@ def build_market_monitor_report(
         preset_names=tuple(dict.fromkeys(preset_names)),
         benchmark_symbol=benchmark_symbol,
         alerts=tuple(alerts),
+        ranked_opportunity_rows=(
+            tuple(daily_summary.rows)
+            if daily_summary is not None
+            else ()
+        ),
+        portfolio_review_rows=(
+            tuple(portfolio_review.rows)
+            if portfolio_review is not None
+            else ()
+        ),
     )
 
 
@@ -1552,6 +1584,21 @@ def _daily_research_brief_card(row: DailyResearchOpportunityRow) -> list[str]:
     ]
 
 
+def _daily_research_monitor_brief_line(row: DailyResearchOpportunityRow) -> str:
+    if row.status == "approved":
+        return (
+            f"- {row.rank}. {row.symbol} | preset={row.preset_name} | "
+            f"qty={row.quantity} | entry={_brief_value(row.entry_price_hint)} | "
+            f"stop={_brief_value(row.stop_level)} | note={_single_line(row.rationale)}"
+        )
+
+    reason = row.rejection_reasons[0] if row.rejection_reasons else row.rationale
+    return (
+        f"- {row.rank}. {row.symbol} | preset={row.preset_name} | "
+        f"status={row.status} | reason={_single_line(reason)}"
+    )
+
+
 def _market_monitor_brief_line(alert: MarketMonitorAlertRow) -> str:
     parts = [alert.category]
     if alert.symbol:
@@ -1569,6 +1616,19 @@ def _market_monitor_brief_line(alert: MarketMonitorAlertRow) -> str:
     if alert.latest_close is not None:
         parts.append(f"close={_brief_value(alert.latest_close)}")
     parts.append(f"note={_single_line(alert.rationale)}")
+    return "- " + " | ".join(parts)
+
+
+def _portfolio_review_brief_line(row: PortfolioReviewRow) -> str:
+    parts = [row.suggested_action, row.symbol]
+    if row.preset_name:
+        parts.append(f"preset={row.preset_name}")
+    if row.current_stop is not None:
+        parts.append(f"current_stop={_brief_value(row.current_stop)}")
+    if row.suggested_stop is not None:
+        parts.append(f"suggested_stop={_brief_value(row.suggested_stop)}")
+    parts.append(f"close={_brief_value(row.latest_close)}")
+    parts.append(f"note={_single_line(row.rationale)}")
     return "- " + " | ".join(parts)
 
 

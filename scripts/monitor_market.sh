@@ -20,6 +20,7 @@ PRESET_NAMES="${INVESTOPEDIA_BOT_PRESET_NAMES:-standard_breakout}"
 OUTPUT_BASE="${INVESTOPEDIA_BOT_OUTPUT_BASE:-$REPO_ROOT/data/processed/monitor_market}"
 OUTPUT_DIR="$OUTPUT_BASE/$AS_OF_DATE"
 MONITOR_TEXT_PATH="$OUTPUT_DIR/market_monitor.txt"
+MONITOR_BRIEF_PATH="$OUTPUT_DIR/market_monitor_brief.txt"
 NOTIFY_ENABLED="${INVESTOPEDIA_BOT_NOTIFY:-true}"
 NOTIFY_LOCAL="${INVESTOPEDIA_BOT_NOTIFY_LOCAL:-true}"
 NOTIFY_DISCORD="${INVESTOPEDIA_BOT_NOTIFY_DISCORD:-true}"
@@ -83,6 +84,57 @@ summarize_alert_lines() {
   grep -E "$pattern" "$MONITOR_TEXT_PATH" | head -n "$max_lines" || true
 }
 
+brief_available() {
+  [ -f "$MONITOR_BRIEF_PATH" ]
+}
+
+extract_brief_section() {
+  local heading="$1"
+
+  if ! brief_available; then
+    return 0
+  fi
+
+  awk -v heading="$heading" '
+    $0 == heading { in_section = 1; next }
+    in_section && $0 == "" { exit }
+    in_section { print }
+  ' "$MONITOR_BRIEF_PATH"
+}
+
+join_nonempty_lines() {
+  local separator="$1"
+  local summary=""
+  local line
+
+  while IFS= read -r line; do
+    if [ -z "$line" ]; then
+      continue
+    fi
+    if [ -z "$summary" ]; then
+      summary="$line"
+    else
+      summary="$summary$separator$line"
+    fi
+  done
+
+  printf '%s\n' "$summary"
+}
+
+brief_section_lines() {
+  local heading="$1"
+  local max_lines="${2:-3}"
+
+  extract_brief_section "$heading" | head -n "$max_lines" || true
+}
+
+brief_section_summary() {
+  local heading="$1"
+  local max_lines="${2:-2}"
+
+  join_nonempty_lines "; " < <(brief_section_lines "$heading" "$max_lines")
+}
+
 truncate_message() {
   local message="$1"
   local max_length="${2:-1500}"
@@ -127,9 +179,37 @@ build_discord_message() {
   local heading="$1"
   local counts_pattern="$2"
   local detail_pattern="$3"
+  local headline
+  local best_actions
+  local top_buys
+  local current_holdings
   local counts
   local details
   local message
+
+  if brief_available; then
+    headline="$(brief_section_summary "Headline" 2)"
+    best_actions="$(brief_section_lines "Best actions now" 3)"
+    top_buys="$(brief_section_lines "Top buy candidates" 3)"
+    current_holdings="$(brief_section_lines "Current holdings" 3)"
+
+    message="**$heading**"
+    if [ -n "$headline" ]; then
+      message="$message"$'\n'"$headline"
+    fi
+    if [ -n "$best_actions" ] && [ "$best_actions" != "No immediate action is required." ]; then
+      message="$message"$'\n\n'"Best actions now"$'\n'"$best_actions"
+    fi
+    if [ -n "$top_buys" ] && [ "$top_buys" != "No approved buy candidates." ]; then
+      message="$message"$'\n\n'"Top buy candidates"$'\n'"$top_buys"
+    fi
+    if [ -n "$current_holdings" ] && [ "$current_holdings" != "No held positions were reviewed." ]; then
+      message="$message"$'\n\n'"Current holdings"$'\n'"$current_holdings"
+    fi
+
+    truncate_message "$message"
+    return 0
+  fi
 
   counts="$(summarize_alert_counts "$counts_pattern")"
   details="$(summarize_alert_lines "$detail_pattern" 5)"
@@ -143,6 +223,37 @@ build_discord_message() {
   fi
 
   truncate_message "$message"
+}
+
+build_local_notification_message() {
+  local fallback_message="$1"
+  local headline
+  local primary_line
+  local summary
+
+  if ! brief_available; then
+    printf '%s\n' "$fallback_message"
+    return 0
+  fi
+
+  headline="$(brief_section_summary "Headline" 2)"
+  primary_line="$(brief_section_lines "Best actions now" 1 | sed 's/^- //')"
+
+  if [ -z "$primary_line" ] || [ "$primary_line" = "No immediate action is required." ]; then
+    primary_line="$(brief_section_lines "Lower-priority names" 1 | sed 's/^- //')"
+  fi
+
+  if [ -n "$headline" ] && [ -n "$primary_line" ]; then
+    summary="$headline"$'\n'"$primary_line"
+  elif [ -n "$headline" ]; then
+    summary="$headline"
+  elif [ -n "$primary_line" ]; then
+    summary="$primary_line"
+  else
+    summary="$fallback_message"
+  fi
+
+  truncate_message "$summary" 220
 }
 
 send_discord_notification() {
@@ -190,9 +301,14 @@ send_local_notification() {
   local subtitle="$1"
   local message="$2"
   local notifier_bin
+  local open_path="$MONITOR_TEXT_PATH"
 
   if ! is_truthy "$NOTIFY_ENABLED" || ! is_truthy "$NOTIFY_LOCAL"; then
     return 0
+  fi
+
+  if brief_available; then
+    open_path="$MONITOR_BRIEF_PATH"
   fi
 
   notifier_bin="$(resolve_terminal_notifier)"
@@ -206,7 +322,7 @@ send_local_notification() {
     -subtitle "$subtitle"
     -message "$message"
     -group "$NOTIFY_GROUP"
-    -open "file://$MONITOR_TEXT_PATH"
+    -open "file://$open_path"
   )
 
   if [ -n "$NOTIFY_SOUND" ] && [ "$NOTIFY_SOUND" != "none" ]; then
@@ -232,7 +348,7 @@ maybe_notify() {
       "^(BUY CANDIDATE|RAISE STOP|EXIT CANDIDATE) \\|"
     send_local_notification \
       "Actionable monitor alerts" \
-      "$(summarize_alert_counts '^(BUY CANDIDATE|RAISE STOP|EXIT CANDIDATE): ')"
+      "$(build_local_notification_message "$(summarize_alert_counts '^(BUY CANDIDATE|RAISE STOP|EXIT CANDIDATE): ')")"
     return 0
   fi
 
@@ -243,7 +359,7 @@ maybe_notify() {
       "^WATCH CLOSELY \\|"
     send_local_notification \
       "Watch closely" \
-      "$(summarize_alert_counts '^WATCH CLOSELY: ')"
+      "$(build_local_notification_message "$(summarize_alert_counts '^WATCH CLOSELY: ')")"
   fi
 }
 
