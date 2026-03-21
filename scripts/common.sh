@@ -11,7 +11,7 @@ fi
 
 : "${BOT_PYTHON:=.venv/bin/python}"
 : "${BOT_MAIN:=src}"
-: "${BOT_DATE:=$(date +%F)}"
+: "${BOT_DATE:=$(TZ=America/New_York date +%F)}"
 : "${BOT_PORTFOLIO_FILE:=data/processed/portfolio/current_positions.csv}"
 : "${BOT_PRESET:=aggressive_breakout}"
 : "${BOT_UNIVERSE_DEFAULT:=data/raw/candidate_symbols_quality_liquid.txt}"

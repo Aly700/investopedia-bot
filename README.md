@@ -436,7 +436,7 @@ This command:
 - reuses the existing `daily-summary` scan to find approved `BUY CANDIDATE` entries
 - reuses `review-portfolio` logic to classify current holdings as `HOLD`, `WATCH CLOSELY`, `RAISE STOP`, or `EXIT CANDIDATE`
 - combines both into a compact machine-readable alert payload
-- writes `market_monitor.json`, `market_monitor.csv`, and a plain-text `market_monitor.txt` summary for later notification delivery
+- writes `market_monitor.json`, `market_monitor.csv`, the existing raw `market_monitor.txt`, and a human-readable `market_monitor_brief.txt` for later notification delivery
 
 This is the background-friendly layer for automation. On macOS, prefer `launchd` over `cron` or a constantly running shell loop, then hand the JSON or text file to a future email, Discord, Telegram, or other notifier without changing the trading logic itself.
 
@@ -480,19 +480,22 @@ brew install terminal-notifier
 
 On Apple Silicon Macs, Homebrew commonly installs `terminal-notifier` at `/opt/homebrew/bin/terminal-notifier`. `launchd` jobs usually do not inherit the same `PATH` as an interactive Terminal shell, so a command that works in Terminal may still be missing when the LaunchAgent runs.
 
-After `monitor-market` finishes and writes `market_monitor.txt`, the wrapper checks the category counts in that file:
+After `monitor-market` finishes, the wrapper still checks the category counts in `market_monitor.txt` to preserve the current trigger rules:
 
 - sends an actionable notification when `BUY CANDIDATE`, `RAISE STOP`, or `EXIT CANDIDATE` is greater than zero
 - sends a lower-priority notification for `WATCH CLOSELY` when there are no actionable alerts and `INVESTOPEDIA_BOT_NOTIFY_ON_WATCH=true`
 - sends no notification for pure `NO ACTION` runs by default
 
-Discord webhook alerts are the primary remote path in the wrapper. If `INVESTOPEDIA_BOT_DISCORD_WEBHOOK` is set and `INVESTOPEDIA_BOT_NOTIFY_DISCORD=true`, the wrapper sends a compact Discord message with:
+Discord webhook alerts are the primary remote path in the wrapper. If `INVESTOPEDIA_BOT_DISCORD_WEBHOOK` is set and `INVESTOPEDIA_BOT_NOTIFY_DISCORD=true`, the wrapper prefers `market_monitor_brief.txt` for the human-facing message and falls back to `market_monitor.txt` if the brief is unavailable.
+When the brief exists, the Discord payload uses a compact version of:
 
-- the as-of date
-- the key category count summary
-- the relevant alert lines from `market_monitor.txt`
+- the headline summary
+- the best-actions section
+- the top buy candidates
+- the current-holdings section
 
 The wrapper keeps the message compact and trims it before sending so it stays readable in Discord.
+Local macOS notifications follow the same preference order: brief first when present, raw count-based fallback when not.
 
 The wrapper resolves `terminal-notifier` in this order:
 
@@ -623,7 +626,7 @@ Disable notifications without disabling the LaunchAgent:
 Outputs and logs:
 
 - monitor outputs: `data/processed/monitor_market/YYYY-MM-DD/market_monitor.json`
-- CSV/text summaries: `data/processed/monitor_market/YYYY-MM-DD/market_monitor.csv` and `market_monitor.txt`
+- CSV/text summaries: `data/processed/monitor_market/YYYY-MM-DD/market_monitor.csv`, `market_monitor.txt`, and `market_monitor_brief.txt`
 - recommended market-hours logs: `data/logs/launchd/monitor-market.market-hours.out.log` and `monitor-market.market-hours.err.log`
 - optional single-run logs: `data/logs/launchd/monitor-market.after-close.out.log`, `monitor-market.after-close.err.log`, `monitor-market.market-open.out.log`, and `monitor-market.market-open.err.log`
 
