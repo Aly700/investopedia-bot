@@ -17,6 +17,7 @@ from bot.risk.portfolio_rules import (
     initialize_portfolio_snapshot,
     load_existing_positions,
     review_existing_long_position,
+    review_existing_long_position_intraday,
     remove_existing_position_snapshot,
     update_existing_position_stop_snapshot,
     upsert_existing_position_snapshot,
@@ -738,6 +739,127 @@ def test_review_existing_long_position_marks_stale_weak_relative_strength_as_wat
     joined_rationale = " ".join(decision.rationale).lower()
     assert "trading days without a new closing high" in joined_rationale
     assert "relative strength" in joined_rationale
+
+
+def test_review_existing_long_position_intraday_exits_on_stop_breach() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=110.0,
+        session_high=112.0,
+        session_low=94.0,
+        latest_close=96.0,
+        latest_low=95.0,
+        session_vwap=108.0,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["stop_breached_intraday"] is True
+    assert "traded through the current stop" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_intraday_exits_on_severe_session_high_giveback() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=110.0,
+        session_high=130.0,
+        session_low=108.0,
+        latest_close=115.0,
+        latest_low=114.0,
+        session_vwap=120.0,
+        session_high_giveback_exit_threshold=0.08,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["session_high_giveback_pct"] == pytest.approx((130.0 - 115.0) / 130.0)
+    assert "session high" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_intraday_marks_fade_as_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=110.0,
+        session_high=116.0,
+        session_low=107.0,
+        latest_close=107.0,
+        latest_low=107.0,
+        session_vwap=111.0,
+    )
+
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert decision.metadata["intraday_momentum_fade"] is True
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "fading intraday" in joined_rationale
+    assert "session vwap" in joined_rationale
+
+
+def test_review_existing_long_position_intraday_exits_on_failed_intraday_strength() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=120.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=100.0,
+        session_high=108.0,
+        session_low=96.0,
+        latest_close=97.0,
+        latest_low=96.5,
+        session_vwap=101.0,
+        session_high_giveback_exit_threshold=0.08,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["failed_intraday_strength"] is True
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "failed to hold" in joined_rationale
+    assert "session vwap" in joined_rationale
+
+
+def test_review_existing_long_position_intraday_keeps_healthy_position_on_hold() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=110.0,
+        session_high=114.0,
+        session_low=109.0,
+        latest_close=113.0,
+        latest_low=112.0,
+        session_vwap=111.0,
+    )
+
+    assert decision.suggested_action == "HOLD"
+    assert decision.metadata["intraday_momentum_fade"] is False
+    assert decision.metadata["stop_breached_intraday"] is False
 
 
 def test_review_existing_long_position_clears_stop_for_weak_regime_exit_candidate() -> None:

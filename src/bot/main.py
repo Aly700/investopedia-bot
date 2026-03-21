@@ -64,10 +64,12 @@ from bot.execution.manual_executor import (
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
 from bot.reporting.daily_report import (
+    IntradayPortfolioReviewReport,
     PresetCandidateEvaluation,
     PortfolioReviewReport,
     PortfolioReviewRow,
     build_daily_research_summary,
+    build_intraday_portfolio_review_report,
     build_market_monitor_report,
     build_portfolio_review_report,
     build_daily_signal_report,
@@ -78,6 +80,8 @@ from bot.reporting.daily_report import (
     write_market_monitor_brief,
     write_market_monitor_text_summary,
     write_daily_preset_summary,
+    write_intraday_portfolio_review_brief,
+    write_intraday_portfolio_review_report,
     write_portfolio_review_report,
     write_daily_research_summary,
     write_daily_signal_report,
@@ -94,6 +98,7 @@ from bot.risk.portfolio_rules import (
     load_existing_positions,
     remove_existing_position_snapshot,
     review_existing_long_position,
+    review_existing_long_position_intraday,
     update_existing_position_stop_snapshot,
     upsert_existing_position_snapshot,
 )
@@ -108,6 +113,10 @@ from bot.strategy.regime_filter import regime_is_bullish
 
 
 LOGGER = get_logger(__name__)
+
+
+class NoIntradayDataError(ValueError):
+    """Raised when an intraday review session has no usable regular-session bars."""
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -434,6 +443,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass local cache and force provider fetches.",
     )
     review_portfolio_parser.set_defaults(handler=_handle_review_portfolio)
+
+    review_portfolio_intraday_parser = subparsers.add_parser(
+        "review-portfolio-intraday",
+        help="Review current holdings with intraday bars for scheduled sell monitoring.",
+    )
+    review_portfolio_intraday_parser.add_argument(
+        "--portfolio-file",
+        type=Path,
+        required=True,
+        help="CSV or JSON portfolio snapshot to review.",
+    )
+    review_portfolio_intraday_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Trading session date to review.",
+    )
+    review_portfolio_intraday_parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=15,
+        help="Intraday aggregate interval in minutes.",
+    )
+    review_portfolio_intraday_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for intraday relative-strength context.",
+    )
+    review_portfolio_intraday_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for intraday review CSV, JSON, and brief outputs.",
+    )
+    review_portfolio_intraday_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    review_portfolio_intraday_parser.set_defaults(handler=_handle_review_portfolio_intraday)
 
     monitor_market_parser = subparsers.add_parser(
         "monitor-market",
@@ -1324,6 +1374,74 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    current_positions = _load_current_positions(args.portfolio_file)
+    provider = (
+        create_daily_bar_provider(config, env_file=args.env_file)
+        if current_positions
+        else None
+    )
+    try:
+        report = _run_portfolio_review_intraday_workflow(
+            args,
+            config=config,
+            provider=provider,
+            current_positions=current_positions,
+        )
+    except NoIntradayDataError as exc:
+        payload = {
+            "status": "skipped",
+            "reason": "no_intraday_data",
+            "message": str(exc),
+            "portfolio_path": str(args.portfolio_file.resolve()),
+            "interval_minutes": args.interval_minutes,
+            "position_count": len(current_positions),
+            "symbols_reviewed": [],
+            "outputs": {},
+        }
+        _print_structured(payload, output_format=args.format)
+        return 0
+    output_dir = (
+        args.output_dir
+        or _default_intraday_portfolio_output_dir(config.project_root, args.as_of)
+    ).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    review_json_path = write_intraday_portfolio_review_report(
+        report,
+        output_dir / "portfolio_review_intraday.json",
+    )
+    review_csv_path = write_intraday_portfolio_review_report(
+        report,
+        output_dir / "portfolio_review_intraday.csv",
+    )
+    review_brief_path = write_intraday_portfolio_review_brief(
+        report,
+        output_dir / "portfolio_review_intraday_brief.txt",
+    )
+    report_payload = report.to_dict()
+    action_counts = {
+        f"{action.lower().replace(' ', '_')}_count": report_payload[
+            f"{action.lower().replace(' ', '_')}_count"
+        ]
+        for action in PORTFOLIO_REVIEW_ACTIONS
+    }
+    payload = {
+        "portfolio_path": str(args.portfolio_file.resolve()),
+        "interval_minutes": args.interval_minutes,
+        "position_count": len(current_positions),
+        "symbols_reviewed": report_payload["reviewed_symbols"],
+        **action_counts,
+        "outputs": {
+            "portfolio_review_intraday_json": str(review_json_path),
+            "portfolio_review_intraday_csv": str(review_csv_path),
+            "portfolio_review_intraday_brief": str(review_brief_path),
+        },
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
 def _handle_monitor_market(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     provider = create_daily_bar_provider(config, env_file=args.env_file)
@@ -1989,6 +2107,10 @@ def _default_daily_output_dir(project_root: Path, as_of_date: date) -> Path:
     return project_root / "data" / "processed" / "daily" / as_of_date.isoformat()
 
 
+def _default_intraday_portfolio_output_dir(project_root: Path, as_of_date: date) -> Path:
+    return project_root / "data" / "processed" / "portfolio_review_intraday" / as_of_date.isoformat()
+
+
 def _benchmark_symbol_override(raw_value: object) -> str | None:
     if not isinstance(raw_value, str) or not raw_value.strip():
         return None
@@ -2182,6 +2304,267 @@ def _run_daily_summary_workflow(
         "current_positions": resolved_current_positions,
         "current_equity": current_equity,
     }
+
+
+def _run_portfolio_review_intraday_workflow(
+    args: argparse.Namespace,
+    *,
+    config: AppConfig,
+    provider: DailyBarProvider | None,
+    current_positions: list[ExistingPosition] | None = None,
+) -> IntradayPortfolioReviewReport:
+    resolved_current_positions = (
+        _load_current_positions(args.portfolio_file)
+        if current_positions is None
+        else current_positions
+    )
+    benchmark_symbol_override = _benchmark_symbol_override(args.benchmark_symbol)
+
+    if args.interval_minutes <= 0:
+        raise ValueError("interval_minutes must be greater than zero.")
+    if not resolved_current_positions:
+        return build_intraday_portfolio_review_report(
+            as_of_date=args.as_of,
+            interval_minutes=args.interval_minutes,
+            portfolio_path=str(args.portfolio_file.resolve()),
+            rows=[],
+            current_positions=[],
+            benchmark_symbol=benchmark_symbol_override,
+        )
+    if provider is None:
+        raise ValueError("A data provider is required when reviewing non-empty portfolios.")
+
+    preset_catalog = _portfolio_review_preset_catalog(args, config)
+    base_settings = BreakoutMomentumSettings.from_configs(
+        config.strategy.signals,
+        config.strategy.risk,
+    )
+    if benchmark_symbol_override is not None:
+        base_settings = replace(base_settings, benchmark_symbol=benchmark_symbol_override)
+
+    position_plans = [
+        _build_portfolio_review_plan(
+            position,
+            preset_catalog=preset_catalog,
+            base_settings=base_settings,
+            as_of_date=args.as_of,
+        )
+        for position in resolved_current_positions
+    ]
+
+    benchmark_symbol = base_settings.benchmark_symbol
+    benchmark_intraday_metrics: Mapping[str, float | str | None] | None = None
+    if benchmark_symbol:
+        benchmark_frame = provider.fetch_intraday_bars(
+            benchmark_symbol,
+            args.as_of,
+            interval_minutes=args.interval_minutes,
+            refresh_cache=True,
+        )
+        if not benchmark_frame.empty:
+            benchmark_intraday_metrics = _intraday_session_metrics(benchmark_frame)
+
+    rows: list[PortfolioReviewRow] = []
+    for plan in position_plans:
+        position = plan.get("position")
+        symbol = position.symbol if isinstance(position, ExistingPosition) else "<unknown>"
+        try:
+            rows.append(
+                _build_portfolio_review_intraday_row(
+                    plan,
+                    provider=provider,
+                    as_of_date=args.as_of,
+                    interval_minutes=args.interval_minutes,
+                    benchmark_symbol=benchmark_symbol,
+                    benchmark_intraday_metrics=benchmark_intraday_metrics,
+                    refresh_cache=True,
+                )
+            )
+        except DataProviderConfigurationError:
+            raise
+        except (DataProviderError, ValueError) as exc:
+            LOGGER.warning("Skipping held symbol %s due to intraday review error: %s", symbol, exc)
+
+    if not rows:
+        raise NoIntradayDataError(
+            "No held symbols had usable regular-session intraday data for the requested session."
+        )
+
+    return build_intraday_portfolio_review_report(
+        as_of_date=args.as_of,
+        interval_minutes=args.interval_minutes,
+        portfolio_path=str(args.portfolio_file.resolve()),
+        rows=rows,
+        current_positions=resolved_current_positions,
+        benchmark_symbol=benchmark_symbol,
+    )
+
+
+def _build_portfolio_review_intraday_row(
+    plan: dict[str, object],
+    *,
+    provider: DailyBarProvider,
+    as_of_date: date,
+    interval_minutes: int,
+    benchmark_symbol: str | None,
+    benchmark_intraday_metrics: Mapping[str, float | str | None] | None,
+    refresh_cache: bool,
+) -> PortfolioReviewRow:
+    position = plan["position"]
+    preset = plan["preset"]
+    preset_resolution = plan["preset_resolution"]
+    settings = plan["settings"]
+    if not isinstance(position, ExistingPosition):
+        raise TypeError("plan['position'] must be an ExistingPosition.")
+    if not isinstance(preset, BreakoutStrategyPreset):
+        raise TypeError("plan['preset'] must be a BreakoutStrategyPreset.")
+    if not isinstance(preset_resolution, str):
+        raise TypeError("plan['preset_resolution'] must be a string.")
+    if not isinstance(settings, BreakoutMomentumSettings):
+        raise TypeError("plan['settings'] must be BreakoutMomentumSettings.")
+
+    bars = provider.fetch_intraday_bars(
+        position.symbol,
+        as_of_date,
+        interval_minutes=interval_minutes,
+        refresh_cache=refresh_cache,
+    )
+    if bars.empty:
+        raise ValueError(f"No intraday bars were available for held symbol '{position.symbol}'.")
+
+    intraday_metrics = _intraday_session_metrics(bars)
+    intraday_relative_strength_diff = _intraday_relative_strength_diff(
+        intraday_metrics,
+        benchmark_intraday_metrics,
+    )
+    decision = review_existing_long_position_intraday(
+        position,
+        session_open=float(intraday_metrics["session_open"]),
+        session_high=float(intraday_metrics["session_high"]),
+        session_low=float(intraday_metrics["session_low"]),
+        latest_close=float(intraday_metrics["latest_close"]),
+        latest_low=float(intraday_metrics["latest_low"]),
+        session_vwap=_mapping_float_or_none(intraday_metrics, "session_vwap"),
+        session_high_giveback_exit_threshold=settings.profit_giveback_threshold,
+        intraday_relative_strength_diff=intraday_relative_strength_diff,
+    )
+    entry_date_used = _position_entry_date(position)
+    return PortfolioReviewRow(
+        date=as_of_date,
+        symbol=position.symbol,
+        quantity=position.shares,
+        average_entry_price=position.average_entry_price,
+        current_stop=position.current_stop,
+        suggested_stop=decision.suggested_stop,
+        latest_close=decision.latest_close,
+        unrealized_pl_pct=decision.unrealized_pl_pct,
+        distance_to_stop_pct=decision.distance_to_stop_pct,
+        regime_passed=None,
+        above_entry=decision.above_entry,
+        suggested_action=decision.suggested_action,
+        preset_name=preset.name,
+        rationale=" | ".join(decision.rationale),
+        metadata={
+            "preset_resolution": preset_resolution,
+            "position_source": position.source,
+            "position_metadata": dict(position.metadata),
+            "entry_date_used": entry_date_used.isoformat() if entry_date_used is not None else None,
+            "interval_minutes": interval_minutes,
+            "latest_bar_time": intraday_metrics.get("latest_bar_time"),
+            "benchmark_symbol": benchmark_symbol,
+            "intraday_relative_strength_diff": intraday_relative_strength_diff,
+            "benchmark_intraday_return_vs_open": (
+                benchmark_intraday_metrics.get("intraday_return_vs_open")
+                if benchmark_intraday_metrics is not None
+                else None
+            ),
+            **dict(intraday_metrics),
+            **decision.metadata,
+        },
+    )
+
+
+def _intraday_session_metrics(
+    intraday_bars: pd.DataFrame,
+) -> dict[str, float | str | None]:
+    prepared = intraday_bars.sort_values("datetime", kind="stable").reset_index(drop=True)
+    if prepared.empty:
+        raise ValueError("intraday_bars cannot be empty.")
+
+    session_open = float(prepared.iloc[0]["open"])
+    session_high = float(pd.to_numeric(prepared["high"], errors="coerce").max())
+    session_low = float(pd.to_numeric(prepared["low"], errors="coerce").min())
+    latest_bar = prepared.iloc[-1]
+    latest_close = float(latest_bar["close"])
+    latest_low = float(latest_bar["low"])
+    latest_bar_time = pd.to_datetime(latest_bar["datetime"], errors="coerce")
+    session_vwap = _intraday_session_vwap(prepared)
+    intraday_return_vs_open = (latest_close / session_open) - 1.0
+    peak_intraday_return_vs_open = (session_high / session_open) - 1.0
+
+    return {
+        "session_open": session_open,
+        "session_high": session_high,
+        "session_low": session_low,
+        "latest_close": latest_close,
+        "latest_low": latest_low,
+        "latest_bar_time": (
+            latest_bar_time.isoformat() if not pd.isna(latest_bar_time) else None
+        ),
+        "session_vwap": session_vwap,
+        "intraday_return_vs_open": intraday_return_vs_open,
+        "peak_intraday_return_vs_open": peak_intraday_return_vs_open,
+    }
+
+
+def _intraday_session_vwap(intraday_bars: pd.DataFrame) -> float | None:
+    if "vwap" in intraday_bars.columns:
+        explicit_vwap = pd.to_numeric(intraday_bars["vwap"], errors="coerce")
+        volume = pd.to_numeric(intraday_bars["volume"], errors="coerce")
+        valid_explicit = explicit_vwap.notna() & volume.notna() & (volume > 0)
+        if bool(valid_explicit.any()):
+            weighted_vwap = float(
+                (explicit_vwap.loc[valid_explicit] * volume.loc[valid_explicit]).sum()
+            )
+            total_volume = float(volume.loc[valid_explicit].sum())
+            if total_volume > 0:
+                return weighted_vwap / total_volume
+
+    volume = pd.to_numeric(intraday_bars["volume"], errors="coerce")
+    close = pd.to_numeric(intraday_bars["close"], errors="coerce")
+    valid = volume.notna() & close.notna() & (volume > 0)
+    if not bool(valid.any()):
+        return None
+    weighted_close = float((close.loc[valid] * volume.loc[valid]).sum())
+    total_volume = float(volume.loc[valid].sum())
+    if total_volume <= 0:
+        return None
+    return weighted_close / total_volume
+
+
+def _intraday_relative_strength_diff(
+    intraday_metrics: Mapping[str, float | str | None],
+    benchmark_intraday_metrics: Mapping[str, float | str | None] | None,
+) -> float | None:
+    if benchmark_intraday_metrics is None:
+        return None
+    symbol_return = _mapping_float_or_none(intraday_metrics, "intraday_return_vs_open")
+    benchmark_return = _mapping_float_or_none(
+        benchmark_intraday_metrics,
+        "intraday_return_vs_open",
+    )
+    if symbol_return is None or benchmark_return is None:
+        return None
+    return symbol_return - benchmark_return
+
+
+def _mapping_float_or_none(data: Mapping[str, object], key: str) -> float | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
 
 
 def _portfolio_review_preset_catalog(

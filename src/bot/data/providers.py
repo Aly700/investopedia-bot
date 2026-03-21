@@ -15,12 +15,16 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
-from bot.config import AppConfig
+from bot.config import AppConfig, ConfigError, _read_env_file as _read_config_env_file
 from bot.data.normalize import (
     DAILY_BAR_COLUMNS,
+    INTRADAY_BAR_COLUMNS,
     DataNormalizationError,
     empty_daily_bar_frame,
+    empty_intraday_bar_frame,
     filter_daily_bars_by_date,
+    filter_intraday_bars_by_session_date,
+    normalize_intraday_bars,
     normalize_daily_bars,
 )
 
@@ -59,6 +63,7 @@ class DailyBarProvider(ABC):
 
         self.api_key = api_key
         self.cache = DailyBarCache(cache_dir=cache_dir, provider_name=self.provider_name)
+        self.intraday_cache = IntradayBarCache(cache_dir=cache_dir, provider_name=self.provider_name)
         self.timeout_seconds = timeout_seconds
 
     def fetch_daily_bars(
@@ -90,6 +95,47 @@ class DailyBarProvider(ABC):
         self.cache.store(normalized_symbol, start_date, end_date, filtered_frame)
         return filtered_frame
 
+    def fetch_intraday_bars(
+        self,
+        symbol: str,
+        session_date: date,
+        *,
+        interval_minutes: int = 15,
+        refresh_cache: bool = True,
+    ) -> pd.DataFrame:
+        """Fetch normalized intraday OHLCV bars for one symbol and session date."""
+
+        normalized_symbol = _normalize_symbol(symbol)
+        if interval_minutes <= 0:
+            raise ValueError("interval_minutes must be greater than zero.")
+
+        if not refresh_cache:
+            cached_frame = self.intraday_cache.load(
+                normalized_symbol,
+                session_date,
+                interval_minutes,
+            )
+            if cached_frame is not None:
+                return cached_frame
+
+        frame = self._fetch_intraday_bars_from_api(
+            normalized_symbol,
+            session_date,
+            interval_minutes,
+        )
+        normalized_frame = normalize_intraday_bars(frame, symbol=normalized_symbol)
+        filtered_frame = filter_intraday_bars_by_session_date(
+            normalized_frame,
+            session_date=session_date,
+        )
+        self.intraday_cache.store(
+            normalized_symbol,
+            session_date,
+            interval_minutes,
+            filtered_frame,
+        )
+        return filtered_frame
+
     @abstractmethod
     def _fetch_daily_bars_from_api(
         self,
@@ -98,6 +144,18 @@ class DailyBarProvider(ABC):
         end_date: date,
     ) -> pd.DataFrame:
         """Fetch remote data for the requested symbol and date range."""
+
+    def _fetch_intraday_bars_from_api(
+        self,
+        symbol: str,
+        session_date: date,
+        interval_minutes: int,
+    ) -> pd.DataFrame:
+        """Fetch remote intraday data for the requested symbol and session date."""
+
+        raise DataProviderConfigurationError(
+            f"{self.provider_name} does not support intraday aggregate bars."
+        )
 
     def _get_json(
         self,
@@ -273,6 +331,53 @@ class PolygonDailyBarProvider(DailyBarProvider):
             },
         )
 
+    def _fetch_intraday_bars_from_api(
+        self,
+        symbol: str,
+        session_date: date,
+        interval_minutes: int,
+    ) -> pd.DataFrame:
+        query = urlencode(
+            {
+                "adjusted": "true",
+                "sort": "asc",
+                "limit": 50000,
+                "apiKey": self.api_key,
+            }
+        )
+        symbol_path = quote(symbol, safe="")
+        url = (
+            f"{self.base_url}/{symbol_path}/range/{interval_minutes}/minute/"
+            f"{session_date.isoformat()}/{session_date.isoformat()}?{query}"
+        )
+        payload = self._get_json(url)
+        if not isinstance(payload, dict):
+            raise DataProviderRequestError("Polygon returned an unexpected payload.")
+        if payload.get("status") == "ERROR" or payload.get("error"):
+            raise DataProviderRequestError(
+                f"Polygon returned an error: {payload.get('error') or payload.get('message') or payload}"
+            )
+
+        results = payload.get("results")
+        if not isinstance(results, list) or not results:
+            return empty_intraday_bar_frame()
+
+        frame = pd.DataFrame(results)
+        frame["datetime"] = pd.to_datetime(frame["t"], unit="ms", utc=True)
+        return normalize_intraday_bars(
+            frame,
+            symbol=symbol,
+            column_mapping={
+                "datetime": "datetime",
+                "o": "open",
+                "h": "high",
+                "l": "low",
+                "c": "close",
+                "v": "volume",
+                "vw": "vwap",
+            },
+        )
+
 
 class DailyBarCache:
     """Simple file-based cache for normalized daily bars."""
@@ -308,6 +413,54 @@ class DailyBarCache:
         path = self.cache_path(symbol, start_date, end_date)
         path.parent.mkdir(parents=True, exist_ok=True)
         frame.loc[:, list(DAILY_BAR_COLUMNS)].to_csv(path, index=False, date_format="%Y-%m-%d")
+        return path
+
+
+class IntradayBarCache:
+    """Simple file-based cache for normalized intraday bars."""
+
+    def __init__(self, *, cache_dir: Path, provider_name: str) -> None:
+        self.cache_dir = cache_dir.resolve()
+        self.provider_name = provider_name
+
+    def cache_path(self, symbol: str, session_date: date, interval_minutes: int) -> Path:
+        safe_symbol = re.sub(r"[^A-Z0-9._-]+", "_", symbol.upper())
+        provider_dir = self.cache_dir / self.provider_name
+        filename = (
+            f"{safe_symbol}_intraday_{session_date.isoformat()}_{interval_minutes}min.csv"
+        )
+        return provider_dir / filename
+
+    def load(
+        self,
+        symbol: str,
+        session_date: date,
+        interval_minutes: int,
+    ) -> pd.DataFrame | None:
+        path = self.cache_path(symbol, session_date, interval_minutes)
+        if not path.exists():
+            return None
+
+        frame = pd.read_csv(path, parse_dates=["datetime"])
+        try:
+            return normalize_intraday_bars(frame)
+        except DataNormalizationError as exc:
+            raise DataProviderError(f"Cached data at {path} is invalid: {exc}") from exc
+
+    def store(
+        self,
+        symbol: str,
+        session_date: date,
+        interval_minutes: int,
+        frame: pd.DataFrame,
+    ) -> Path:
+        path = self.cache_path(symbol, session_date, interval_minutes)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        frame.loc[:, list(INTRADAY_BAR_COLUMNS)].to_csv(
+            path,
+            index=False,
+            date_format="%Y-%m-%dT%H:%M:%S",
+        )
         return path
 
 
@@ -354,31 +507,12 @@ def load_provider_environment(
 ) -> dict[str, str]:
     """Merge a simple .env file with the live process environment."""
 
-    merged_environment = _read_env_file(env_file)
+    try:
+        merged_environment = _read_config_env_file(env_file)
+    except ConfigError as exc:
+        raise DataProviderConfigurationError(str(exc)) from exc
     merged_environment.update(dict(environment or os.environ))
     return merged_environment
-
-
-def _read_env_file(env_file: Path | None) -> dict[str, str]:
-    if env_file is None or not env_file.exists():
-        return {}
-
-    parsed: dict[str, str] = {}
-    for line_number, raw_line in enumerate(env_file.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[7:].strip()
-
-        key, separator, value = line.partition("=")
-        if not separator or not key.strip():
-            raise DataProviderConfigurationError(
-                f"Invalid environment line in {env_file} at line {line_number}: {raw_line}"
-            )
-
-        parsed[key.strip()] = value.strip().strip("'\"")
-    return parsed
 
 
 def _normalize_symbol(symbol: str) -> str:

@@ -529,6 +529,164 @@ def review_existing_long_position(
     )
 
 
+def review_existing_long_position_intraday(
+    position: ExistingPosition,
+    *,
+    session_open: float,
+    session_high: float,
+    session_low: float,
+    latest_close: float,
+    latest_low: float,
+    session_vwap: float | None = None,
+    session_high_giveback_exit_threshold: float = 0.10,
+    session_high_giveback_watch_threshold: float | None = None,
+    meaningful_profit_pct: float = 0.05,
+    early_strength_threshold: float = 0.03,
+    intraday_relative_strength_diff: float | None = None,
+    intraday_relative_strength_watch_threshold: float = -0.02,
+) -> PortfolioReviewDecision:
+    """Review one long position using a single intraday session snapshot."""
+
+    _validate_finite_positive(session_open, name="session_open")
+    _validate_finite_positive(session_high, name="session_high")
+    _validate_finite_positive(session_low, name="session_low")
+    _validate_finite_positive(latest_close, name="latest_close")
+    _validate_finite_positive(latest_low, name="latest_low")
+    if session_vwap is not None:
+        _validate_finite_positive(session_vwap, name="session_vwap")
+    if session_high_giveback_exit_threshold <= 0 or session_high_giveback_exit_threshold >= 1:
+        raise ValueError(
+            "session_high_giveback_exit_threshold must be between zero and one."
+        )
+    if session_high_giveback_watch_threshold is None:
+        session_high_giveback_watch_threshold = max(
+            0.04,
+            session_high_giveback_exit_threshold * 0.75,
+        )
+    if session_high_giveback_watch_threshold <= 0 or session_high_giveback_watch_threshold >= 1:
+        raise ValueError(
+            "session_high_giveback_watch_threshold must be between zero and one."
+        )
+    if meaningful_profit_pct <= 0:
+        raise ValueError("meaningful_profit_pct must be greater than zero.")
+    if early_strength_threshold <= 0:
+        raise ValueError("early_strength_threshold must be greater than zero.")
+
+    unrealized_pl_pct = (latest_close / position.average_entry_price) - 1.0
+    above_entry = latest_close >= position.average_entry_price
+    distance_to_stop_pct: float | None = None
+    if position.current_stop is not None:
+        distance_to_stop_pct = (latest_close - position.current_stop) / latest_close
+
+    intraday_return_vs_open = (latest_close / session_open) - 1.0
+    peak_intraday_return_vs_open = (session_high / session_open) - 1.0
+    peak_unrealized_pct = (session_high / position.average_entry_price) - 1.0
+    session_high_giveback_pct = max((session_high - latest_close) / session_high, 0.0)
+    close_vs_vwap_pct = (
+        (latest_close - session_vwap) / session_vwap
+        if session_vwap is not None
+        else None
+    )
+    stop_breached_intraday = (
+        position.current_stop is not None
+        and session_low <= position.current_stop
+    )
+    failed_intraday_strength = (
+        peak_intraday_return_vs_open >= early_strength_threshold
+        and (
+            (session_vwap is not None and latest_close < session_vwap)
+            or latest_close <= session_open
+        )
+    )
+    intraday_momentum_fade = (
+        peak_unrealized_pct >= meaningful_profit_pct
+        and session_high_giveback_pct >= session_high_giveback_watch_threshold
+        and (
+            (session_vwap is not None and latest_close < session_vwap)
+            or intraday_return_vs_open < 0
+        )
+    )
+    weak_intraday_relative_strength = (
+        intraday_relative_strength_diff is not None
+        and intraday_relative_strength_diff <= intraday_relative_strength_watch_threshold
+    )
+
+    rationale: list[str] = []
+    metadata = {
+        "session_open": session_open,
+        "session_high": session_high,
+        "session_low": session_low,
+        "latest_low": latest_low,
+        "session_vwap": session_vwap,
+        "intraday_return_vs_open": intraday_return_vs_open,
+        "peak_intraday_return_vs_open": peak_intraday_return_vs_open,
+        "peak_unrealized_pct": peak_unrealized_pct,
+        "session_high_giveback_pct": session_high_giveback_pct,
+        "session_high_giveback_watch_threshold": session_high_giveback_watch_threshold,
+        "session_high_giveback_exit_threshold": session_high_giveback_exit_threshold,
+        "close_vs_vwap_pct": close_vs_vwap_pct,
+        "stop_breached_intraday": stop_breached_intraday,
+        "failed_intraday_strength": failed_intraday_strength,
+        "intraday_momentum_fade": intraday_momentum_fade,
+        "intraday_relative_strength_diff": intraday_relative_strength_diff,
+        "intraday_relative_strength_watch_threshold": intraday_relative_strength_watch_threshold,
+        "weak_intraday_relative_strength": weak_intraday_relative_strength,
+    }
+
+    if stop_breached_intraday:
+        rationale.append("An intraday bar traded through the current stop.")
+        action = "EXIT CANDIDATE"
+    elif (
+        peak_unrealized_pct >= meaningful_profit_pct
+        and session_high_giveback_pct >= session_high_giveback_exit_threshold
+    ):
+        rationale.append(
+            "Profitable position has given back "
+            f"{session_high_giveback_pct:.1%} from the session high of {session_high:.2f}."
+        )
+        action = "EXIT CANDIDATE"
+    elif failed_intraday_strength and session_high_giveback_pct >= session_high_giveback_exit_threshold:
+        rationale.append("Strong intraday move failed to hold into the latest bar.")
+        if session_vwap is not None and latest_close < session_vwap:
+            rationale.append(
+                f"Latest close is below session VWAP ({session_vwap:.2f})."
+            )
+        action = "EXIT CANDIDATE"
+    elif intraday_momentum_fade or weak_intraday_relative_strength or failed_intraday_strength:
+        if intraday_momentum_fade:
+            rationale.append(
+                "Profitable position is fading intraday after a strong session high."
+            )
+        if failed_intraday_strength:
+            rationale.append("Strong intraday move is no longer holding the session range.")
+        if session_vwap is not None and latest_close < session_vwap:
+            rationale.append(
+                f"Latest close is below session VWAP ({session_vwap:.2f})."
+            )
+        if weak_intraday_relative_strength and intraday_relative_strength_diff is not None:
+            rationale.append(
+                "Intraday return vs benchmark is "
+                f"{intraday_relative_strength_diff:.1%}."
+            )
+        action = "WATCH CLOSELY"
+    else:
+        rationale.append("Intraday structure remains healthy and no stop or fade signal is active.")
+        action = "HOLD"
+
+    return PortfolioReviewDecision(
+        latest_close=latest_close,
+        unrealized_pl_pct=unrealized_pl_pct,
+        distance_to_stop_pct=distance_to_stop_pct,
+        regime_passed=None,
+        above_entry=above_entry,
+        suggested_action=action,
+        suggested_stop=None,
+        trailing_stop_candidate=None,
+        rationale=tuple(rationale),
+        metadata=metadata,
+    )
+
+
 def apply_drawdown_risk_adjustment(
     base_risk_per_trade: float,
     *,

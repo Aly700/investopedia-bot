@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from datetime import date
 from pathlib import Path
 
@@ -5,18 +7,39 @@ import pandas as pd
 from pandas.testing import assert_frame_equal
 
 from bot.config import UniverseConfig, load_app_config
-from bot.data.normalize import DAILY_BAR_COLUMNS, empty_daily_bar_frame, normalize_daily_bars
-from bot.data.providers import DailyBarProvider, create_daily_bar_provider
+from bot.data.normalize import (
+    DAILY_BAR_COLUMNS,
+    INTRADAY_BAR_COLUMNS,
+    empty_daily_bar_frame,
+    empty_intraday_bar_frame,
+    filter_intraday_bars_by_session_date,
+    normalize_daily_bars,
+    normalize_intraday_bars,
+)
+from bot.data.providers import (
+    DailyBarProvider,
+    create_daily_bar_provider,
+    load_provider_environment,
+)
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
 
 
 class FakeDailyBarProvider(DailyBarProvider):
     provider_name = "fake"
 
-    def __init__(self, *, frames_by_symbol: dict[str, pd.DataFrame], cache_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        frames_by_symbol: dict[str, pd.DataFrame],
+        intraday_frames_by_symbol: dict[str, pd.DataFrame] | None = None,
+        cache_dir: Path,
+    ) -> None:
         super().__init__(api_key="test-key", cache_dir=cache_dir)
         self.frames_by_symbol = frames_by_symbol
+        self.intraday_frames_by_symbol = intraday_frames_by_symbol or {}
         self.fetch_count = 0
+        self.intraday_fetch_count = 0
+        self.intraday_fetch_count_by_symbol: dict[str, int] = {}
 
     def _fetch_daily_bars_from_api(
         self,
@@ -26,6 +49,23 @@ class FakeDailyBarProvider(DailyBarProvider):
     ) -> pd.DataFrame:
         self.fetch_count += 1
         return self.frames_by_symbol.get(symbol, empty_daily_bar_frame()).copy()
+
+    def _fetch_intraday_bars_from_api(
+        self,
+        symbol: str,
+        session_date: date,
+        interval_minutes: int,
+    ) -> pd.DataFrame:
+        self.intraday_fetch_count += 1
+        fetch_index = self.intraday_fetch_count_by_symbol.get(symbol, 0)
+        self.intraday_fetch_count_by_symbol[symbol] = fetch_index + 1
+
+        raw_frame = self.intraday_frames_by_symbol.get(symbol, empty_intraday_bar_frame())
+        if isinstance(raw_frame, list):
+            if not raw_frame:
+                return empty_intraday_bar_frame()
+            return raw_frame[min(fetch_index, len(raw_frame) - 1)].copy()
+        return raw_frame.copy()
 
 
 def test_normalize_daily_bars_enforces_schema_and_ordering() -> None:
@@ -87,6 +127,171 @@ def test_provider_cache_avoids_duplicate_remote_fetches(tmp_path: Path) -> None:
     assert provider.fetch_count == 1
     assert_frame_equal(first, second)
     assert (tmp_path / "fake" / "AAPL_2024-01-02_2024-01-03.csv").exists()
+
+
+def test_provider_intraday_cache_avoids_duplicate_remote_fetches(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2024-01-03 14:30:00", "2024-01-03 14:45:00"]),
+            "open": [10.0, 10.5],
+            "high": [10.6, 10.8],
+            "low": [9.9, 10.4],
+            "close": [10.5, 10.7],
+            "volume": [1000, 1200],
+            "vwap": [10.3, 10.5],
+            "symbol": ["AAPL", "AAPL"],
+        }
+    )
+    provider = FakeDailyBarProvider(
+        frames_by_symbol={},
+        intraday_frames_by_symbol={"AAPL": frame},
+        cache_dir=tmp_path,
+    )
+
+    first = provider.fetch_intraday_bars(
+        "AAPL",
+        date(2024, 1, 3),
+        interval_minutes=15,
+        refresh_cache=False,
+    )
+    second = provider.fetch_intraday_bars(
+        "AAPL",
+        date(2024, 1, 3),
+        interval_minutes=15,
+        refresh_cache=False,
+    )
+
+    assert provider.intraday_fetch_count == 1
+    assert list(first.columns) == list(INTRADAY_BAR_COLUMNS)
+    assert_frame_equal(first, second)
+    assert (
+        tmp_path / "fake" / "AAPL_intraday_2024-01-03_15min.csv"
+    ).exists()
+
+
+def test_provider_intraday_fetch_bypasses_cache_by_default(tmp_path: Path) -> None:
+    first_frame = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2024-01-03 14:30:00", "2024-01-03 14:45:00"]),
+            "open": [10.0, 10.5],
+            "high": [10.6, 10.8],
+            "low": [9.9, 10.4],
+            "close": [10.5, 10.7],
+            "volume": [1000, 1200],
+            "vwap": [10.3, 10.5],
+            "symbol": ["AAPL", "AAPL"],
+        }
+    )
+    second_frame = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(["2024-01-03 14:30:00", "2024-01-03 14:45:00"]),
+            "open": [11.0, 11.5],
+            "high": [11.6, 11.8],
+            "low": [10.9, 11.4],
+            "close": [11.5, 11.7],
+            "volume": [1500, 1800],
+            "vwap": [11.3, 11.5],
+            "symbol": ["AAPL", "AAPL"],
+        }
+    )
+    provider = FakeDailyBarProvider(
+        frames_by_symbol={},
+        intraday_frames_by_symbol={"AAPL": [first_frame, second_frame]},
+        cache_dir=tmp_path,
+    )
+
+    first = provider.fetch_intraday_bars("AAPL", date(2024, 1, 3), interval_minutes=15)
+    second = provider.fetch_intraday_bars("AAPL", date(2024, 1, 3), interval_minutes=15)
+
+    assert provider.intraday_fetch_count == 2
+    assert first["close"].tolist() == [10.5, 10.7]
+    assert second["close"].tolist() == [11.5, 11.7]
+
+
+def test_provider_intraday_fetch_excludes_premarket_and_after_hours(tmp_path: Path) -> None:
+    frame = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(
+                [
+                    "2024-01-03 13:00:00",  # 08:00 ET premarket
+                    "2024-01-03 14:30:00",  # 09:30 ET regular session
+                    "2024-01-03 21:15:00",  # 16:15 ET after hours
+                ]
+            ),
+            "open": [9.0, 10.0, 10.8],
+            "high": [9.2, 10.6, 10.9],
+            "low": [8.9, 9.9, 10.7],
+            "close": [9.1, 10.5, 10.75],
+            "volume": [500, 1500, 400],
+            "vwap": [9.05, 10.3, 10.8],
+            "symbol": ["AAPL", "AAPL", "AAPL"],
+        }
+    )
+    provider = FakeDailyBarProvider(
+        frames_by_symbol={},
+        intraday_frames_by_symbol={"AAPL": frame},
+        cache_dir=tmp_path,
+    )
+
+    session_frame = provider.fetch_intraday_bars(
+        "AAPL",
+        date(2024, 1, 3),
+        interval_minutes=15,
+    )
+
+    assert session_frame["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist() == [
+        "2024-01-03 14:30:00"
+    ]
+    assert session_frame["open"].tolist() == [10.0]
+
+
+def test_filter_intraday_bars_by_session_date_handles_dst_transition() -> None:
+    frame = pd.DataFrame(
+        {
+            "datetime": pd.to_datetime(
+                [
+                    "2024-03-11 13:00:00",  # 09:00 ET premarket after spring DST shift
+                    "2024-03-11 13:30:00",  # 09:30 ET regular-session open
+                    "2024-03-11 20:00:00",  # 16:00 ET session close
+                    "2024-03-11 20:15:00",  # 16:15 ET after hours
+                ]
+            ),
+            "open": [9.0, 10.0, 10.8, 10.9],
+            "high": [9.2, 10.6, 11.0, 11.1],
+            "low": [8.9, 9.9, 10.7, 10.8],
+            "close": [9.1, 10.5, 10.9, 11.0],
+            "volume": [500, 1500, 1400, 300],
+            "vwap": [9.05, 10.3, 10.85, 10.95],
+            "symbol": ["AAPL", "AAPL", "AAPL", "AAPL"],
+        }
+    )
+
+    filtered = filter_intraday_bars_by_session_date(
+        normalize_intraday_bars(frame),
+        session_date=date(2024, 3, 11),
+    )
+
+    assert filtered["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S").tolist() == [
+        "2024-03-11 13:30:00",
+        "2024-03-11 20:00:00",
+    ]
+    assert filtered["open"].tolist() == [10.0, 10.8]
+
+
+def test_load_provider_environment_uses_paired_quote_parsing(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        'DOUBLE_QUOTED="double value"\n'
+        "SINGLE_QUOTED='single value'\n"
+        "UNQUOTED=plain-value\n",
+        encoding="utf-8",
+    )
+
+    parsed = load_provider_environment(env_file=env_file, environment={})
+
+    assert parsed["DOUBLE_QUOTED"] == "double value"
+    assert parsed["SINGLE_QUOTED"] == "single value"
+    assert parsed["UNQUOTED"] == "plain-value"
 
 
 def test_create_provider_uses_configured_provider() -> None:

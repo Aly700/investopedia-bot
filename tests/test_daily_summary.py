@@ -16,13 +16,16 @@ from bot.execution.manual_executor import ManualExecutor
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
 from bot.reporting.daily_report import (
     MARKET_MONITOR_CATEGORIES,
+    IntradayPortfolioReviewReport,
     PresetCandidateEvaluation,
     PortfolioReviewRow,
     build_daily_research_summary,
+    build_intraday_portfolio_review_report,
     build_market_monitor_report,
     build_portfolio_review_report,
     ensure_market_monitor_categories_cover_portfolio_actions,
     market_monitor_flat_count_key,
+    write_intraday_portfolio_review_brief,
     write_market_monitor_report,
     write_market_monitor_text_summary,
     write_daily_preset_summary,
@@ -1083,6 +1086,404 @@ def test_run_portfolio_review_workflow_skips_symbols_with_value_errors(
     assert [row.symbol for row in report.rows] == ["AAPL"]
     assert payload["position_count"] == 2
     assert payload["reviewed_symbol_count"] == 1
+
+
+def test_intraday_portfolio_review_brief_separates_pressure_and_healthy_holdings(
+    tmp_path: Path,
+) -> None:
+    current_positions = [
+        ExistingPosition(symbol="AAPL", shares=10, average_entry_price=100.0, current_stop=95.0, preset_name="standard_breakout"),
+        ExistingPosition(symbol="AMD", shares=8, average_entry_price=100.0, current_stop=90.0, preset_name="standard_breakout"),
+        ExistingPosition(symbol="MSFT", shares=6, average_entry_price=100.0, current_stop=95.0, preset_name="standard_breakout"),
+    ]
+    report = build_intraday_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        interval_minutes=15,
+        portfolio_path="/tmp/portfolio.csv",
+        current_positions=current_positions,
+        benchmark_symbol="SPY",
+        rows=[
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=None,
+                latest_close=96.0,
+                unrealized_pl_pct=-0.04,
+                distance_to_stop_pct=(96.0 - 95.0) / 96.0,
+                regime_passed=None,
+                above_entry=False,
+                suggested_action="EXIT CANDIDATE",
+                preset_name="standard_breakout",
+                rationale="An intraday bar traded through the current stop.",
+                metadata={
+                    "stop_breached_intraday": True,
+                    "session_vwap": 108.0,
+                    "session_high": 112.0,
+                    "session_high_giveback_pct": 0.143,
+                },
+            ),
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AMD",
+                quantity=8,
+                average_entry_price=100.0,
+                current_stop=90.0,
+                suggested_stop=None,
+                latest_close=107.0,
+                unrealized_pl_pct=0.07,
+                distance_to_stop_pct=(107.0 - 90.0) / 107.0,
+                regime_passed=None,
+                above_entry=True,
+                suggested_action="WATCH CLOSELY",
+                preset_name="standard_breakout",
+                rationale="Profitable position is fading intraday after a strong session high.",
+                metadata={
+                    "session_vwap": 111.0,
+                    "session_high": 116.0,
+                    "session_high_giveback_pct": (116.0 - 107.0) / 116.0,
+                },
+            ),
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="MSFT",
+                quantity=6,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=None,
+                latest_close=113.0,
+                unrealized_pl_pct=0.13,
+                distance_to_stop_pct=(113.0 - 95.0) / 113.0,
+                regime_passed=None,
+                above_entry=True,
+                suggested_action="HOLD",
+                preset_name="standard_breakout",
+                rationale="Intraday structure remains healthy and no stop or fade signal is active.",
+                metadata={
+                    "session_vwap": 111.0,
+                    "session_high": 114.0,
+                    "session_high_giveback_pct": (114.0 - 113.0) / 114.0,
+                },
+            ),
+        ],
+    )
+
+    brief_path = write_intraday_portfolio_review_brief(
+        report,
+        tmp_path / "portfolio_review_intraday_brief.txt",
+    )
+    text = brief_path.read_text(encoding="utf-8")
+
+    assert "Headline" in text
+    assert "Urgent intraday actions" in text
+    assert "Current holdings under pressure" in text
+    assert "Holdings still healthy" in text
+    urgent_section = text.split("Urgent intraday actions\n", 1)[1].split("\n\nCurrent holdings under pressure", 1)[0]
+    pressure_section = text.split("Current holdings under pressure\n", 1)[1].split("\n\nHoldings still healthy", 1)[0]
+    healthy_section = text.split("Holdings still healthy\n", 1)[1]
+    assert "AAPL" in urgent_section
+    assert "AMD" not in urgent_section
+    assert "AAPL" in pressure_section
+    assert "AMD" in pressure_section
+    assert "MSFT" not in pressure_section
+    assert "MSFT" in healthy_section
+    assert "AAPL" not in healthy_section
+
+
+def test_intraday_session_metrics_uses_full_multi_bar_session() -> None:
+    metrics = main_module._intraday_session_metrics(
+        pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(
+                    ["2024-01-05 14:30:00", "2024-01-05 14:45:00", "2024-01-05 15:00:00"]
+                ),
+                "open": [110.0, 112.0, 111.0],
+                "high": [113.0, 116.0, 114.0],
+                "low": [109.0, 110.0, 108.0],
+                "close": [112.0, 111.0, 109.0],
+                "volume": [500_000, 600_000, 700_000],
+                "vwap": [111.0, 113.0, 112.0],
+                "symbol": ["AAPL", "AAPL", "AAPL"],
+            }
+        )
+    )
+
+    assert metrics["session_open"] == 110.0
+    assert metrics["session_high"] == 116.0
+    assert metrics["session_low"] == 108.0
+    assert metrics["latest_close"] == 109.0
+    assert metrics["latest_low"] == 108.0
+    assert metrics["latest_bar_time"] == "2024-01-05T15:00:00"
+
+
+def test_intraday_session_vwap_aggregates_explicit_bar_vwap() -> None:
+    vwap = main_module._intraday_session_vwap(
+        pd.DataFrame(
+            {
+                "datetime": pd.to_datetime(["2024-01-05 14:30:00", "2024-01-05 14:45:00"]),
+                "open": [10.0, 20.0],
+                "high": [10.5, 20.5],
+                "low": [9.5, 19.5],
+                "close": [10.2, 20.2],
+                "volume": [100, 300],
+                "vwap": [10.0, 20.0],
+                "symbol": ["AAPL", "AAPL"],
+            }
+        )
+    )
+
+    assert vwap == pytest.approx((10.0 * 100 + 20.0 * 300) / 400)
+
+
+def test_build_portfolio_review_intraday_row_uses_provider_and_metrics() -> None:
+    config = load_app_config()
+    preset = _selected_presets("standard_breakout")[0]
+    settings = main_module.BreakoutMomentumSettings.from_configs(
+        config.strategy.signals,
+        config.strategy.risk,
+    )
+    plan = {
+        "position": ExistingPosition(
+            symbol="AAPL",
+            shares=10,
+            average_entry_price=100.0,
+            current_stop=90.0,
+            preset_name="standard_breakout",
+            source="manual",
+            metadata={"note": "starter"},
+        ),
+        "preset": preset,
+        "preset_resolution": "position_preset",
+        "settings": settings,
+    }
+
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def fetch_intraday_bars(
+            self,
+            symbol: str,
+            session_date: date,
+            *,
+            interval_minutes: int = 15,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            self.calls.append(
+                {
+                    "symbol": symbol,
+                    "session_date": session_date,
+                    "interval_minutes": interval_minutes,
+                    "refresh_cache": refresh_cache,
+                }
+            )
+            return pd.DataFrame(
+                {
+                    "datetime": pd.to_datetime(
+                        ["2024-01-05 14:30:00", "2024-01-05 14:45:00", "2024-01-05 15:00:00"]
+                    ),
+                    "open": [110.0, 113.0, 109.0],
+                    "high": [113.0, 116.0, 110.0],
+                    "low": [109.0, 108.0, 107.0],
+                    "close": [113.0, 109.0, 107.0],
+                    "volume": [500_000, 600_000, 550_000],
+                    "vwap": [111.0, 111.5, 111.0],
+                    "symbol": [symbol] * 3,
+                }
+            )
+
+    provider = FakeProvider()
+    row = main_module._build_portfolio_review_intraday_row(
+        plan,
+        provider=provider,
+        as_of_date=date(2024, 1, 5),
+        interval_minutes=15,
+        benchmark_symbol="SPY",
+        benchmark_intraday_metrics={"intraday_return_vs_open": 0.01},
+        refresh_cache=True,
+    )
+
+    assert provider.calls == [
+        {
+            "symbol": "AAPL",
+            "session_date": date(2024, 1, 5),
+            "interval_minutes": 15,
+            "refresh_cache": True,
+        }
+    ]
+    assert row.symbol == "AAPL"
+    assert row.suggested_action == "WATCH CLOSELY"
+    assert row.metadata["position_source"] == "manual"
+    assert row.metadata["position_metadata"] == {"note": "starter"}
+    assert row.metadata["session_high"] == 116.0
+    assert row.metadata["session_vwap"] == pytest.approx((111.0 * 500_000 + 111.5 * 600_000 + 111.0 * 550_000) / 1_650_000)
+    assert row.metadata["intraday_relative_strength_diff"] is not None
+
+
+def test_handle_review_portfolio_intraday_writes_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = load_app_config()
+    preset = _selected_presets("standard_breakout")[0]
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n"
+        "AAPL,10,100,90,standard_breakout,manual,{}\n",
+        encoding="utf-8",
+    )
+
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.refresh_values: list[bool] = []
+
+        def fetch_intraday_bars(
+            self,
+            symbol: str,
+            session_date: date,
+            *,
+            interval_minutes: int = 15,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            self.refresh_values.append(refresh_cache)
+            if symbol == "SPY":
+                return pd.DataFrame(
+                    {
+                        "datetime": pd.to_datetime(
+                            ["2024-01-05 09:30:00", "2024-01-05 09:45:00", "2024-01-05 10:00:00"]
+                        ),
+                        "open": [100.0, 100.5, 100.8],
+                        "high": [100.8, 101.0, 101.2],
+                        "low": [99.9, 100.4, 100.7],
+                        "close": [100.5, 100.8, 101.0],
+                        "volume": [1_000_000, 1_100_000, 1_200_000],
+                        "vwap": [100.4, 100.6, 100.8],
+                        "symbol": [symbol] * 3,
+                    }
+                )
+            return pd.DataFrame(
+                {
+                    "datetime": pd.to_datetime(
+                        ["2024-01-05 09:30:00", "2024-01-05 09:45:00", "2024-01-05 10:00:00"]
+                    ),
+                    "open": [110.0, 113.0, 109.0],
+                    "high": [113.0, 116.0, 110.0],
+                    "low": [109.0, 108.0, 107.0],
+                    "close": [113.0, 109.0, 107.0],
+                    "volume": [500_000, 600_000, 550_000],
+                    "vwap": [111.0, 111.5, 111.0],
+                    "symbol": [symbol] * 3,
+                }
+            )
+
+    provider = FakeProvider()
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: provider)
+    monkeypatch.setattr(
+        main_module,
+        "_portfolio_review_preset_catalog",
+        lambda args, config: {preset.name: preset},
+    )
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio-intraday",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-05",
+            "--interval-minutes",
+            "15",
+            "--output-dir",
+            str(tmp_path / "intraday"),
+            "--format",
+            "json",
+        ]
+    )
+
+    result = main_module._handle_review_portfolio_intraday(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert payload["interval_minutes"] == 15
+    assert payload["watch_closely_count"] == 1
+    assert payload["exit_candidate_count"] == 0
+    assert Path(payload["outputs"]["portfolio_review_intraday_json"]).exists()
+    assert Path(payload["outputs"]["portfolio_review_intraday_csv"]).exists()
+    assert Path(payload["outputs"]["portfolio_review_intraday_brief"]).exists()
+    assert provider.refresh_values == [True, True]
+
+
+def test_handle_review_portfolio_intraday_returns_skipped_when_no_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = load_app_config()
+    preset = _selected_presets("standard_breakout")[0]
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n"
+        "AAPL,10,100,90,standard_breakout,manual,{}\n",
+        encoding="utf-8",
+    )
+
+    class EmptyProvider:
+        def fetch_intraday_bars(
+            self,
+            symbol: str,
+            session_date: date,
+            *,
+            interval_minutes: int = 15,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "datetime": pd.Series(dtype="datetime64[ns]"),
+                    "open": pd.Series(dtype="float64"),
+                    "high": pd.Series(dtype="float64"),
+                    "low": pd.Series(dtype="float64"),
+                    "close": pd.Series(dtype="float64"),
+                    "volume": pd.Series(dtype="int64"),
+                    "vwap": pd.Series(dtype="float64"),
+                    "symbol": pd.Series(dtype="object"),
+                }
+            )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: EmptyProvider())
+    monkeypatch.setattr(
+        main_module,
+        "_portfolio_review_preset_catalog",
+        lambda args, config: {preset.name: preset},
+    )
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio-intraday",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-06",
+            "--interval-minutes",
+            "15",
+            "--format",
+            "json",
+        ]
+    )
+
+    result = main_module._handle_review_portfolio_intraday(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert payload["status"] == "skipped"
+    assert payload["reason"] == "no_intraday_data"
+    assert payload["position_count"] == 1
+    assert payload["symbols_reviewed"] == []
+    assert payload["outputs"] == {}
 
 
 def test_run_daily_summary_workflow_treats_held_symbol_as_no_signal(

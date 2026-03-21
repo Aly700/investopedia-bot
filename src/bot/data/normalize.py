@@ -1,15 +1,19 @@
-"""Helpers for normalizing daily OHLCV data frames."""
+"""Helpers for normalizing daily and intraday OHLCV data frames."""
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, time
 from typing import Mapping
 
 import pandas as pd
 
 
 DAILY_BAR_COLUMNS = ("date", "open", "high", "low", "close", "volume", "symbol")
+INTRADAY_BAR_COLUMNS = ("datetime", "open", "high", "low", "close", "volume", "vwap", "symbol")
 PRICE_COLUMNS = ("open", "high", "low", "close")
+REGULAR_SESSION_START = time(9, 30)
+REGULAR_SESSION_END = time(16, 0)
+US_EQUITY_MARKET_TIMEZONE = "America/New_York"
 
 
 class DataNormalizationError(ValueError):
@@ -27,6 +31,23 @@ def empty_daily_bar_frame() -> pd.DataFrame:
             "low": pd.Series(dtype="float64"),
             "close": pd.Series(dtype="float64"),
             "volume": pd.Series(dtype="int64"),
+            "symbol": pd.Series(dtype="object"),
+        }
+    )
+
+
+def empty_intraday_bar_frame() -> pd.DataFrame:
+    """Return an empty intraday-bar frame with the canonical schema and dtypes."""
+
+    return pd.DataFrame(
+        {
+            "datetime": pd.Series(dtype="datetime64[ns]"),
+            "open": pd.Series(dtype="float64"),
+            "high": pd.Series(dtype="float64"),
+            "low": pd.Series(dtype="float64"),
+            "close": pd.Series(dtype="float64"),
+            "volume": pd.Series(dtype="int64"),
+            "vwap": pd.Series(dtype="float64"),
             "symbol": pd.Series(dtype="object"),
         }
     )
@@ -97,6 +118,73 @@ def normalize_daily_bars(
     return working_frame.loc[:, list(DAILY_BAR_COLUMNS)]
 
 
+def normalize_intraday_bars(
+    frame: pd.DataFrame,
+    *,
+    symbol: str | None = None,
+    column_mapping: Mapping[str, str] | None = None,
+) -> pd.DataFrame:
+    """Normalize provider output into the repo's canonical intraday-bar schema."""
+
+    if frame.empty:
+        return empty_intraday_bar_frame()
+
+    normalized_symbol = symbol.upper() if symbol is not None else None
+    working_frame = frame.copy()
+    if column_mapping is not None:
+        working_frame = working_frame.rename(columns=dict(column_mapping))
+
+    missing_columns = [
+        column
+        for column in ("datetime", "open", "high", "low", "close", "volume")
+        if column not in working_frame.columns
+    ]
+    if missing_columns:
+        expected_columns = ", ".join(missing_columns)
+        raise DataNormalizationError(
+            f"Missing required columns after normalization: {expected_columns}."
+        )
+
+    if "symbol" not in working_frame.columns:
+        if normalized_symbol is None:
+            raise DataNormalizationError("A symbol column or symbol argument is required.")
+        working_frame["symbol"] = normalized_symbol
+    if "vwap" not in working_frame.columns:
+        working_frame["vwap"] = pd.NA
+
+    working_frame = working_frame.loc[:, list(INTRADAY_BAR_COLUMNS)].copy()
+    working_frame["datetime"] = pd.to_datetime(working_frame["datetime"], errors="coerce", utc=True).dt.tz_convert(None)
+    for column in PRICE_COLUMNS:
+        working_frame[column] = pd.to_numeric(working_frame[column], errors="coerce")
+    working_frame["volume"] = pd.to_numeric(working_frame["volume"], errors="coerce")
+    working_frame["vwap"] = pd.to_numeric(working_frame["vwap"], errors="coerce")
+    working_frame["symbol"] = working_frame["symbol"].astype(str).str.strip().str.upper()
+
+    working_frame = working_frame.dropna(subset=["datetime", "open", "high", "low", "close", "volume"])
+    working_frame = working_frame[working_frame["symbol"] != ""]
+    for column in PRICE_COLUMNS:
+        working_frame = working_frame[working_frame[column] > 0]
+    working_frame = working_frame[working_frame["volume"] >= 0]
+
+    if working_frame.empty:
+        return empty_intraday_bar_frame()
+
+    working_frame["open"] = working_frame["open"].astype("float64")
+    working_frame["high"] = working_frame["high"].astype("float64")
+    working_frame["low"] = working_frame["low"].astype("float64")
+    working_frame["close"] = working_frame["close"].astype("float64")
+    working_frame["volume"] = working_frame["volume"].round(0).astype("int64")
+    working_frame["vwap"] = working_frame["vwap"].astype("float64")
+    working_frame["symbol"] = working_frame["symbol"].astype("object")
+
+    working_frame = (
+        working_frame.sort_values(["datetime", "symbol"])
+        .drop_duplicates(subset=["datetime", "symbol"], keep="last")
+        .reset_index(drop=True)
+    )
+    return working_frame.loc[:, list(INTRADAY_BAR_COLUMNS)]
+
+
 def filter_daily_bars_by_date(
     frame: pd.DataFrame,
     *,
@@ -113,3 +201,31 @@ def filter_daily_bars_by_date(
     if filtered.empty:
         return empty_daily_bar_frame()
     return filtered.loc[:, list(DAILY_BAR_COLUMNS)]
+
+
+def filter_intraday_bars_by_session_date(
+    frame: pd.DataFrame,
+    *,
+    session_date: date,
+    market_timezone: str = US_EQUITY_MARKET_TIMEZONE,
+    regular_session_only: bool = True,
+) -> pd.DataFrame:
+    """Filter a normalized intraday-bar frame to one trading session date."""
+
+    if frame.empty:
+        return empty_intraday_bar_frame()
+
+    localized_datetimes = frame["datetime"].dt.tz_localize("UTC").dt.tz_convert(
+        market_timezone
+    )
+    mask = localized_datetimes.dt.date == session_date
+    if regular_session_only:
+        session_clock = localized_datetimes.dt.time
+        mask &= (
+            (session_clock >= REGULAR_SESSION_START)
+            & (session_clock <= REGULAR_SESSION_END)
+        )
+    filtered = frame.loc[mask].reset_index(drop=True)
+    if filtered.empty:
+        return empty_intraday_bar_frame()
+    return filtered.loc[:, list(INTRADAY_BAR_COLUMNS)]

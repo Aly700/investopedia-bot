@@ -604,6 +604,126 @@ class PortfolioReviewReport:
 
 
 @dataclass(frozen=True)
+class IntradayPortfolioReviewReport:
+    """Intraday held-position review driven by scheduled bar polling."""
+
+    as_of_date: date
+    generated_at_utc: str
+    interval_minutes: int
+    portfolio_path: str | None
+    benchmark_symbol: str | None
+    current_positions: tuple[ExistingPosition, ...]
+    rows: tuple[PortfolioReviewRow, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly intraday review payload."""
+
+        action_counts = {
+            f"{action.lower().replace(' ', '_')}_count": sum(
+                row.suggested_action == action for row in self.rows
+            )
+            for action in PORTFOLIO_REVIEW_ACTIONS
+        }
+        return {
+            "as_of_date": self.as_of_date.isoformat(),
+            "generated_at_utc": self.generated_at_utc,
+            "interval_minutes": self.interval_minutes,
+            "portfolio_path": self.portfolio_path,
+            "benchmark_symbol": self.benchmark_symbol,
+            "position_count": len(self.current_positions),
+            "reviewed_symbol_count": len(self.rows),
+            "reviewed_symbols": [row.symbol for row in self.rows],
+            "current_position_symbols": [position.symbol for position in self.current_positions],
+            "current_positions": [position.to_dict() for position in self.current_positions],
+            **action_counts,
+            "rows": [row.to_dict() for row in self.rows],
+        }
+
+    def to_brief(self) -> str:
+        """Return a human-readable intraday trader brief."""
+
+        sorted_rows = sorted(
+            self.rows,
+            key=lambda row: (
+                MARKET_MONITOR_CATEGORY_PRIORITY.get(row.suggested_action, 99),
+                row.symbol,
+                row.preset_name or "",
+            ),
+        )
+        urgent_rows = [
+            row
+            for row in sorted_rows
+            if row.suggested_action == "EXIT CANDIDATE"
+            or (
+                row.suggested_action == "WATCH CLOSELY"
+                and (
+                    bool(row.metadata.get("failed_intraday_strength"))
+                    or (
+                        _optional_float(row.metadata.get("session_high_giveback_pct")) is not None
+                        and _optional_float(row.metadata.get("session_high_giveback_exit_threshold")) is not None
+                        and _optional_float(row.metadata.get("session_high_giveback_pct"))
+                        >= _optional_float(row.metadata.get("session_high_giveback_exit_threshold"))
+                    )
+                )
+            )
+        ]
+        pressure_rows = [
+            row
+            for row in sorted_rows
+            if row.suggested_action in {"EXIT CANDIDATE", "WATCH CLOSELY"}
+        ]
+        healthy_rows = [
+            row
+            for row in sorted_rows
+            if row.suggested_action in {"HOLD", "RAISE STOP"}
+        ]
+
+        exit_count = sum(row.suggested_action == "EXIT CANDIDATE" for row in self.rows)
+        watch_count = sum(row.suggested_action == "WATCH CLOSELY" for row in self.rows)
+        hold_count = sum(row.suggested_action == "HOLD" for row in self.rows)
+        raise_stop_count = sum(row.suggested_action == "RAISE STOP" for row in self.rows)
+
+        lines = [f"Intraday portfolio brief for {self.as_of_date.isoformat()}", "", "Headline"]
+        lines.append(
+            f"Interval: {self.interval_minutes}m | "
+            f"Reviewed: {len(self.rows)} | "
+            f"Exit: {exit_count} | "
+            f"Watch: {watch_count} | "
+            f"Hold: {hold_count} | "
+            f"Raise stop: {raise_stop_count}"
+        )
+        lines.append(
+            "Benchmark: "
+            + (self.benchmark_symbol or "none")
+            + " | Portfolio: "
+            + (self.portfolio_path or "n/a")
+        )
+
+        lines.extend(("", "Urgent intraday actions"))
+        if urgent_rows:
+            for row in urgent_rows:
+                lines.append(_intraday_portfolio_review_brief_line(row))
+        else:
+            lines.append("No urgent intraday actions.")
+
+        lines.extend(("", "Current holdings under pressure"))
+        if pressure_rows:
+            for row in pressure_rows:
+                lines.append(_intraday_portfolio_review_brief_line(row))
+        else:
+            lines.append("No holdings are currently under intraday pressure.")
+
+        lines.extend(("", "Holdings still healthy"))
+        if healthy_rows:
+            for row in healthy_rows:
+                lines.append(_intraday_portfolio_review_brief_line(row))
+        else:
+            lines.append("No holdings are currently classified as healthy.")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+
+@dataclass(frozen=True)
 class MarketMonitorAlertRow:
     """One compact alert row for scheduled market monitoring."""
 
@@ -835,6 +955,28 @@ def build_portfolio_review_report(
     )
 
 
+def build_intraday_portfolio_review_report(
+    *,
+    as_of_date: date,
+    interval_minutes: int,
+    portfolio_path: str | None,
+    rows: Sequence[PortfolioReviewRow],
+    current_positions: Sequence[ExistingPosition],
+    benchmark_symbol: str | None = None,
+) -> IntradayPortfolioReviewReport:
+    """Build an intraday portfolio review report from row-level suggestions."""
+
+    return IntradayPortfolioReviewReport(
+        as_of_date=as_of_date,
+        generated_at_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        interval_minutes=interval_minutes,
+        portfolio_path=portfolio_path,
+        benchmark_symbol=benchmark_symbol,
+        current_positions=tuple(current_positions),
+        rows=tuple(rows),
+    )
+
+
 def build_market_monitor_report(
     *,
     as_of_date: date,
@@ -968,6 +1110,45 @@ def write_portfolio_review_report(
         writer.writeheader()
         for row in report.rows:
             writer.writerow(row.to_record())
+    return resolved_output_path
+
+
+def write_intraday_portfolio_review_report(
+    report: IntradayPortfolioReviewReport,
+    output_path: Path,
+    *,
+    output_format: str | None = None,
+) -> Path:
+    """Write an intraday portfolio review report to CSV or JSON."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_format = _resolve_output_format(resolved_output_path, output_format)
+
+    if resolved_format == "json":
+        resolved_output_path.write_text(
+            json.dumps(report.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return resolved_output_path
+
+    with resolved_output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PORTFOLIO_REVIEW_COLUMNS)
+        writer.writeheader()
+        for row in report.rows:
+            writer.writerow(row.to_record())
+    return resolved_output_path
+
+
+def write_intraday_portfolio_review_brief(
+    report: IntradayPortfolioReviewReport,
+    output_path: Path,
+) -> Path:
+    """Write a human-readable intraday portfolio trader brief."""
+
+    resolved_output_path = output_path.resolve()
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_output_path.write_text(report.to_brief(), encoding="utf-8")
     return resolved_output_path
 
 
@@ -1628,6 +1809,24 @@ def _portfolio_review_brief_line(row: PortfolioReviewRow) -> str:
     if row.suggested_stop is not None:
         parts.append(f"suggested_stop={_brief_value(row.suggested_stop)}")
     parts.append(f"close={_brief_value(row.latest_close)}")
+    parts.append(f"note={_single_line(row.rationale)}")
+    return "- " + " | ".join(parts)
+
+
+def _intraday_portfolio_review_brief_line(row: PortfolioReviewRow) -> str:
+    parts = [row.suggested_action, row.symbol]
+    if row.preset_name:
+        parts.append(f"preset={row.preset_name}")
+    parts.append(f"close={_brief_value(row.latest_close)}")
+    session_vwap = _optional_float(row.metadata.get("session_vwap"))
+    if session_vwap is not None:
+        parts.append(f"vwap={_brief_value(session_vwap)}")
+    session_high = _optional_float(row.metadata.get("session_high"))
+    if session_high is not None:
+        parts.append(f"session_high={_brief_value(session_high)}")
+    giveback_pct = _optional_float(row.metadata.get("session_high_giveback_pct"))
+    if giveback_pct is not None:
+        parts.append(f"giveback={giveback_pct:.1%}")
     parts.append(f"note={_single_line(row.rationale)}")
     return "- " + " | ".join(parts)
 

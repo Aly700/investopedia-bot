@@ -309,6 +309,34 @@ The intended daily workflow is:
 2. run `review-portfolio` to manage existing holdings
 3. run `daily-summary` or `generate-orders` to evaluate fresh entries against the same snapshot
 
+### Review existing holdings intraday
+
+```bash
+investopedia-bot review-portfolio-intraday --portfolio-file data/processed/portfolio/current_positions.csv --as-of 2026-03-20 --interval-minutes 15
+investopedia-bot review-portfolio-intraday --portfolio-file data/processed/portfolio/current_positions.csv --as-of 2026-03-20 --interval-minutes 15 --benchmark-symbol SPY
+```
+
+This command is the scheduled intraday sell-monitoring layer for held positions only. It does not scan new buys or change sizing. Instead, it fetches one session of intraday aggregate bars for each open position and checks:
+
+- intraday stop breaches
+- session-high giveback after a profitable move
+- failed intraday strength, including fades back below VWAP or the session open
+- intraday momentum fade and simple benchmark-relative weakness
+
+It writes:
+
+- `portfolio_review_intraday.json`
+- `portfolio_review_intraday.csv`
+- `portfolio_review_intraday_brief.txt`
+
+The brief is the decision-first human-readable layer. It groups names into:
+
+- `Urgent intraday actions`
+- `Current holdings under pressure`
+- `Holdings still healthy`
+
+Use it as a market-hours polling job, for example every 15 minutes during the session. Keep the existing daily `review-portfolio` path for end-of-day confirmation and stop-raising logic.
+
 ### Render manual orders from offline signals
 
 ```bash
@@ -635,7 +663,7 @@ Outputs and logs:
 - Signal generation should stay separate from execution. Research code can emit candidate trades, while execution modules only format or route orders.
 - The data layer normalizes every provider into one daily-bar schema before strategy or backtest code sees it.
 - Cache files are plain CSVs so they are easy to inspect, delete, or regenerate.
-- Daily-bar assumptions are first-class. The repo is meant for end-of-day research and next-session decision support, not intraday automation.
+- Daily bars remain the primary research timeframe. Intraday support is intentionally limited to scheduled held-position monitoring and does not turn the repo into a streaming executor.
 - Simulator-specific rules live in config, not in strategy logic. That keeps backtests and manual order prep aligned.
 - The backtest engine uses decision-on-close and fill-on-next-open semantics to avoid look-ahead bias. Trailing stops only update after the close and become active on the following session.
 - The manual execution layer is intentionally report-first. It produces human-readable orders and research artifacts, but it does not submit anything to Investopedia yet.
