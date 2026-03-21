@@ -37,6 +37,11 @@ class BreakoutMomentumSettings:
     enable_regime_filter: bool = True
     regime_filter_mode: RegimeFilterMode = "either"
     relative_volume_window: int | None = None
+    profit_giveback_threshold: float = 0.10
+    profit_giveback_min_unrealized_pct: float = 0.10
+    stale_high_watch_days: int = 15
+    relative_strength_window: int = 20
+    relative_strength_watch_threshold: float = -0.05
 
     @classmethod
     def from_configs(
@@ -77,6 +82,14 @@ class BreakoutMomentumSettings:
             raise ValueError("trailing_stop_atr must be greater than zero.")
         if self.relative_volume_window is not None and self.relative_volume_window <= 0:
             raise ValueError("relative_volume_window must be greater than zero when provided.")
+        if self.profit_giveback_threshold <= 0 or self.profit_giveback_threshold >= 1:
+            raise ValueError("profit_giveback_threshold must be between zero and one.")
+        if self.profit_giveback_min_unrealized_pct <= 0:
+            raise ValueError("profit_giveback_min_unrealized_pct must be greater than zero.")
+        if self.stale_high_watch_days <= 0:
+            raise ValueError("stale_high_watch_days must be greater than zero.")
+        if self.relative_strength_window <= 0:
+            raise ValueError("relative_strength_window must be greater than zero.")
         if self.regime_filter_mode not in VALID_REGIME_FILTER_MODES:
             raise ValueError(
                 "regime_filter_mode must be one of "
@@ -114,6 +127,7 @@ class BreakoutStrategyPreset:
     risk_per_trade: float
     require_relative_volume_confirmation: bool = False
     regime_filter_mode: RegimeFilterMode = "either"
+    profit_giveback_threshold: float = 0.10
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -128,6 +142,8 @@ class BreakoutStrategyPreset:
             raise ValueError("trailing_stop_atr must be greater than zero.")
         if self.risk_per_trade <= 0:
             raise ValueError("risk_per_trade must be greater than zero.")
+        if self.profit_giveback_threshold <= 0 or self.profit_giveback_threshold >= 1:
+            raise ValueError("profit_giveback_threshold must be between zero and one.")
         if self.regime_filter_mode not in VALID_REGIME_FILTER_MODES:
             raise ValueError(
                 "regime_filter_mode must be one of "
@@ -151,6 +167,11 @@ class BreakoutStrategyPreset:
                 default=False,
             ),
             regime_filter_mode=_mapping_regime_filter_mode(data),
+            profit_giveback_threshold=(
+                _mapping_float(data, "profit_giveback_threshold")
+                if "profit_giveback_threshold" in data
+                else 0.10
+            ),
         )
 
     @property
@@ -164,7 +185,8 @@ class BreakoutStrategyPreset:
             f"initial_stop={self.initial_stop_atr:g}|"
             f"trailing_stop={self.trailing_stop_atr:g}|"
             f"risk={self.risk_per_trade:g}|"
-            f"regime={self.regime_filter_mode}"
+            f"regime={self.regime_filter_mode}|"
+            f"giveback={self.profit_giveback_threshold:g}"
         )
 
     def apply_to_settings(
@@ -192,6 +214,7 @@ class BreakoutStrategyPreset:
                 else force_require_relative_volume_confirmation
             ),
             regime_filter_mode=self.regime_filter_mode,
+            profit_giveback_threshold=self.profit_giveback_threshold,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -207,6 +230,7 @@ class BreakoutStrategyPreset:
             "trailing_stop_atr": self.trailing_stop_atr,
             "risk_per_trade": self.risk_per_trade,
             "regime_filter_mode": self.regime_filter_mode,
+            "profit_giveback_threshold": self.profit_giveback_threshold,
         }
 
 
@@ -224,6 +248,7 @@ def build_default_breakout_presets(
         trailing_stop_atr=risk_config.trailing_stop_atr,
         risk_per_trade=risk_config.risk_per_trade,
         require_relative_volume_confirmation=False,
+        profit_giveback_threshold=0.10,
     )
     confirmed = BreakoutStrategyPreset(
         name="confirmed_breakout",
@@ -233,6 +258,7 @@ def build_default_breakout_presets(
         trailing_stop_atr=risk_config.trailing_stop_atr,
         risk_per_trade=risk_config.risk_per_trade,
         require_relative_volume_confirmation=True,
+        profit_giveback_threshold=0.10,
     )
     conservative = BreakoutStrategyPreset(
         name="conservative_breakout",
@@ -242,6 +268,7 @@ def build_default_breakout_presets(
         trailing_stop_atr=risk_config.trailing_stop_atr + 0.5,
         risk_per_trade=max(risk_config.risk_per_trade * 0.5, 0.0025),
         require_relative_volume_confirmation=False,
+        profit_giveback_threshold=0.12,
     )
     confirmed_conservative = BreakoutStrategyPreset(
         name="confirmed_conservative_breakout",
@@ -251,6 +278,7 @@ def build_default_breakout_presets(
         trailing_stop_atr=conservative.trailing_stop_atr,
         risk_per_trade=conservative.risk_per_trade,
         require_relative_volume_confirmation=True,
+        profit_giveback_threshold=0.12,
     )
     aggressive = BreakoutStrategyPreset(
         name="aggressive_breakout",
@@ -261,6 +289,7 @@ def build_default_breakout_presets(
         risk_per_trade=min(0.05, risk_config.risk_per_trade * 1.5),
         require_relative_volume_confirmation=False,
         regime_filter_mode="fast_above_slow",
+        profit_giveback_threshold=0.08,
     )
     return {
         conservative.name: conservative,
@@ -294,7 +323,8 @@ def breakout_preset_from_cli_definition(raw_value: str) -> BreakoutStrategyPrese
     ``name=my_preset,breakout_lookback=20,relative_volume_threshold=1.5,initial_stop_atr=2.5,trailing_stop_atr=3.0,risk_per_trade=0.01,regime_filter_mode=fast_above_slow``
 
     Optional fields:
-    ``require_relative_volume_confirmation=true|false`` and
+    ``require_relative_volume_confirmation=true|false``,
+    ``profit_giveback_threshold=0.08``, and
     ``regime_filter_mode=close_above_slow|fast_above_slow|either``.
     Valid ``regime_filter_mode`` values are ``close_above_slow``,
     ``fast_above_slow``, and ``either``. These values are case-insensitive.

@@ -560,8 +560,19 @@ def test_market_monitor_text_summary_header_matches_alert_priority_order() -> No
 def test_market_monitor_brief_separates_holdings_and_buy_candidates(tmp_path: Path) -> None:
     preset = _selected_presets("standard_breakout")[0]
     approved_candidates = [
-        _evaluation(preset, symbol="BBB", approved=True, shares=25),
-        _evaluation(preset, symbol="AAA", approved=True, shares=20),
+        _evaluation(preset, symbol="BBB", approved=True, shares=25, relative_volume=2.2),
+        _evaluation(preset, symbol="AAA", approved=True, shares=20, relative_volume=2.8),
+        _evaluation(preset, symbol="CCC", approved=True, shares=15, relative_volume=1.9),
+    ]
+    lower_priority_candidate = [
+        _evaluation(
+            preset,
+            symbol="DDD",
+            approved=False,
+            shares=0,
+            relative_volume=1.2,
+            rejection_reasons=("Relative volume confirmation was not strong enough.",),
+        )
     ]
     summary = build_daily_research_summary(
         as_of_date=date(2024, 1, 5),
@@ -569,9 +580,9 @@ def test_market_monitor_brief_separates_holdings_and_buy_candidates(tmp_path: Pa
             [evaluation.candidate for evaluation in approved_candidates],
             as_of_date=date(2024, 1, 5),
         ),
-        evaluations=approved_candidates,
+        evaluations=[*approved_candidates, *lower_priority_candidate],
         selected_presets=[preset],
-        universe_symbols=["AAA", "BBB", "AAPL", "AMD"],
+        universe_symbols=["AAA", "BBB", "CCC", "DDD", "AAPL", "AMD"],
         current_equity=100_000.0,
         no_signal_symbols_by_preset={"standard_breakout": ()},
         benchmark_symbol="SPY",
@@ -647,15 +658,67 @@ def test_market_monitor_brief_separates_holdings_and_buy_candidates(tmp_path: Pa
     assert "Current holdings" in text
     assert "Top buy candidates" in text
     assert "Lower-priority names" in text
+    best_actions_section = text.split("Best actions now\n", 1)[1].split("\n\nCurrent holdings", 1)[0]
     holdings_section = text.split("Current holdings\n", 1)[1].split("\n\nTop buy candidates", 1)[0]
     buy_section = text.split("Top buy candidates\n", 1)[1].split("\n\nLower-priority names", 1)[0]
     lower_priority_section = text.split("Lower-priority names\n", 1)[1]
+    assert "- Urgent holdings: AAPL (RAISE STOP)" in best_actions_section
+    assert "- Best buys: AAA, BBB, CCC" in best_actions_section
     assert "AAPL" in holdings_section
-    assert "AAA" in buy_section
-    assert "BBB" in buy_section
+    assert "AMD" in holdings_section
+    assert "AAA" not in holdings_section
+    assert "DDD" not in holdings_section
+    assert "1. AAA" in buy_section
+    assert "2. BBB" in buy_section
+    assert "3. CCC" in buy_section
     assert "AAPL" not in buy_section
-    assert buy_section.index("AAA") < buy_section.index("BBB")
-    assert "AMD" in lower_priority_section
+    assert "AMD" not in buy_section
+    assert buy_section.index("1. AAA") < buy_section.index("2. BBB") < buy_section.index("3. CCC")
+    assert "DDD" in lower_priority_section
+    assert "AMD" not in lower_priority_section
+    assert "AAPL" not in lower_priority_section
+
+
+def test_market_monitor_brief_limits_top_buy_section_and_moves_remainder_lower(
+    tmp_path: Path,
+) -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved_candidates = [
+        _evaluation(preset, symbol="AAA", approved=True, shares=30, relative_volume=3.0),
+        _evaluation(preset, symbol="BBB", approved=True, shares=30, relative_volume=2.8),
+        _evaluation(preset, symbol="CCC", approved=True, shares=30, relative_volume=2.6),
+        _evaluation(preset, symbol="DDD", approved=True, shares=30, relative_volume=2.4),
+        _evaluation(preset, symbol="EEE", approved=True, shares=30, relative_volume=2.2),
+        _evaluation(preset, symbol="FFF", approved=True, shares=30, relative_volume=2.0),
+    ]
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=ManualExecutor().build_execution_batch(
+            [evaluation.candidate for evaluation in approved_candidates],
+            as_of_date=date(2024, 1, 5),
+        ),
+        evaluations=approved_candidates,
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB", "CCC", "DDD", "EEE", "FFF"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+    report = build_market_monitor_report(as_of_date=date(2024, 1, 5), daily_summary=summary)
+
+    brief_path = write_market_monitor_brief(report, tmp_path / "market_monitor_brief.txt")
+    text = brief_path.read_text(encoding="utf-8")
+
+    best_actions_section = text.split("Best actions now\n", 1)[1].split("\n\nCurrent holdings", 1)[0]
+    buy_section = text.split("Top buy candidates\n", 1)[1].split("\n\nLower-priority names", 1)[0]
+    lower_priority_section = text.split("Lower-priority names\n", 1)[1]
+    assert "- Best buys: AAA, BBB, CCC, DDD, EEE" in best_actions_section
+    assert "FFF" not in best_actions_section
+    assert "1. AAA" in buy_section
+    assert "5. EEE" in buy_section
+    assert "6. FFF" not in buy_section
+    assert "6. FFF" in lower_priority_section
 
 
 def test_market_monitor_report_orders_multiple_alert_categories_by_priority() -> None:
@@ -1359,6 +1422,67 @@ def test_portfolio_review_reference_close_filters_to_post_entry_dates_only() -> 
     reference_close = main_module._portfolio_review_reference_close(bars, position=position)
 
     assert reference_close == pytest.approx(160.0)
+
+
+def test_build_portfolio_review_row_includes_profit_protection_metadata() -> None:
+    preset = _selected_presets("aggressive_breakout")[0]
+    settings = main_module.BreakoutMomentumSettings.from_configs(
+        _signal_config(),
+        _risk_config(),
+        enable_regime_filter=False,
+    )
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+        preset_name=preset.name,
+        metadata={"entry_date": "2024-01-02"},
+    )
+    plan = {
+        "position": position,
+        "preset": preset,
+        "preset_resolution": "portfolio_snapshot",
+        "settings": preset.apply_to_settings(settings),
+        "fetch_start": date(2024, 1, 1),
+    }
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(
+                        ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"]
+                    ),
+                    "open": [100.0, 101.0, 129.0, 120.0, 114.0],
+                    "high": [101.0, 130.0, 131.0, 121.0, 115.0],
+                    "low": [99.0, 100.0, 118.0, 112.0, 110.0],
+                    "close": [100.0, 101.0, 130.0, 120.0, 114.0],
+                    "volume": [1_000_000.0] * 5,
+                    "symbol": [symbol] * 5,
+                }
+            )
+
+    row = main_module._build_portfolio_review_row(
+        plan,
+        provider=FakeProvider(),
+        as_of_date=date(2024, 1, 5),
+        benchmark_frame=None,
+        refresh_cache=False,
+    )
+
+    assert row.suggested_action == "EXIT CANDIDATE"
+    assert row.metadata["high_water_close"] == pytest.approx(130.0)
+    assert row.metadata["giveback_pct"] == pytest.approx((130.0 - 114.0) / 130.0)
+    assert row.metadata["days_since_new_high"] == 2
+    assert row.metadata["failed_breakout_detected"] is False
 
 
 def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:

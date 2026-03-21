@@ -180,6 +180,7 @@ class PortfolioReviewDecision:
     suggested_stop: float | None = None
     trailing_stop_candidate: float | None = None
     rationale: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.suggested_action not in PORTFOLIO_REVIEW_ACTIONS:
@@ -378,17 +379,54 @@ def review_existing_long_position(
     regime_passed: bool | None,
     trailing_stop_candidate: float | None = None,
     watch_distance_pct: float = 0.03,
+    high_water_close: float | None = None,
+    profit_giveback_threshold: float = 0.10,
+    profit_giveback_min_unrealized_pct: float = 0.10,
+    breakout_failure_reference: float | None = None,
+    days_since_new_high: int | None = None,
+    stale_high_watch_days: int = 15,
+    relative_strength_return_diff: float | None = None,
+    relative_strength_window: int | None = None,
+    relative_strength_watch_threshold: float = -0.05,
 ) -> PortfolioReviewDecision:
     """Review one long position and suggest a simple management action."""
 
     _validate_finite_positive(latest_close, name="latest_close")
     _validate_finite_non_negative(watch_distance_pct, name="watch_distance_pct")
+    if profit_giveback_threshold <= 0 or profit_giveback_threshold >= 1:
+        raise ValueError("profit_giveback_threshold must be between zero and one.")
+    if profit_giveback_min_unrealized_pct <= 0:
+        raise ValueError("profit_giveback_min_unrealized_pct must be greater than zero.")
+    if stale_high_watch_days <= 0:
+        raise ValueError("stale_high_watch_days must be greater than zero.")
+    if days_since_new_high is not None and days_since_new_high < 0:
+        raise ValueError("days_since_new_high cannot be negative.")
+    if relative_strength_window is not None and relative_strength_window <= 0:
+        raise ValueError("relative_strength_window must be greater than zero when provided.")
 
     unrealized_pl_pct = (latest_close / position.average_entry_price) - 1.0
     above_entry = latest_close >= position.average_entry_price
     distance_to_stop_pct: float | None = None
     if position.current_stop is not None:
         distance_to_stop_pct = (latest_close - position.current_stop) / latest_close
+
+    giveback_pct: float | None = None
+    if high_water_close is not None:
+        _validate_finite_positive(high_water_close, name="high_water_close")
+        giveback_pct = max((high_water_close - latest_close) / high_water_close, 0.0)
+
+    failed_breakout = (
+        breakout_failure_reference is not None
+        and latest_close < breakout_failure_reference
+    )
+    stale_position = (
+        days_since_new_high is not None
+        and days_since_new_high >= stale_high_watch_days
+    )
+    weak_relative_strength = (
+        relative_strength_return_diff is not None
+        and relative_strength_return_diff <= relative_strength_watch_threshold
+    )
 
     suggested_stop = suggest_long_stop_update(
         current_stop=position.current_stop,
@@ -400,12 +438,43 @@ def review_existing_long_position(
     if suggested_stop is not None and suggested_stop >= latest_close:
         suggested_stop = None
     rationale: list[str] = []
+    metadata = {
+        "high_water_close": high_water_close,
+        "giveback_pct": giveback_pct,
+        "profit_giveback_threshold": profit_giveback_threshold,
+        "profit_giveback_min_unrealized_pct": profit_giveback_min_unrealized_pct,
+        "breakout_failure_reference": breakout_failure_reference,
+        "failed_breakout_detected": failed_breakout,
+        "days_since_new_high": days_since_new_high,
+        "stale_high_watch_days": stale_high_watch_days,
+        "stale_position": stale_position,
+        "relative_strength_return_diff": relative_strength_return_diff,
+        "relative_strength_window": relative_strength_window,
+        "relative_strength_watch_threshold": relative_strength_watch_threshold,
+        "weak_relative_strength": weak_relative_strength,
+    }
 
     if position.current_stop is not None and latest_close <= position.current_stop:
         rationale.append("Latest close is at or below the current stop.")
         action = "EXIT CANDIDATE"
     elif regime_passed is False and not above_entry:
         rationale.append("Benchmark regime is weak and the position is below the average entry price.")
+        action = "EXIT CANDIDATE"
+    elif (
+        giveback_pct is not None
+        and unrealized_pl_pct > profit_giveback_min_unrealized_pct
+        and giveback_pct > profit_giveback_threshold
+    ):
+        rationale.append(
+            "Profitable position has given back "
+            f"{giveback_pct:.1%} from the high-water close of {high_water_close:.2f}."
+        )
+        action = "EXIT CANDIDATE"
+    elif failed_breakout:
+        rationale.append(
+            "Latest close has fallen back below the breakout reference of "
+            f"{breakout_failure_reference:.2f}."
+        )
         action = "EXIT CANDIDATE"
     elif suggested_stop is not None:
         rationale.append("Trailing-stop logic supports a higher stop without lowering risk control.")
@@ -414,6 +483,8 @@ def review_existing_long_position(
         (distance_to_stop_pct is not None and distance_to_stop_pct <= watch_distance_pct)
         or regime_passed is False
         or not above_entry
+        or stale_position
+        or weak_relative_strength
     ):
         if distance_to_stop_pct is not None and distance_to_stop_pct <= watch_distance_pct:
             rationale.append("Latest close is close to the current stop.")
@@ -421,6 +492,20 @@ def review_existing_long_position(
             rationale.append("Benchmark regime filter is not currently passing.")
         if not above_entry:
             rationale.append("Position is below the average entry price.")
+        if stale_position and days_since_new_high is not None:
+            rationale.append(
+                f"Position has gone {days_since_new_high} trading days without a new closing high."
+            )
+        if weak_relative_strength and relative_strength_return_diff is not None:
+            if relative_strength_window is not None:
+                rationale.append(
+                    f"Relative strength vs benchmark over {relative_strength_window} trading days is "
+                    f"{relative_strength_return_diff:.1%}."
+                )
+            else:
+                rationale.append(
+                    f"Relative strength vs benchmark is {relative_strength_return_diff:.1%}."
+                )
         action = "WATCH CLOSELY"
     else:
         rationale.append("Position remains above entry and sufficiently above the current stop.")
@@ -440,6 +525,7 @@ def review_existing_long_position(
         suggested_stop=suggested_stop,
         trailing_stop_candidate=trailing_stop_candidate,
         rationale=tuple(rationale),
+        metadata=metadata,
     )
 
 

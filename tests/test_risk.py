@@ -556,6 +556,75 @@ def test_review_existing_long_position_suggests_exit_candidate() -> None:
     assert "current stop" in " ".join(decision.rationale).lower()
 
 
+def test_review_existing_long_position_exits_on_large_profit_giveback() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=102.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=115.0,
+        regime_passed=True,
+        trailing_stop_candidate=106.0,
+        high_water_close=130.0,
+        profit_giveback_threshold=0.08,
+        profit_giveback_min_unrealized_pct=0.10,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.suggested_stop is None
+    assert decision.trailing_stop_candidate is None
+    assert decision.metadata["high_water_close"] == pytest.approx(130.0)
+    assert decision.metadata["giveback_pct"] == pytest.approx((130.0 - 115.0) / 130.0)
+    assert "given back" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_does_not_exit_on_small_profit_giveback() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=116.0,
+        regime_passed=True,
+        trailing_stop_candidate=None,
+        high_water_close=120.0,
+        profit_giveback_threshold=0.08,
+        profit_giveback_min_unrealized_pct=0.10,
+    )
+
+    assert decision.suggested_action == "HOLD"
+    assert decision.metadata["giveback_pct"] == pytest.approx((120.0 - 116.0) / 120.0)
+
+
+def test_review_existing_long_position_exits_on_failed_breakout_reference() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=94.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=101.0,
+        regime_passed=True,
+        trailing_stop_candidate=None,
+        breakout_failure_reference=103.0,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["failed_breakout_detected"] is True
+    assert "breakout reference" in " ".join(decision.rationale).lower()
+
+
 def test_review_existing_long_position_trailing_stop_above_latest_close_does_not_raise_stop() -> None:
     # Regression: trailing_stop_candidate above latest_close must never produce RAISE STOP.
     # Mirrors the live NET case: close=221.27, bad candidate=228.574.
@@ -617,6 +686,58 @@ def test_review_existing_long_position_raise_stop_suggested_stop_always_below_la
     assert decision.suggested_action == "RAISE STOP"
     assert decision.suggested_stop is not None
     assert decision.suggested_stop < decision.latest_close
+
+
+def test_review_existing_long_position_raise_stop_still_wins_over_stale_and_weak_relative_strength() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=120.0,
+        regime_passed=True,
+        trailing_stop_candidate=108.0,
+        high_water_close=123.0,
+        days_since_new_high=18,
+        stale_high_watch_days=15,
+        relative_strength_return_diff=-0.07,
+        relative_strength_window=20,
+    )
+
+    assert decision.suggested_action == "RAISE STOP"
+    assert decision.suggested_stop == pytest.approx(108.0)
+    assert decision.metadata["stale_position"] is True
+    assert decision.metadata["weak_relative_strength"] is True
+
+
+def test_review_existing_long_position_marks_stale_weak_relative_strength_as_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+
+    decision = review_existing_long_position(
+        position,
+        latest_close=112.0,
+        regime_passed=True,
+        trailing_stop_candidate=None,
+        high_water_close=118.0,
+        days_since_new_high=16,
+        stale_high_watch_days=15,
+        relative_strength_return_diff=-0.06,
+        relative_strength_window=20,
+    )
+
+    assert decision.suggested_action == "WATCH CLOSELY"
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "trading days without a new closing high" in joined_rationale
+    assert "relative strength" in joined_rationale
 
 
 def test_review_existing_long_position_clears_stop_for_weak_regime_exit_candidate() -> None:

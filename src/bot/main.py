@@ -10,7 +10,7 @@ from datetime import timedelta
 import json
 from pathlib import Path
 import sys
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 import yaml
@@ -2313,12 +2313,16 @@ def _build_portfolio_review_plan(
 ) -> dict[str, object]:
     preset, preset_resolution = _resolve_portfolio_review_preset(position, preset_catalog)
     settings = preset.apply_to_settings(base_settings)
+    fetch_start = _strategy_warmup_start(as_of_date, settings)
+    entry_date = _position_entry_date(position)
+    if entry_date is not None and entry_date < fetch_start:
+        fetch_start = entry_date
     return {
         "position": position,
         "preset": preset,
         "preset_resolution": preset_resolution,
         "settings": settings,
-        "fetch_start": _strategy_warmup_start(as_of_date, settings),
+        "fetch_start": fetch_start,
     }
 
 
@@ -2362,6 +2366,15 @@ def _build_portfolio_review_row(
         position=position,
         settings=settings,
     )
+    high_water_metrics = _portfolio_review_high_water_metrics(
+        prepared_bars,
+        position=position,
+    )
+    relative_strength_metrics = _portfolio_review_relative_strength_metrics(
+        prepared_bars,
+        benchmark_frame=benchmark_frame,
+        window=settings.relative_strength_window,
+    )
     regime_passed: bool | None = None
     if settings.enable_regime_filter:
         if benchmark_frame is None or benchmark_frame.empty:
@@ -2375,6 +2388,15 @@ def _build_portfolio_review_row(
         latest_close=latest_close,
         regime_passed=regime_passed,
         trailing_stop_candidate=trailing_stop_candidate,
+        high_water_close=high_water_metrics.get("high_water_close"),
+        profit_giveback_threshold=settings.profit_giveback_threshold,
+        profit_giveback_min_unrealized_pct=settings.profit_giveback_min_unrealized_pct,
+        breakout_failure_reference=_portfolio_review_breakout_failure_reference(position),
+        days_since_new_high=high_water_metrics.get("days_since_new_high"),
+        stale_high_watch_days=settings.stale_high_watch_days,
+        relative_strength_return_diff=relative_strength_metrics.get("relative_strength_return_diff"),
+        relative_strength_window=settings.relative_strength_window,
+        relative_strength_watch_threshold=settings.relative_strength_watch_threshold,
     )
     entry_date_used = _position_entry_date(position)
     return PortfolioReviewRow(
@@ -2401,6 +2423,14 @@ def _build_portfolio_review_row(
             "regime_filter_mode": settings.regime_filter_mode,
             "benchmark_symbol": settings.benchmark_symbol if settings.enable_regime_filter else None,
             "entry_date_used": entry_date_used.isoformat() if entry_date_used is not None else None,
+            "high_water_close": high_water_metrics.get("high_water_close"),
+            "high_water_close_date": high_water_metrics.get("high_water_close_date"),
+            "days_since_new_high": high_water_metrics.get("days_since_new_high"),
+            "relative_strength_window": relative_strength_metrics.get("relative_strength_window"),
+            "relative_strength_symbol_return": relative_strength_metrics.get("symbol_return"),
+            "relative_strength_benchmark_return": relative_strength_metrics.get("benchmark_return"),
+            "relative_strength_return_diff": relative_strength_metrics.get("relative_strength_return_diff"),
+            **decision.metadata,
         },
     )
 
@@ -2437,22 +2467,160 @@ def _portfolio_review_reference_close(
     *,
     position: ExistingPosition,
 ) -> float | None:
+    prepared = _portfolio_review_history_since_entry(price_frame, position=position)
+    if prepared.empty:
+        return None
+    return float(prepared["close"].max())
+
+
+def _portfolio_review_history_since_entry(
+    price_frame: pd.DataFrame,
+    *,
+    position: ExistingPosition,
+) -> pd.DataFrame:
     prepared = price_frame.copy()
     prepared["close"] = pd.to_numeric(prepared["close"], errors="coerce")
     prepared["date"] = pd.to_datetime(prepared["date"], errors="coerce")
-    prepared = prepared.dropna(subset=["close", "date"])
+    prepared = prepared.dropna(subset=["close", "date"]).sort_values("date", kind="stable")
     if prepared.empty:
-        return None
+        return prepared.reset_index(drop=True)
 
     entry_date = _position_entry_date(position)
     if entry_date is not None:
         entry_mask = prepared["date"].dt.date >= entry_date
         if bool(entry_mask.any()):
             prepared = prepared.loc[entry_mask]
+    return prepared.reset_index(drop=True)
 
+
+def _portfolio_review_high_water_metrics(
+    price_frame: pd.DataFrame,
+    *,
+    position: ExistingPosition,
+) -> dict[str, float | int | str | None]:
+    prepared = _portfolio_review_history_since_entry(price_frame, position=position)
     if prepared.empty:
+        return {
+            "high_water_close": None,
+            "high_water_close_date": None,
+            "days_since_new_high": None,
+        }
+
+    high_water_close = float(prepared["close"].max())
+    high_indices = prepared.index[prepared["close"] == high_water_close]
+    if len(high_indices) == 0:
+        return {
+            "high_water_close": None,
+            "high_water_close_date": None,
+            "days_since_new_high": None,
+        }
+
+    last_high_index = int(high_indices[-1])
+    last_high_date = prepared.iloc[last_high_index]["date"]
+    high_water_close_date = (
+        last_high_date.date().isoformat()
+        if isinstance(last_high_date, pd.Timestamp)
+        else None
+    )
+    return {
+        "high_water_close": high_water_close,
+        "high_water_close_date": high_water_close_date,
+        "days_since_new_high": len(prepared) - last_high_index - 1,
+    }
+
+
+def _portfolio_review_relative_strength_metrics(
+    price_frame: pd.DataFrame,
+    *,
+    benchmark_frame: pd.DataFrame | None,
+    window: int,
+) -> dict[str, float | int | None]:
+    if benchmark_frame is None or benchmark_frame.empty or window <= 0:
+        return {
+            "relative_strength_window": window,
+            "symbol_return": None,
+            "benchmark_return": None,
+            "relative_strength_return_diff": None,
+        }
+
+    symbol_history = price_frame.loc[:, ["date", "close"]].copy()
+    symbol_history["date"] = pd.to_datetime(symbol_history["date"], errors="coerce")
+    symbol_history["close"] = pd.to_numeric(symbol_history["close"], errors="coerce")
+    symbol_history = symbol_history.dropna(subset=["date", "close"]).sort_values("date", kind="stable")
+
+    benchmark_history = benchmark_frame.loc[:, ["date", "close"]].copy()
+    benchmark_history["date"] = pd.to_datetime(benchmark_history["date"], errors="coerce")
+    benchmark_history["close"] = pd.to_numeric(benchmark_history["close"], errors="coerce")
+    benchmark_history = benchmark_history.dropna(subset=["date", "close"]).sort_values("date", kind="stable")
+
+    merged = symbol_history.merge(
+        benchmark_history,
+        on="date",
+        how="inner",
+        suffixes=("_symbol", "_benchmark"),
+    )
+    if len(merged) <= window:
+        return {
+            "relative_strength_window": window,
+            "symbol_return": None,
+            "benchmark_return": None,
+            "relative_strength_return_diff": None,
+        }
+
+    window_frame = merged.iloc[-(window + 1):]
+    symbol_start = float(window_frame.iloc[0]["close_symbol"])
+    symbol_end = float(window_frame.iloc[-1]["close_symbol"])
+    benchmark_start = float(window_frame.iloc[0]["close_benchmark"])
+    benchmark_end = float(window_frame.iloc[-1]["close_benchmark"])
+    if symbol_start <= 0 or benchmark_start <= 0:
+        return {
+            "relative_strength_window": window,
+            "symbol_return": None,
+            "benchmark_return": None,
+            "relative_strength_return_diff": None,
+        }
+
+    symbol_return = (symbol_end / symbol_start) - 1.0
+    benchmark_return = (benchmark_end / benchmark_start) - 1.0
+    return {
+        "relative_strength_window": window,
+        "symbol_return": symbol_return,
+        "benchmark_return": benchmark_return,
+        "relative_strength_return_diff": symbol_return - benchmark_return,
+    }
+
+
+def _portfolio_review_breakout_failure_reference(position: ExistingPosition) -> float | None:
+    metadata_containers: list[Mapping[str, Any]] = [position.metadata]
+    signal_metadata = position.metadata.get("signal_metadata")
+    if isinstance(signal_metadata, Mapping):
+        metadata_containers.append(signal_metadata)
+    execution_metadata = position.metadata.get("execution_metadata")
+    if isinstance(execution_metadata, Mapping):
+        metadata_containers.append(execution_metadata)
+        nested_signal_metadata = execution_metadata.get("signal_metadata")
+        if isinstance(nested_signal_metadata, Mapping):
+            metadata_containers.append(nested_signal_metadata)
+
+    for container in metadata_containers:
+        for key in ("breakout_reference", "breakout_level", "prior_high", "entry_price_hint"):
+            value = _portfolio_review_metadata_float(container.get(key))
+            if value is not None and value > 0:
+                return value
+    return None
+
+
+def _portfolio_review_metadata_float(value: Any) -> float | None:
+    if value is None:
         return None
-    return float(prepared["close"].max())
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _position_entry_date(position: ExistingPosition) -> date | None:
@@ -2484,6 +2652,8 @@ def _strategy_warmup_start(
         settings.breakout_lookback + 1,
         settings.atr_window,
         settings.resolved_relative_volume_window + 1,
+        settings.stale_high_watch_days + 1,
+        settings.relative_strength_window + 1,
         settings.benchmark_sma_slow if settings.enable_regime_filter else 1,
     )
     return as_of_date - timedelta(days=max(largest_window * 3, 30))
