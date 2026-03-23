@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -10,6 +10,11 @@ from bot.ingestion.market_data import (
     MarketCycleIngestionEnvelope,
     MarketDataIngestionUpdate,
     PollingIngestionAdapter,
+)
+from bot.ingestion.streaming import (
+    LiveUpdateBuffer,
+    StreamingMarketDataEvent,
+    WebsocketIngestionAdapter,
 )
 from bot.orchestration.live_runner import (
     LiveMarketCycleRequest,
@@ -425,6 +430,484 @@ def test_polling_ingestion_adapter_adds_portfolio_refresh_for_intraday_cycle() -
         "portfolio_symbol_refresh_batch",
         "intraday_portfolio_refresh_batch",
     ]
+
+
+def test_streaming_market_data_event_normalizes_into_ingestion_update() -> None:
+    event = StreamingMarketDataEvent.from_message(
+        {
+            "type": "quote_bar_batch_refresh",
+            "as_of_date": "2024-01-05",
+            "symbols": ["msft", "AAPL", "msft"],
+            "metadata": {"source": "websocket"},
+        }
+    )
+
+    assert event.to_ingestion_update() == MarketDataIngestionUpdate(
+        update_type="quote_bar_batch_refresh",
+        as_of_date=date(2024, 1, 5),
+        symbols=("AAPL", "MSFT"),
+        metadata={"source": "websocket"},
+    )
+
+
+def test_live_update_buffer_coalesces_symbol_batches() -> None:
+    observed_at = datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    buffer = LiveUpdateBuffer()
+
+    buffer.add_update(
+        MarketDataIngestionUpdate(
+            update_type="quote_bar_batch_refresh",
+            as_of_date=date(2024, 1, 5),
+            symbols=("AAPL",),
+            metadata={"batch": 1},
+        ),
+        observed_at_utc=observed_at,
+    )
+    buffer.add_update(
+        MarketDataIngestionUpdate(
+            update_type="quote_bar_batch_refresh",
+            as_of_date=date(2024, 1, 5),
+            symbols=("MSFT",),
+            metadata={"batch": 2},
+        ),
+        observed_at_utc=observed_at + timedelta(seconds=1),
+    )
+
+    assert buffer.current_updates(as_of_date=date(2024, 1, 5)) == (
+        MarketDataIngestionUpdate(
+            update_type="quote_bar_batch_refresh",
+            as_of_date=date(2024, 1, 5),
+            symbols=("AAPL", "MSFT"),
+            metadata={"batch": 2},
+        ),
+    )
+
+
+def test_websocket_ingestion_adapter_periodic_flush_produces_stable_envelope() -> None:
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=date(2024, 1, 5),
+        include_daily_summary=True,
+        daily_summary_required=True,
+    )
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "type": "candidate_universe_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                        "metadata": {"source": "stream"},
+                    },
+                    {
+                        "type": "market_context_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                        "metadata": {"source": "stream"},
+                    },
+                ]
+            ]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        run_daily_summary=lambda snapshot, current_positions: {"summary": _daily_summary()},
+        flush_interval_seconds=5,
+    )
+    started_at = datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    adapter.connect()
+
+    poll_result = adapter.poll_messages(observed_at_utc=started_at)
+
+    assert poll_result.received_count == 2
+    assert poll_result.accepted_count == 2
+    assert adapter.flush_ready_cycle_ingestion(
+        request,
+        now_utc=started_at + timedelta(seconds=4),
+    ) is None
+
+    envelope = adapter.flush_ready_cycle_ingestion(
+        request,
+        now_utc=started_at + timedelta(seconds=5),
+    )
+
+    assert envelope is not None
+    assert envelope.adapter_name == "websocket"
+    assert envelope.ingestion_mode == "streaming"
+    assert [update.update_type for update in envelope.updates] == [
+        "candidate_universe_refresh_batch",
+        "market_context_refresh_batch",
+    ]
+    assert (
+        adapter.flush_ready_cycle_ingestion(
+            request,
+            now_utc=started_at + timedelta(seconds=6),
+        )
+        is None
+    )
+
+
+def test_websocket_ingestion_adapter_skips_malformed_messages_cleanly() -> None:
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=date(2024, 1, 5),
+        include_daily_summary=True,
+        daily_summary_required=True,
+    )
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {"metadata": {"bad": True}},
+                    {
+                        "type": "candidate_universe_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                    },
+                ]
+            ]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        flush_interval_seconds=1,
+    )
+    adapter.connect()
+    poll_result = adapter.poll_messages(
+        observed_at_utc=datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    )
+
+    assert poll_result.accepted_count == 1
+    assert poll_result.skipped_count == 1
+    assert poll_result.warning_count == 1
+    assert adapter.flush_ready_cycle_ingestion(
+        request,
+        now_utc=datetime(2024, 1, 5, 14, 30, 1, tzinfo=timezone.utc),
+    ) is not None
+
+
+def test_websocket_ingestion_adapter_handles_disconnect_and_reconnect() -> None:
+    transport = FakeWebsocketTransport(
+        [
+            ConnectionError("socket closed"),
+            [{"type": "reconnect"}],
+        ]
+    )
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=transport,
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+    )
+
+    adapter.connect()
+    disconnected_result = adapter.poll_messages()
+
+    assert disconnected_result.connected is False
+    assert disconnected_result.warning_count == 1
+
+    adapter.connect()
+    reconnected_result = adapter.poll_messages()
+
+    assert reconnected_result.connected is True
+    assert reconnected_result.accepted_count == 1
+
+
+def test_websocket_ingestion_adapter_treats_timeout_like_disconnect() -> None:
+    timeout_adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport([TimeoutError("socket closed")]),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+    )
+    connection_adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport([ConnectionError("socket closed")]),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+    )
+
+    timeout_result = timeout_adapter.poll_messages()
+    connection_result = connection_adapter.poll_messages()
+
+    assert timeout_result == connection_result
+    assert timeout_result.connected is False
+    assert timeout_result.warning_count == 1
+
+
+def test_websocket_ingestion_adapter_build_cycle_ingestion_rejects_empty_buffer() -> None:
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport(),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="No buffered streaming updates are available",
+    ):
+        adapter.build_cycle_ingestion(
+            LiveMarketCycleRequest(
+                workflow="monitor-market",
+                as_of_date=date(2024, 1, 5),
+                include_daily_summary=True,
+            )
+        )
+
+
+def test_websocket_ingestion_adapter_rejects_empty_portfolio_path() -> None:
+    with pytest.raises(ValueError, match="portfolio_path cannot be an empty string"):
+        WebsocketIngestionAdapter(
+            transport_name="test-websocket",
+            transport=FakeWebsocketTransport(),
+            portfolio_path="",
+            load_current_positions=lambda: (),
+        )
+
+
+def test_websocket_ingestion_adapter_build_cycle_ingestion_rejects_missing_required_updates() -> None:
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "type": "market_context_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                    },
+                ]
+            ]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+    )
+    adapter.connect()
+    adapter.poll_messages(
+        observed_at_utc=datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Streaming ingestion buffer is missing required update types",
+    ):
+        adapter.build_cycle_ingestion(
+            LiveMarketCycleRequest(
+                workflow="monitor-market",
+                as_of_date=date(2024, 1, 5),
+                include_daily_summary=True,
+            )
+        )
+
+
+def test_websocket_ingestion_adapter_build_cycle_ingestion_returns_valid_envelope() -> None:
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "type": "candidate_universe_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                    },
+                    {
+                        "type": "market_context_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                    },
+                ]
+            ]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        run_daily_summary=lambda snapshot, current_positions: {"summary": _daily_summary()},
+    )
+    adapter.connect()
+    adapter.poll_messages(
+        observed_at_utc=datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    )
+
+    envelope = adapter.build_cycle_ingestion(
+        LiveMarketCycleRequest(
+            workflow="monitor-market",
+            as_of_date=date(2024, 1, 5),
+            include_daily_summary=True,
+            daily_summary_required=True,
+        )
+    )
+
+    assert envelope.adapter_name == "websocket"
+    assert envelope.ingestion_mode == "streaming"
+    assert [update.update_type for update in envelope.updates] == [
+        "candidate_universe_refresh_batch",
+        "market_context_refresh_batch",
+    ]
+
+
+def test_websocket_ingestion_adapter_keeps_buffer_dirty_when_envelope_build_fails() -> None:
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=date(2024, 1, 5),
+        include_daily_summary=True,
+        daily_summary_required=True,
+    )
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "type": "candidate_universe_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                    },
+                    {
+                        "type": "market_context_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                    },
+                ]
+            ]
+        ),
+        portfolio_path="/tmp/portfolio.csv",
+        load_current_positions=lambda: ("bad-position",),
+        flush_interval_seconds=1,
+    )
+    started_at = datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    adapter.connect()
+    adapter.poll_messages(observed_at_utc=started_at)
+
+    with pytest.raises(TypeError, match="current_positions\\[0\\] must be an ExistingPosition"):
+        adapter.build_cycle_ingestion(request)
+
+    adapter.load_current_positions = lambda: ()
+    envelope = adapter.flush_ready_cycle_ingestion(
+        request,
+        now_utc=started_at + timedelta(seconds=1),
+    )
+
+    assert envelope is not None
+    assert envelope.portfolio_path == "/tmp/portfolio.csv"
+
+
+def test_live_market_runner_consumes_websocket_ingestion_envelope(
+    tmp_path: Path,
+) -> None:
+    call_order: list[str] = []
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=date(2024, 1, 5),
+        portfolio_path=str(tmp_path / "portfolio.csv"),
+        include_daily_summary=True,
+        include_portfolio_review=True,
+        daily_summary_required=True,
+        portfolio_review_required=True,
+    )
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "type": "candidate_universe_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                    },
+                    {
+                        "type": "market_context_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                    },
+                    {
+                        "type": "portfolio_symbol_refresh_batch",
+                        "as_of_date": "2024-01-05",
+                        "symbols": ["AAPL"],
+                    },
+                ]
+            ]
+        ),
+        portfolio_path=str(tmp_path / "portfolio.csv"),
+        load_current_positions=lambda: (
+            ExistingPosition(
+                symbol="AAPL",
+                shares=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+            ),
+        ),
+        run_daily_summary=lambda snapshot, current_positions: _record_call(
+            call_order,
+            "daily_summary",
+            {"summary": _daily_summary()},
+        ),
+        run_portfolio_review=lambda snapshot, current_positions: _record_call(
+            call_order,
+            "portfolio_review",
+            _portfolio_review_report(),
+        ),
+        flush_interval_seconds=1,
+    )
+    state_artifacts = _state_artifacts(tmp_path)
+    adapter.connect()
+    adapter.poll_messages(
+        observed_at_utc=datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    )
+    envelope = adapter.flush_ready_cycle_ingestion(
+        request,
+        now_utc=datetime(2024, 1, 5, 14, 30, 1, tzinfo=timezone.utc),
+    )
+    assert envelope is not None
+    runner = LiveMarketRunner(
+        build_monitor_report=lambda as_of_date, summary, review, intraday, portfolio_path: _record_call(
+            call_order,
+            "monitor_report",
+            build_market_monitor_report(
+                as_of_date=as_of_date,
+                daily_summary=summary,
+                portfolio_review=review,
+                portfolio_path=portfolio_path,
+            ),
+        ),
+        persist_market_state=lambda as_of_date, workflow, summary, review, intraday, portfolio_path: _record_call(
+            call_order,
+            "persist_market_state",
+            state_artifacts,
+        ),
+    )
+
+    result = runner.run_cycle(request, ingestion=envelope)
+
+    assert call_order == [
+        "daily_summary",
+        "portfolio_review",
+        "monitor_report",
+        "persist_market_state",
+    ]
+    assert result.status == "ok"
+    assert result.ingestion_adapter_name == "websocket"
+    assert result.ingestion_mode == "streaming"
+    assert result.market_state_snapshot == state_artifacts.update_result.current_snapshot
+
+
+class FakeWebsocketTransport:
+    def __init__(self, responses: list[object] | None = None) -> None:
+        self._responses = list(responses or [])
+        self.connect_calls = 0
+        self.disconnect_calls = 0
+
+    def connect(self) -> None:
+        self.connect_calls += 1
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+    def read_messages(
+        self,
+        *,
+        max_messages: int | None = None,
+    ):
+        if not self._responses:
+            return ()
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        messages = tuple(response)
+        if max_messages is None:
+            return messages
+        return messages[:max_messages]
 
 
 def _record_call(call_order: list[str], name: str, value):

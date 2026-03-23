@@ -139,6 +139,43 @@ class MarketDataIngestionAdapter(Protocol):
         """Return the typed ingestion envelope for one live market cycle."""
 
 
+def required_ingestion_update_types(
+    *,
+    include_daily_summary: bool,
+    include_portfolio_review: bool,
+    include_intraday_review: bool,
+) -> tuple[str, ...]:
+    """Return the minimum update types required for a request shape."""
+
+    required: list[str] = []
+    if include_daily_summary:
+        required.append("candidate_universe_refresh_batch")
+    if include_portfolio_review or include_intraday_review:
+        required.append("portfolio_symbol_refresh_batch")
+    return tuple(required)
+
+
+def sort_ingestion_updates(
+    updates: Sequence[MarketDataIngestionUpdate],
+) -> tuple[MarketDataIngestionUpdate, ...]:
+    """Return updates in the shared deterministic adapter order."""
+
+    order = {
+        update_type: index
+        for index, update_type in enumerate(MARKET_DATA_INGESTION_UPDATE_TYPES)
+    }
+    return tuple(
+        sorted(
+            updates,
+            key=lambda update: (
+                order.get(update.update_type, len(order)),
+                update.as_of_date.isoformat(),
+                update.symbols,
+            ),
+        )
+    )
+
+
 @dataclass(frozen=True)
 class PollingIngestionAdapter:
     """Polling-backed adapter that packages one cycle's ingress state."""

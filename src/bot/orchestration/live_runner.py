@@ -6,7 +6,11 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Mapping
 
-from bot.ingestion.market_data import MarketCycleIngestionEnvelope, MarketDataIngestionUpdate
+from bot.ingestion.market_data import (
+    MarketCycleIngestionEnvelope,
+    MarketDataIngestionUpdate,
+    required_ingestion_update_types,
+)
 from bot.reporting.daily_report import (
     DailyResearchSummary,
     IntradayPortfolioReviewReport,
@@ -370,27 +374,23 @@ def _validate_ingestion(
     ):
         raise ValueError("ingestion.portfolio_path must match request.portfolio_path.")
     update_types = {update.update_type for update in ingestion.updates}
-    if (
-        request.include_daily_summary
-        and "candidate_universe_refresh_batch" not in update_types
+    for required_update_type in required_ingestion_update_types(
+        include_daily_summary=request.include_daily_summary,
+        include_portfolio_review=request.include_portfolio_review,
+        include_intraday_review=request.include_intraday_review,
     ):
-        raise ValueError(
-            "ingestion.updates must include 'candidate_universe_refresh_batch' when include_daily_summary=True."
-        )
-    if (
-        request.include_portfolio_review
-        and "portfolio_symbol_refresh_batch" not in update_types
-    ):
-        raise ValueError(
-            "ingestion.updates must include 'portfolio_symbol_refresh_batch' when include_portfolio_review=True."
-        )
-    if (
-        request.include_intraday_review
-        and "portfolio_symbol_refresh_batch" not in update_types
-    ):
-        raise ValueError(
-            "ingestion.updates must include 'portfolio_symbol_refresh_batch' when include_intraday_review=True."
-        )
+        if required_update_type not in update_types:
+            if required_update_type == "candidate_universe_refresh_batch":
+                raise ValueError(
+                    "ingestion.updates must include 'candidate_universe_refresh_batch' when include_daily_summary=True."
+                )
+            if request.include_portfolio_review:
+                raise ValueError(
+                    "ingestion.updates must include 'portfolio_symbol_refresh_batch' when include_portfolio_review=True."
+                )
+            raise ValueError(
+                "ingestion.updates must include 'portfolio_symbol_refresh_batch' when include_intraday_review=True."
+            )
 
 
 def _candidate_summary(summary: DailyResearchSummary | None) -> dict[str, Any] | None:
