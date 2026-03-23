@@ -24,6 +24,11 @@ from bot.data.position_trajectory import (
     PositionTrajectoryObservation,
     default_position_trajectory_journal_path,
 )
+from bot.data.trade_feedback import (
+    TradeOutcomeSnapshot,
+    default_trade_feedback_log_path,
+    load_trade_feedback_events,
+)
 from bot.data.sector_context import SectorFeatureContext, SymbolSectorClassification
 from bot.data.providers import DataProviderError
 from bot.execution.manual_executor import ManualExecutor
@@ -4022,6 +4027,7 @@ def test_handle_daily_summary_uses_workflow_universe_count(
             "current_positions": loaded_positions,
             "current_equity": 100_000.0,
             "execution_batch": ManualExecutor().build_execution_batch([], as_of_date=date(2024, 1, 5)),
+            "ranked_evaluations": [],
         }
 
     monkeypatch.setattr(
@@ -4059,6 +4065,435 @@ def test_handle_daily_summary_uses_workflow_universe_count(
     assert payload["current_position_symbols"] == ["AAPL"]
     assert Path(payload["outputs"]["daily_summary_json"]).exists()
     assert Path(payload["outputs"]["daily_summary_brief"]).exists()
+
+
+def test_handle_daily_summary_writes_trade_decision_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    preset = _selected_presets("standard_breakout")[0]
+    evaluation = _evaluation(
+        preset,
+        symbol="AAPL",
+        approved=True,
+        shares=50,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    )
+    execution_batch = ManualExecutor().build_execution_batch(
+        [evaluation.candidate],
+        as_of_date=date(2024, 1, 5),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[evaluation],
+        selected_presets=[preset],
+        universe_symbols=["AAPL"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={preset.name: ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+        current_positions=[],
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
+    monkeypatch.setattr(
+        main_module,
+        "_run_daily_summary_workflow",
+        lambda args, *, config, provider, current_positions=None: {
+            "summary": summary,
+            "presets": [preset],
+            "preset_selection_source": "named_presets",
+            "current_positions": [],
+            "current_equity": 100_000.0,
+            "execution_batch": execution_batch,
+            "ranked_evaluations": [evaluation],
+            "candidate_score_journal_path": None,
+        },
+    )
+
+    candidate_path = tmp_path / "candidates.txt"
+    candidate_path.write_text("AAPL\n", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--output-dir",
+            str(tmp_path / "daily"),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_daily_summary(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    log_path = Path(payload["outputs"]["trade_decision_log"])
+    events = load_trade_feedback_events(log_path)
+
+    assert log_path == default_trade_feedback_log_path(tmp_path)
+    assert len(events) == 1
+    assert events[0].workflow == "daily-summary"
+    assert events[0].symbol == "AAPL"
+    assert events[0].approved is True
+    assert events[0].decision_id is not None
+
+
+def test_handle_review_portfolio_writes_trade_decision_and_outcome_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text("placeholder\n", encoding="utf-8")
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        preset_name="standard_breakout",
+        source="manual",
+        metadata={
+            "trade_id": "trade_aapl",
+            "linked_decision_id": "decision_aapl",
+            "entry_date": "2024-01-02",
+        },
+    )
+    row = PortfolioReviewRow(
+        date=date(2024, 1, 5),
+        symbol="AAPL",
+        quantity=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        suggested_stop=101.0,
+        latest_close=105.0,
+        unrealized_pl_pct=0.05,
+        distance_to_stop_pct=0.095,
+        regime_passed=True,
+        above_entry=True,
+        suggested_action="RAISE STOP",
+        preset_name="standard_breakout",
+        rationale="Trailing-stop logic supports a higher stop.",
+        metadata={
+            "position_metadata": dict(position.metadata),
+            main_module._TRADE_OUTCOME_SNAPSHOT_METADATA_KEY: TradeOutcomeSnapshot(
+                as_of_date=date(2024, 1, 5),
+                entry_date=date(2024, 1, 2),
+                sessions_since_entry=3,
+                current_return_pct=0.05,
+                max_favorable_excursion_pct=0.08,
+                max_adverse_excursion_pct=-0.02,
+                stop_hit=False,
+                forward_return_1d=0.01,
+                forward_return_5d=None,
+                forward_return_10d=None,
+                above_entry_after_1d=True,
+                above_entry_after_5d=None,
+                above_entry_after_10d=None,
+            ).to_dict(),
+        },
+    )
+    report = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        rows=[row],
+        current_positions=[position],
+        benchmark_symbol="SPY",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [position])
+    monkeypatch.setattr(main_module, "_run_portfolio_review_workflow", lambda *args, **kwargs: report)
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-05",
+            "--output-dir",
+            str(tmp_path / "daily"),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_review_portfolio(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    events = load_trade_feedback_events(Path(payload["outputs"]["trade_decision_log"]))
+
+    assert [event.event_type for event in events] == ["decision", "outcome"]
+    assert events[0].workflow == "review-portfolio"
+    assert events[0].decision_id is not None
+    assert events[1].trade_id == "trade_aapl"
+    assert events[1].linked_decision_id == "decision_aapl"
+    assert events[1].outcome_snapshot is not None
+    assert events[1].outcome_snapshot.current_return_pct == pytest.approx(0.05)
+
+
+def test_handle_review_portfolio_intraday_writes_trade_decision_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n"
+        "AAPL,10,100,95,standard_breakout,manual,{}\n",
+        encoding="utf-8",
+    )
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        preset_name="standard_breakout",
+        source="manual",
+    )
+    row = PortfolioReviewRow(
+        date=date(2024, 1, 5),
+        symbol="AAPL",
+        quantity=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        suggested_stop=None,
+        latest_close=101.0,
+        unrealized_pl_pct=0.01,
+        distance_to_stop_pct=0.059,
+        regime_passed=None,
+        above_entry=True,
+        suggested_action="HOLD",
+        preset_name="standard_breakout",
+        rationale="Recovered intraday and remains healthy.",
+        metadata={"latest_bar_time": "2024-01-05T10:00:00"},
+    )
+    report = build_intraday_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        interval_minutes=15,
+        portfolio_path=str(portfolio_path),
+        rows=[row],
+        current_positions=[position],
+        benchmark_symbol="SPY",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
+    monkeypatch.setattr(
+        main_module,
+        "_run_portfolio_review_intraday_workflow",
+        lambda *args, **kwargs: report,
+    )
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio-intraday",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-05",
+            "--interval-minutes",
+            "15",
+            "--output-dir",
+            str(tmp_path / "intraday"),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_review_portfolio_intraday(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    events = load_trade_feedback_events(Path(payload["outputs"]["trade_decision_log"]))
+
+    assert len(events) == 1
+    assert events[0].workflow == "review-portfolio-intraday"
+    assert events[0].decision_id is not None
+    assert events[0].feature_snapshot["above_entry"] is True
+
+
+def test_position_snapshot_commands_log_linked_execution_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+
+    upsert_args = build_parser().parse_args(
+        [
+            "upsert-position",
+            str(portfolio_path),
+            "AAPL",
+            "--quantity",
+            "10",
+            "--average-entry-price",
+            "100",
+            "--current-stop",
+            "95",
+            "--preset-name",
+            "standard_breakout",
+            "--decision-id",
+            "decision_aapl",
+            "--as-of",
+            "2024-01-05",
+            "--format",
+            "json",
+        ]
+    )
+    assert main_module._handle_upsert_position(upsert_args) == 0
+    capsys.readouterr()
+
+    update_stop_args = build_parser().parse_args(
+        [
+            "update-stop",
+            str(portfolio_path),
+            "AAPL",
+            "--current-stop",
+            "97",
+            "--as-of",
+            "2024-01-06",
+            "--format",
+            "json",
+        ]
+    )
+    assert main_module._handle_update_stop(update_stop_args) == 0
+    capsys.readouterr()
+
+    remove_args = build_parser().parse_args(
+        [
+            "remove-position",
+            str(portfolio_path),
+            "AAPL",
+            "--close-price",
+            "110",
+            "--as-of",
+            "2024-01-09",
+            "--format",
+            "json",
+        ]
+    )
+    assert main_module._handle_remove_position(remove_args) == 0
+    capsys.readouterr()
+
+    events = load_trade_feedback_events(default_trade_feedback_log_path(tmp_path))
+    trade_ids = {event.trade_id for event in events}
+    decision_ids = {event.linked_decision_id or event.decision_id for event in events}
+
+    assert [event.event_type for event in events] == ["executed", "stop_raised", "closed"]
+    assert len(trade_ids) == 1
+    assert decision_ids == {"decision_aapl"}
+    assert events[-1].metadata["close_price"] == pytest.approx(110.0)
+    assert events[-1].metadata["realized_return_pct"] == pytest.approx(0.10)
+
+
+def test_handle_generate_orders_writes_trade_decision_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    candidate_path = tmp_path / "candidates.txt"
+    candidate_path.write_text("AAPL\n", encoding="utf-8")
+    output_dir = tmp_path / "orders"
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [99.0],
+                    "high": [101.0],
+                    "low": [98.0],
+                    "close": [100.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "compute_market_breadth_from_frames",
+        lambda *args, **kwargs: {
+            "market_breadth_pct_above_200ma": None,
+            "market_breadth_pct_above_50ma": None,
+            "market_breadth_state": None,
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context",
+        lambda **kwargs: {
+            "vix_close": None,
+            "vix_sma_short": None,
+            "vix_sma_long": None,
+            "volatility_regime_state": None,
+            "volatility_regime_risk_off": None,
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda *args, **kwargs: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol="AAPL",
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=100.0,
+            stop_hint=95.0,
+            metadata={"prior_high": 99.0, "relative_volume": 2.0},
+        ),
+    )
+
+    args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(output_dir),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_generate_orders(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    events = load_trade_feedback_events(Path(payload["outputs"]["trade_decision_log"]))
+
+    assert len(events) == 1
+    assert events[0].workflow == "generate-orders"
+    assert events[0].approved is True
+    assert events[0].decision_id is not None
 
 
 def test_position_entry_date_returns_date_object() -> None:

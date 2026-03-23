@@ -49,6 +49,15 @@ from bot.data.sector_context import (
     SymbolSectorClassification,
     build_sector_feature_contexts,
 )
+from bot.data.trade_feedback import (
+    TradeFeedbackEvent,
+    TradeOutcomeSnapshot,
+    append_trade_feedback_events,
+    compute_trade_outcome_snapshot,
+    default_trade_feedback_log_path,
+    load_trade_feedback_events,
+    summarize_trade_feedback_events,
+)
 from bot.data.volatility_context import (
     MAX_VOLATILITY_CONTEXT_BAR_AGE_DAYS,
     build_volatility_regime_context,
@@ -1423,6 +1432,250 @@ def test_position_trajectory_features_count_repeated_watch_states() -> None:
     assert trajectory.consecutive_watch_closely_days == 2
     assert trajectory.consecutive_hold_days == 0
     assert trajectory.consecutive_stale_position_days == 2
+
+
+def test_trade_feedback_log_appends_deduplicates_and_stays_compact(
+    tmp_path: Path,
+) -> None:
+    log_path = default_trade_feedback_log_path(tmp_path)
+    first_event = TradeFeedbackEvent(
+        event_type="decision",
+        workflow="daily-summary",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_abc123",
+        preset_name="standard_breakout",
+        strategy_name="breakout_momentum:standard_breakout",
+        suggested_action="BUY",
+        approved=True,
+        queue_rank=1,
+        priority_bucket="top_priority",
+        actionable_now=True,
+        quantity=100,
+        entry_price_hint=100.0,
+        stop_price=95.0,
+        notional_value=10_000.0,
+        feature_snapshot={
+            "opportunity_score": 1.25,
+            "setup_quality_score": 0.8,
+            "volatility_regime_state": "calm",
+        },
+    )
+    duplicate_event = TradeFeedbackEvent(
+        event_type="decision",
+        workflow="daily-summary",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_abc123",
+        preset_name="standard_breakout",
+        strategy_name="breakout_momentum:standard_breakout",
+        suggested_action="BUY",
+        approved=True,
+        queue_rank=1,
+        priority_bucket="top_priority",
+        actionable_now=True,
+        quantity=100,
+        entry_price_hint=100.0,
+        stop_price=95.0,
+        notional_value=10_000.0,
+        feature_snapshot={
+            "opportunity_score": 1.25,
+            "setup_quality_score": 0.8,
+            "volatility_regime_state": "calm",
+        },
+    )
+    executed_event = TradeFeedbackEvent(
+        event_type="executed",
+        workflow="upsert-position",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_abc123",
+        trade_id="trade_abc123",
+        linked_decision_id="decision_abc123",
+        suggested_action="BUY",
+        quantity=100,
+        entry_price_hint=100.0,
+        stop_price=95.0,
+        notional_value=10_000.0,
+    )
+
+    append_trade_feedback_events([first_event, duplicate_event, executed_event], log_path)
+    loaded = load_trade_feedback_events(log_path)
+    summary = summarize_trade_feedback_events(loaded)
+    persisted_lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    persisted_payload = json.loads(persisted_lines[0])
+
+    assert len(loaded) == 2
+    assert [event.event_type for event in loaded] == ["decision", "executed"]
+    assert summary["approved_decision_count"] == 1
+    assert summary["executed_approved_decision_count"] == 1
+    assert summary["approved_execution_rate"] == pytest.approx(1.0)
+    assert set(persisted_payload) == {
+        "actionable_now",
+        "approved",
+        "as_of_date",
+        "decision_id",
+        "entry_price_hint",
+        "event_id",
+        "event_type",
+        "feature_snapshot",
+        "notional_value",
+        "preset_name",
+        "priority_bucket",
+        "quantity",
+        "queue_rank",
+        "schema_version",
+        "stop_price",
+        "strategy_name",
+        "suggested_action",
+        "symbol",
+        "workflow",
+    }
+    assert "price_frame" not in persisted_payload
+    assert "bars" not in persisted_payload
+
+
+def test_trade_feedback_log_ignores_malformed_lines(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    log_path = default_trade_feedback_log_path(tmp_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "{bad-json\n"
+        + json.dumps(
+            TradeFeedbackEvent(
+                event_type="decision",
+                workflow="generate-orders",
+                symbol="MSFT",
+                as_of_date=date(2024, 1, 5),
+                decision_id="decision_msft",
+                suggested_action="BUY",
+                approved=False,
+            ).to_dict()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        loaded = load_trade_feedback_events(log_path)
+
+    assert len(loaded) == 1
+    assert loaded[0].symbol == "MSFT"
+    assert "Ignoring malformed trade feedback line" in caplog.text
+
+
+def test_trade_feedback_event_deserialization_round_trips_zero_sessions_since_entry() -> None:
+    snapshot = TradeOutcomeSnapshot(
+        as_of_date=date(2024, 1, 5),
+        entry_date=date(2024, 1, 5),
+        sessions_since_entry=0,
+        current_return_pct=0.0,
+        max_favorable_excursion_pct=0.01,
+        max_adverse_excursion_pct=-0.01,
+        stop_hit=False,
+        forward_return_1d=None,
+        forward_return_5d=None,
+        forward_return_10d=None,
+        above_entry_after_1d=None,
+        above_entry_after_5d=None,
+        above_entry_after_10d=None,
+    )
+    event = TradeFeedbackEvent(
+        event_type="outcome",
+        workflow="review-portfolio",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_aapl",
+        trade_id="trade_aapl",
+        linked_decision_id="decision_aapl",
+        outcome_snapshot=snapshot,
+    )
+
+    reloaded_event = TradeFeedbackEvent.from_mapping(event.to_dict())
+
+    assert reloaded_event.outcome_snapshot is not None
+    assert reloaded_event.outcome_snapshot.sessions_since_entry == 0
+    assert reloaded_event.outcome_snapshot.entry_date == date(2024, 1, 5)
+
+
+def test_trade_feedback_log_deduplicates_logically_identical_events_with_different_feature_snapshots(
+    tmp_path: Path,
+) -> None:
+    log_path = default_trade_feedback_log_path(tmp_path)
+    first_event = TradeFeedbackEvent(
+        event_type="decision",
+        workflow="daily-summary",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_abc123",
+        suggested_action="BUY",
+        approved=True,
+        feature_snapshot={"opportunity_score": 1.25},
+    )
+    rerun_event = TradeFeedbackEvent(
+        event_type="decision",
+        workflow="daily-summary",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_abc123",
+        suggested_action="BUY",
+        approved=True,
+        feature_snapshot={"opportunity_score": 0.85, "setup_quality_score": 0.6},
+    )
+
+    append_trade_feedback_events([first_event], log_path)
+    append_trade_feedback_events([rerun_event], log_path)
+    loaded = load_trade_feedback_events(log_path)
+
+    assert len(loaded) == 1
+    assert loaded[0].decision_id == "decision_abc123"
+
+
+def test_compute_trade_outcome_snapshot_returns_expected_forward_metrics() -> None:
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                [
+                    "2024-01-02",
+                    "2024-01-03",
+                    "2024-01-04",
+                    "2024-01-05",
+                    "2024-01-08",
+                    "2024-01-09",
+                    "2024-01-10",
+                ]
+            ),
+            "open": [100.0, 101.0, 103.0, 102.0, 104.0, 103.0, 106.0],
+            "high": [101.0, 104.0, 105.0, 103.0, 106.0, 107.0, 108.0],
+            "low": [99.0, 100.0, 101.0, 97.0, 102.0, 101.0, 105.0],
+            "close": [100.0, 103.0, 102.0, 98.0, 105.0, 106.0, 107.0],
+            "volume": [1_000_000] * 7,
+            "symbol": ["AAPL"] * 7,
+        }
+    )
+
+    outcome = compute_trade_outcome_snapshot(
+        frame,
+        entry_date=date(2024, 1, 2),
+        entry_price=100.0,
+        stop_price=98.0,
+        as_of_date=date(2024, 1, 10),
+    )
+
+    assert outcome is not None
+    assert outcome.sessions_since_entry == 6
+    assert outcome.current_return_pct == pytest.approx(0.07)
+    assert outcome.forward_return_1d == pytest.approx(0.03)
+    assert outcome.forward_return_5d == pytest.approx(0.06)
+    assert outcome.forward_return_10d is None
+    assert outcome.max_favorable_excursion_pct == pytest.approx(0.08)
+    assert outcome.max_adverse_excursion_pct == pytest.approx(-0.03)
+    assert outcome.stop_hit is True
+    assert outcome.above_entry_after_1d is True
+    assert outcome.above_entry_after_5d is True
+    assert outcome.above_entry_after_10d is None
 
 
 def test_build_portfolio_heat_context_tracks_sector_counts_and_notional_share() -> None:

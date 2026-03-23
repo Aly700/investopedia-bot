@@ -6,6 +6,7 @@ import argparse
 import csv
 from dataclasses import replace
 from datetime import date
+from datetime import datetime, timezone
 from datetime import timedelta
 import json
 from pathlib import Path
@@ -83,6 +84,15 @@ from bot.data.sector_context import (
     load_symbol_sector_classifications,
     sector_context_history_start,
     sector_context_metadata,
+)
+from bot.data.trade_feedback import (
+    TradeFeedbackEvent,
+    TradeOutcomeSnapshot,
+    append_trade_feedback_events,
+    build_trade_decision_id,
+    build_trade_id,
+    compute_trade_outcome_snapshot,
+    default_trade_feedback_log_path,
 )
 from bot.data.providers import (
     DailyBarProvider,
@@ -180,6 +190,7 @@ from bot.strategy.regime_filter import regime_is_bullish
 LOGGER = get_logger(__name__)
 
 _POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY = "_position_trajectory_observation"
+_TRADE_OUTCOME_SNAPSHOT_METADATA_KEY = "_trade_outcome_snapshot"
 
 
 class NoIntradayDataError(ValueError):
@@ -398,6 +409,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional JSON object string to store as position metadata.",
     )
     upsert_position_parser.add_argument(
+        "--decision-id",
+        default=None,
+        help="Optional linked decision id for execution logging.",
+    )
+    upsert_position_parser.add_argument(
+        "--trade-id",
+        default=None,
+        help="Optional stable trade id override for execution logging.",
+    )
+    upsert_position_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Execution date used for feedback logging and entry-date defaults.",
+    )
+    upsert_position_parser.add_argument(
         "--snapshot-format",
         choices=("csv", "json"),
         default=None,
@@ -431,6 +458,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Updated stop level for the holding.",
     )
     update_stop_parser.add_argument(
+        "--decision-id",
+        default=None,
+        help="Optional linked decision id for stop-update logging.",
+    )
+    update_stop_parser.add_argument(
+        "--trade-id",
+        default=None,
+        help="Optional stable trade id override for stop-update logging.",
+    )
+    update_stop_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Execution date used for stop-update logging.",
+    )
+    update_stop_parser.add_argument(
         "--snapshot-format",
         choices=("csv", "json"),
         default=None,
@@ -456,6 +499,28 @@ def build_parser() -> argparse.ArgumentParser:
     remove_position_parser.add_argument(
         "symbol",
         help="Ticker symbol for the holding to remove.",
+    )
+    remove_position_parser.add_argument(
+        "--decision-id",
+        default=None,
+        help="Optional linked decision id for close logging.",
+    )
+    remove_position_parser.add_argument(
+        "--trade-id",
+        default=None,
+        help="Optional stable trade id override for close logging.",
+    )
+    remove_position_parser.add_argument(
+        "--close-price",
+        type=float,
+        default=None,
+        help="Optional close price used for realized-return logging.",
+    )
+    remove_position_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Execution date used for close logging.",
     )
     remove_position_parser.add_argument(
         "--snapshot-format",
@@ -1339,6 +1404,55 @@ def _handle_init_portfolio(args: argparse.Namespace) -> int:
 
 
 def _handle_upsert_position(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    existing_positions = (
+        load_existing_positions(args.portfolio_path.resolve())
+        if args.portfolio_path.resolve().exists()
+        else []
+    )
+    existing_position = next(
+        (
+            position
+            for position in existing_positions
+            if position.symbol == args.symbol.strip().upper()
+        ),
+        None,
+    )
+    explicit_metadata = _parse_metadata_json(args.metadata_json)
+    merged_metadata = (
+        dict(existing_position.metadata)
+        if existing_position is not None
+        else {}
+    )
+    merged_metadata.update(explicit_metadata)
+    execution_decision_id = _resolve_execution_decision_id(
+        explicit_decision_id=args.decision_id,
+        metadata=merged_metadata,
+        existing_position=existing_position,
+    )
+    entry_date = _position_entry_date(existing_position) if existing_position is not None else None
+    if entry_date is None:
+        raw_entry_date = merged_metadata.get("entry_date")
+        if isinstance(raw_entry_date, str) and raw_entry_date.strip():
+            try:
+                entry_date = date.fromisoformat(raw_entry_date.strip())
+            except ValueError:
+                entry_date = None
+    if entry_date is None:
+        entry_date = args.as_of
+    trade_id = _resolve_execution_trade_id(
+        explicit_trade_id=args.trade_id,
+        metadata=merged_metadata,
+        existing_position=existing_position,
+        symbol=args.symbol.strip().upper(),
+        entry_date=entry_date,
+        average_entry_price=float(args.average_entry_price),
+        decision_id=execution_decision_id,
+    )
+    merged_metadata["trade_id"] = trade_id
+    if execution_decision_id is not None:
+        merged_metadata["linked_decision_id"] = execution_decision_id
+    merged_metadata.setdefault("entry_date", entry_date.isoformat())
     position = ExistingPosition(
         symbol=args.symbol.strip().upper(),
         shares=int(args.quantity),
@@ -1346,7 +1460,7 @@ def _handle_upsert_position(args: argparse.Namespace) -> int:
         current_stop=(None if args.current_stop is None else float(args.current_stop)),
         preset_name=(args.preset_name.strip() if isinstance(args.preset_name, str) and args.preset_name.strip() else None),
         source=(args.source.strip() if isinstance(args.source, str) and args.source.strip() else None),
-        metadata=_parse_metadata_json(args.metadata_json),
+        metadata=merged_metadata,
     )
     written_path = upsert_existing_position_snapshot(
         args.portfolio_path,
@@ -1354,6 +1468,28 @@ def _handle_upsert_position(args: argparse.Namespace) -> int:
         output_format=args.snapshot_format,
     )
     current_positions = load_existing_positions(written_path)
+    event = TradeFeedbackEvent(
+        event_type="executed",
+        workflow="upsert-position",
+        symbol=position.symbol,
+        as_of_date=args.as_of,
+        timestamp_utc=_trade_feedback_timestamp_utc(),
+        decision_id=execution_decision_id,
+        trade_id=trade_id,
+        linked_decision_id=execution_decision_id,
+        preset_name=position.preset_name,
+        strategy_name=_extract_strategy_name_from_metadata(position.metadata),
+        suggested_action="BUY",
+        quantity=position.shares,
+        entry_price_hint=position.average_entry_price,
+        stop_price=position.current_stop,
+        notional_value=position.average_entry_price * position.shares,
+        metadata={"position_source": position.source},
+    )
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=[event],
+    )
     payload = {
         "portfolio_path": str(written_path),
         "snapshot_format": written_path.suffix.lower().lstrip("."),
@@ -1361,11 +1497,24 @@ def _handle_upsert_position(args: argparse.Namespace) -> int:
         "position_count": len(current_positions),
         "current_position_symbols": [current_position.symbol for current_position in current_positions],
     }
+    if trade_feedback_log_path is not None:
+        payload["trade_decision_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
 
 def _handle_update_stop(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    existing_positions = load_existing_positions(args.portfolio_path.resolve())
+    normalized_symbol = args.symbol.strip().upper()
+    existing_position = next(
+        (position for position in existing_positions if position.symbol == normalized_symbol),
+        None,
+    )
+    if existing_position is None:
+        raise PortfolioInputError(
+            f"Symbol '{normalized_symbol}' does not exist in portfolio snapshot."
+        )
     written_path = update_existing_position_stop_snapshot(
         args.portfolio_path,
         args.symbol,
@@ -1380,11 +1529,70 @@ def _handle_update_stop(args: argparse.Namespace) -> int:
         "position_count": len(current_positions),
         "current_position_symbols": [current_position.symbol for current_position in current_positions],
     }
+    execution_decision_id = _resolve_execution_decision_id(
+        explicit_decision_id=args.decision_id,
+        metadata=existing_position.metadata,
+        existing_position=existing_position,
+    )
+    trade_id = _resolve_execution_trade_id(
+        explicit_trade_id=args.trade_id,
+        metadata=existing_position.metadata,
+        existing_position=existing_position,
+        symbol=existing_position.symbol,
+        entry_date=_position_entry_date(existing_position),
+        average_entry_price=existing_position.average_entry_price,
+        decision_id=execution_decision_id,
+    )
+    event_type = (
+        "stop_raised"
+        if existing_position.current_stop is not None
+        and float(args.current_stop) > existing_position.current_stop
+        else "stop_updated"
+    )
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=[
+            TradeFeedbackEvent(
+                event_type=event_type,
+                workflow="update-stop",
+                symbol=existing_position.symbol,
+                as_of_date=args.as_of,
+                timestamp_utc=_trade_feedback_timestamp_utc(),
+                decision_id=execution_decision_id,
+                trade_id=trade_id,
+                linked_decision_id=execution_decision_id,
+                preset_name=existing_position.preset_name,
+                strategy_name=_extract_strategy_name_from_metadata(existing_position.metadata),
+                suggested_action="RAISE STOP",
+                quantity=existing_position.shares,
+                entry_price_hint=existing_position.average_entry_price,
+                stop_price=float(args.current_stop),
+                notional_value=existing_position.average_entry_price * existing_position.shares,
+                metadata={
+                    "previous_stop": existing_position.current_stop,
+                    "position_source": existing_position.source,
+                },
+            )
+        ],
+    )
+    if trade_feedback_log_path is not None:
+        payload["trade_decision_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
 
 def _handle_remove_position(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    existing_positions = load_existing_positions(args.portfolio_path.resolve())
+    normalized_symbol = args.symbol.strip().upper()
+    existing_position = next(
+        (position for position in existing_positions if position.symbol == normalized_symbol),
+        None,
+    )
+    if existing_position is None:
+        raise PortfolioInputError(
+            f"Symbol '{normalized_symbol}' does not exist in portfolio snapshot."
+        )
     written_path = remove_existing_position_snapshot(
         args.portfolio_path,
         args.symbol,
@@ -1398,6 +1606,58 @@ def _handle_remove_position(args: argparse.Namespace) -> int:
         "position_count": len(current_positions),
         "current_position_symbols": [current_position.symbol for current_position in current_positions],
     }
+    execution_decision_id = _resolve_execution_decision_id(
+        explicit_decision_id=args.decision_id,
+        metadata=existing_position.metadata,
+        existing_position=existing_position,
+    )
+    trade_id = _resolve_execution_trade_id(
+        explicit_trade_id=args.trade_id,
+        metadata=existing_position.metadata,
+        existing_position=existing_position,
+        symbol=existing_position.symbol,
+        entry_date=_position_entry_date(existing_position),
+        average_entry_price=existing_position.average_entry_price,
+        decision_id=execution_decision_id,
+    )
+    close_price = None if args.close_price is None else float(args.close_price)
+    close_metadata: dict[str, Any] = {
+        "position_source": existing_position.source,
+    }
+    if close_price is not None:
+        close_metadata["close_price"] = close_price
+        close_metadata["realized_return_pct"] = (
+            close_price / existing_position.average_entry_price
+        ) - 1.0
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=[
+            TradeFeedbackEvent(
+                event_type="closed",
+                workflow="remove-position",
+                symbol=existing_position.symbol,
+                as_of_date=args.as_of,
+                timestamp_utc=_trade_feedback_timestamp_utc(),
+                decision_id=execution_decision_id,
+                trade_id=trade_id,
+                linked_decision_id=execution_decision_id,
+                preset_name=existing_position.preset_name,
+                strategy_name=_extract_strategy_name_from_metadata(existing_position.metadata),
+                suggested_action="SELL",
+                quantity=existing_position.shares,
+                entry_price_hint=existing_position.average_entry_price,
+                stop_price=existing_position.current_stop,
+                notional_value=(
+                    close_price * existing_position.shares
+                    if close_price is not None
+                    else None
+                ),
+                metadata=close_metadata,
+            )
+        ],
+    )
+    if trade_feedback_log_path is not None:
+        payload["trade_decision_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -1416,14 +1676,61 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         provider=provider,
         current_positions=current_positions,
     )
+    report = replace(
+        report,
+        rows=tuple(
+            replace(
+                row,
+                metadata={
+                    **dict(row.metadata),
+                    "decision_id": _portfolio_review_decision_id(
+                        row,
+                        workflow="review-portfolio",
+                    ),
+                },
+            )
+            for row in report.rows
+        ),
+    )
+    trade_feedback_events: list[TradeFeedbackEvent] = [
+        _portfolio_review_decision_event(
+            row,
+            workflow="review-portfolio",
+            timestamp_utc=report.generated_at_utc,
+        )
+        for row in report.rows
+    ]
+    trade_feedback_events.extend(
+        event
+        for row in report.rows
+        for event in [
+            _portfolio_review_outcome_event(
+                row,
+                workflow="review-portfolio",
+                timestamp_utc=report.generated_at_utc,
+            )
+        ]
+        if event is not None
+    )
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=trade_feedback_events,
+    )
+    sanitized_report = _strip_internal_portfolio_review_report(report)
     output_dir = (args.output_dir or _default_daily_output_dir(config.project_root, args.as_of)).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    review_json_path = write_portfolio_review_report(report, output_dir / "portfolio_review.json")
-    review_csv_path = write_portfolio_review_report(report, output_dir / "portfolio_review.csv")
+    review_json_path = write_portfolio_review_report(
+        sanitized_report,
+        output_dir / "portfolio_review.json",
+    )
+    review_csv_path = write_portfolio_review_report(
+        sanitized_report,
+        output_dir / "portfolio_review.csv",
+    )
     position_trajectory_journal_path = default_position_trajectory_journal_path(
         config.project_root,
     ).resolve()
-    report_payload = report.to_dict()
+    report_payload = sanitized_report.to_dict()
     action_counts = {
         f"{action.lower().replace(' ', '_')}_count": report_payload[
             f"{action.lower().replace(' ', '_')}_count"
@@ -1444,6 +1751,8 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         payload["outputs"]["position_trajectory_journal"] = str(
             position_trajectory_journal_path
         )
+    if trade_feedback_log_path is not None:
+        payload["outputs"]["trade_decision_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -1476,6 +1785,33 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         }
         _print_structured(payload, output_format=args.format)
         return 0
+    report = replace(
+        report,
+        rows=tuple(
+            replace(
+                row,
+                metadata={
+                    **dict(row.metadata),
+                    "decision_id": _portfolio_review_decision_id(
+                        row,
+                        workflow="review-portfolio-intraday",
+                    ),
+                },
+            )
+            for row in report.rows
+        ),
+    )
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=[
+            _portfolio_review_decision_event(
+                row,
+                workflow="review-portfolio-intraday",
+                timestamp_utc=report.generated_at_utc,
+            )
+            for row in report.rows
+        ],
+    )
     output_dir = (
         args.output_dir
         or _default_intraday_portfolio_output_dir(config.project_root, args.as_of)
@@ -1518,6 +1854,8 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
     }
     if intraday_state_journal_path.exists():
         payload["outputs"]["intraday_state_journal"] = str(intraday_state_journal_path)
+    if trade_feedback_log_path is not None:
+        payload["outputs"]["trade_decision_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -1536,11 +1874,13 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
 
     portfolio_review = None
     if args.portfolio_file is not None:
-        portfolio_review = _run_portfolio_review_workflow(
-            args,
-            config=config,
-            provider=provider,
-            current_positions=current_positions,
+        portfolio_review = _strip_internal_portfolio_review_report(
+            _run_portfolio_review_workflow(
+                args,
+                config=config,
+                provider=provider,
+                current_positions=current_positions,
+            )
         )
 
     monitor_report = build_market_monitor_report(
@@ -1909,6 +2249,11 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         ),
         current_equity=current_equity,
     )
+    assessed_candidates = _attach_candidate_decision_ids(
+        assessed_candidates,
+        workflow="generate-orders",
+        as_of_date=args.as_of,
+    )
 
     executor = ManualExecutor()
     batch = executor.build_execution_batch(assessed_candidates, as_of_date=args.as_of)
@@ -1927,6 +2272,18 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
     order_sheet_path = write_execution_batch(batch, output_dir / "manual_order_sheet.csv")
     signal_report_json_path = write_daily_signal_report(report, output_dir / "daily_signal_report.json")
     signal_report_csv_path = write_daily_signal_report(report, output_dir / "daily_signal_report.csv")
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=[
+            _candidate_trade_feedback_event(
+                candidate,
+                workflow="generate-orders",
+                as_of_date=args.as_of,
+                timestamp_utc=batch.generated_at_utc,
+            )
+            for candidate in assessed_candidates
+        ],
+    )
 
     payload = {
         "provider": config.data_sources.provider,
@@ -1969,6 +2326,8 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             "daily_signal_report_csv": str(signal_report_csv_path),
         },
     }
+    if trade_feedback_log_path is not None:
+        payload["outputs"]["trade_decision_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -2361,8 +2720,22 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     current_positions = workflow["current_positions"]
     current_equity = workflow["current_equity"]
     execution_batch = workflow["execution_batch"]
+    ranked_evaluations = workflow["ranked_evaluations"]
     summary_payload = summary.to_dict()
     candidate_score_journal_path = workflow.get("candidate_score_journal_path")
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=[
+            _candidate_trade_feedback_event(
+                evaluation.candidate,
+                workflow="daily-summary",
+                as_of_date=args.as_of,
+                timestamp_utc=execution_batch.generated_at_utc,
+            )
+            for evaluation in ranked_evaluations
+            if isinstance(evaluation, PresetCandidateEvaluation)
+        ],
+    )
 
     output_dir = (
         args.output_dir
@@ -2404,6 +2777,8 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     }
     if candidate_score_journal_path is not None:
         outputs["candidate_score_journal"] = str(candidate_score_journal_path)
+    if trade_feedback_log_path is not None:
+        outputs["trade_decision_log"] = str(trade_feedback_log_path)
 
     payload = {
         "provider": config.data_sources.provider,
@@ -2473,6 +2848,447 @@ def _default_daily_output_dir(project_root: Path, as_of_date: date) -> Path:
 def _default_intraday_portfolio_output_dir(project_root: Path, as_of_date: date) -> Path:
     return project_root / "data" / "processed" / "portfolio_review_intraday" / as_of_date.isoformat()
 
+
+def _trade_feedback_timestamp_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _append_trade_feedback_events_safe(
+    *,
+    project_root: Path,
+    events: Sequence[TradeFeedbackEvent],
+) -> Path | None:
+    if not events:
+        return None
+    log_path = default_trade_feedback_log_path(project_root).resolve()
+    try:
+        return append_trade_feedback_events(events, log_path)
+    except (OSError, TypeError, ValueError) as exc:
+        LOGGER.warning("Skipping trade feedback log update at %s: %s", log_path, exc)
+        return None
+
+
+def _clean_optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _mapping_numeric_value(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _candidate_decision_id(candidate: RiskAssessedCandidate, *, workflow: str, as_of_date: date) -> str:
+    signal_metadata = candidate.signal.metadata
+    existing = _clean_optional_text(signal_metadata.get("decision_id"))
+    if existing is not None:
+        return existing
+    return build_trade_decision_id(
+        workflow=workflow,
+        as_of_date=as_of_date,
+        symbol=candidate.signal.symbol,
+        signal_date=candidate.signal.date,
+        preset_name=_clean_optional_text(signal_metadata.get("preset_name")),
+        parameter_id=_clean_optional_text(signal_metadata.get("parameter_id")),
+        strategy_name=candidate.signal.strategy_name,
+    )
+
+
+def _attach_candidate_decision_ids(
+    candidates: Sequence[RiskAssessedCandidate],
+    *,
+    workflow: str,
+    as_of_date: date,
+) -> list[RiskAssessedCandidate]:
+    annotated: list[RiskAssessedCandidate] = []
+    for candidate in candidates:
+        decision_id = _candidate_decision_id(
+            candidate,
+            workflow=workflow,
+            as_of_date=as_of_date,
+        )
+        signal_metadata = dict(candidate.signal.metadata)
+        signal_metadata["decision_id"] = decision_id
+        annotated.append(
+            replace(
+                candidate,
+                signal=replace(candidate.signal, metadata=signal_metadata),
+            )
+        )
+    return annotated
+
+
+def _attach_evaluation_decision_ids(
+    evaluations: Sequence[PresetCandidateEvaluation],
+    *,
+    workflow: str,
+    as_of_date: date,
+) -> list[PresetCandidateEvaluation]:
+    return [
+        replace(
+            evaluation,
+            candidate=_attach_candidate_decision_ids(
+                [evaluation.candidate],
+                workflow=workflow,
+                as_of_date=as_of_date,
+            )[0],
+        )
+        for evaluation in evaluations
+    ]
+
+
+def _candidate_feature_snapshot(candidate: RiskAssessedCandidate) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    if candidate.execution_priority is not None:
+        snapshot["opportunity_score"] = candidate.execution_priority.opportunity_score
+    if candidate.features is not None:
+        if candidate.features.breakout_strength is not None:
+            snapshot["breakout_strength"] = candidate.features.breakout_strength
+        if candidate.features.relative_volume is not None:
+            snapshot["relative_volume"] = candidate.features.relative_volume
+        if candidate.features.setup_quality_score is not None:
+            snapshot["setup_quality_score"] = candidate.features.setup_quality_score
+        if candidate.features.setup_persistence_days is not None:
+            snapshot["setup_persistence_days"] = candidate.features.setup_persistence_days
+        if candidate.features.days_approved is not None:
+            snapshot["days_approved"] = candidate.features.days_approved
+        if candidate.features.sector_name is not None:
+            snapshot["sector_name"] = candidate.features.sector_name
+        if candidate.features.industry_name is not None:
+            snapshot["industry_name"] = candidate.features.industry_name
+        if candidate.features.sector_regime_passed is not None:
+            snapshot["sector_regime_passed"] = candidate.features.sector_regime_passed
+        if candidate.features.relative_strength_vs_sector is not None:
+            snapshot["relative_strength_vs_sector"] = (
+                candidate.features.relative_strength_vs_sector
+            )
+        if candidate.features.is_earnings_risk:
+            snapshot["is_earnings_risk"] = True
+        if candidate.features.earnings_days_away is not None:
+            snapshot["earnings_days_away"] = candidate.features.earnings_days_away
+        if candidate.features.market_context is not None:
+            market_context = candidate.features.market_context
+            if market_context.market_breadth_state is not None:
+                snapshot["market_breadth_state"] = market_context.market_breadth_state
+            if market_context.market_breadth_pct_above_200ma is not None:
+                snapshot["market_breadth_pct_above_200ma"] = (
+                    market_context.market_breadth_pct_above_200ma
+                )
+            if market_context.volatility_regime_state is not None:
+                snapshot["volatility_regime_state"] = (
+                    market_context.volatility_regime_state
+                )
+            if market_context.vix_close is not None:
+                snapshot["vix_close"] = market_context.vix_close
+        if candidate.features.portfolio_heat_context is not None:
+            heat_context = candidate.features.portfolio_heat_context
+            snapshot["same_sector_position_count"] = heat_context.same_sector_position_count
+            snapshot["same_industry_position_count"] = (
+                heat_context.same_industry_position_count
+            )
+    if candidate.portfolio_heat_projection is not None:
+        projection = candidate.portfolio_heat_projection
+        snapshot["projected_same_sector_position_count"] = (
+            projection.projected_same_sector_position_count
+        )
+        snapshot["projected_same_industry_position_count"] = (
+            projection.projected_same_industry_position_count
+        )
+        if projection.projected_sector_notional_pct is not None:
+            snapshot["projected_sector_notional_pct"] = (
+                projection.projected_sector_notional_pct
+            )
+    return snapshot
+
+
+def _order_decision_id(order: object | None) -> str | None:
+    if order is None:
+        return None
+    metadata = getattr(order, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    direct = _clean_optional_text(metadata.get("decision_id"))
+    if direct is not None:
+        return direct
+    signal_metadata = metadata.get("signal_metadata")
+    if isinstance(signal_metadata, Mapping):
+        return _clean_optional_text(signal_metadata.get("decision_id"))
+    return None
+
+
+def _candidate_trade_feedback_event(
+    candidate: RiskAssessedCandidate,
+    *,
+    workflow: str,
+    as_of_date: date,
+    timestamp_utc: str,
+) -> TradeFeedbackEvent:
+    signal_metadata = candidate.signal.metadata
+    decision_id = _candidate_decision_id(candidate, workflow=workflow, as_of_date=as_of_date)
+    priority = candidate.execution_priority
+    return TradeFeedbackEvent(
+        event_type="decision",
+        workflow=workflow,
+        symbol=candidate.signal.symbol,
+        as_of_date=as_of_date,
+        timestamp_utc=timestamp_utc,
+        decision_id=decision_id,
+        preset_name=_clean_optional_text(signal_metadata.get("preset_name")),
+        parameter_id=_clean_optional_text(signal_metadata.get("parameter_id")),
+        strategy_name=candidate.signal.strategy_name,
+        suggested_action=candidate.signal.side,
+        approved=candidate.approved,
+        rejection_reasons=tuple(candidate.rejection_reasons),
+        queue_rank=priority.queue_rank if priority is not None else None,
+        priority_bucket=priority.priority_bucket if priority is not None else None,
+        actionable_now=priority.actionable_now if priority is not None else None,
+        quantity=(candidate.sizing.shares if candidate.sizing.shares > 0 else None),
+        entry_price_hint=candidate.entry_price,
+        stop_price=candidate.stop_price,
+        notional_value=(
+            candidate.sizing.notional_value
+            if candidate.sizing.notional_value > 0
+            else None
+        ),
+        feature_snapshot=_candidate_feature_snapshot(candidate),
+    )
+
+
+def _portfolio_review_decision_id(
+    row: PortfolioReviewRow,
+    *,
+    workflow: str,
+) -> str:
+    existing = _clean_optional_text(row.metadata.get("decision_id"))
+    if existing is not None:
+        return existing
+    return build_trade_decision_id(
+        workflow=workflow,
+        as_of_date=row.date,
+        symbol=row.symbol,
+        preset_name=row.preset_name,
+        review_timestamp=_clean_optional_text(row.metadata.get("latest_bar_time")),
+    )
+
+
+def _portfolio_review_feature_snapshot(row: PortfolioReviewRow) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "above_entry": row.above_entry,
+        "unrealized_pl_pct": row.unrealized_pl_pct,
+    }
+    if row.distance_to_stop_pct is not None:
+        snapshot["distance_to_stop_pct"] = row.distance_to_stop_pct
+    for key in (
+        "days_since_new_high",
+        "relative_strength_return_diff",
+        "sector_name",
+        "earnings_days_away",
+        "session_vwap",
+        "session_high_giveback_pct",
+        "intraday_relative_strength_diff",
+        "consecutive_days_below_entry",
+        "consecutive_watch_closely_days",
+        "consecutive_polls_below_vwap",
+        "repeated_watch_closely_count",
+    ):
+        value = row.metadata.get(key)
+        if value is not None:
+            snapshot[key] = value
+    return snapshot
+
+
+def _trade_outcome_snapshot_from_row(row: PortfolioReviewRow) -> TradeOutcomeSnapshot | None:
+    raw_snapshot = row.metadata.get(_TRADE_OUTCOME_SNAPSHOT_METADATA_KEY)
+    if not isinstance(raw_snapshot, Mapping):
+        return None
+    return TradeOutcomeSnapshot.from_mapping(raw_snapshot)
+
+
+def _strip_internal_portfolio_review_row(row: PortfolioReviewRow) -> PortfolioReviewRow:
+    return replace(
+        row,
+        metadata={
+            key: value
+            for key, value in row.metadata.items()
+            if key not in (
+                _POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY,
+                _TRADE_OUTCOME_SNAPSHOT_METADATA_KEY,
+            )
+        },
+    )
+
+
+def _strip_internal_portfolio_review_report(
+    report: PortfolioReviewReport,
+) -> PortfolioReviewReport:
+    return replace(
+        report,
+        rows=tuple(_strip_internal_portfolio_review_row(row) for row in report.rows),
+    )
+
+
+def _portfolio_review_decision_event(
+    row: PortfolioReviewRow,
+    *,
+    workflow: str,
+    timestamp_utc: str,
+) -> TradeFeedbackEvent:
+    return TradeFeedbackEvent(
+        event_type="decision",
+        workflow=workflow,
+        symbol=row.symbol,
+        as_of_date=row.date,
+        timestamp_utc=timestamp_utc,
+        decision_id=_portfolio_review_decision_id(row, workflow=workflow),
+        preset_name=row.preset_name,
+        suggested_action=row.suggested_action,
+        quantity=row.quantity,
+        entry_price_hint=row.average_entry_price,
+        stop_price=row.current_stop,
+        feature_snapshot=_portfolio_review_feature_snapshot(row),
+        metadata={"rationale": row.rationale},
+    )
+
+
+def _portfolio_review_outcome_event(
+    row: PortfolioReviewRow,
+    *,
+    workflow: str,
+    timestamp_utc: str,
+) -> TradeFeedbackEvent | None:
+    outcome_snapshot = _trade_outcome_snapshot_from_row(row)
+    if outcome_snapshot is None:
+        return None
+    position_metadata = row.metadata.get("position_metadata", {})
+    if not isinstance(position_metadata, Mapping):
+        position_metadata = {}
+    trade_id = _clean_optional_text(position_metadata.get("trade_id"))
+    if trade_id is None:
+        return None
+    linked_decision_id = (
+        _clean_optional_text(position_metadata.get("linked_decision_id"))
+        or _extract_linked_decision_id(position_metadata)
+    )
+    return TradeFeedbackEvent(
+        event_type="outcome",
+        workflow=workflow,
+        symbol=row.symbol,
+        as_of_date=row.date,
+        timestamp_utc=timestamp_utc,
+        decision_id=linked_decision_id,
+        trade_id=trade_id,
+        linked_decision_id=linked_decision_id,
+        preset_name=row.preset_name,
+        suggested_action=row.suggested_action,
+        quantity=row.quantity,
+        entry_price_hint=row.average_entry_price,
+        stop_price=row.current_stop,
+        feature_snapshot=_portfolio_review_feature_snapshot(row),
+        outcome_snapshot=outcome_snapshot,
+    )
+
+
+def _extract_linked_decision_id(metadata: Mapping[str, Any]) -> str | None:
+    for key in ("linked_decision_id", "decision_id"):
+        value = _clean_optional_text(metadata.get(key))
+        if value is not None:
+            return value
+    signal_metadata = metadata.get("signal_metadata")
+    if isinstance(signal_metadata, Mapping):
+        value = _clean_optional_text(signal_metadata.get("decision_id"))
+        if value is not None:
+            return value
+    execution_metadata = metadata.get("execution_metadata")
+    if isinstance(execution_metadata, Mapping):
+        for key in ("decision_id", "linked_decision_id"):
+            value = _clean_optional_text(execution_metadata.get(key))
+            if value is not None:
+                return value
+        nested_signal_metadata = execution_metadata.get("signal_metadata")
+        if isinstance(nested_signal_metadata, Mapping):
+            value = _clean_optional_text(nested_signal_metadata.get("decision_id"))
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_strategy_name_from_metadata(metadata: Mapping[str, Any]) -> str | None:
+    direct = _clean_optional_text(metadata.get("strategy_name"))
+    if direct is not None:
+        return direct
+    signal_metadata = metadata.get("signal_metadata")
+    if isinstance(signal_metadata, Mapping):
+        direct = _clean_optional_text(signal_metadata.get("strategy_name"))
+        if direct is not None:
+            return direct
+    execution_metadata = metadata.get("execution_metadata")
+    if isinstance(execution_metadata, Mapping):
+        direct = _clean_optional_text(execution_metadata.get("strategy_name"))
+        if direct is not None:
+            return direct
+        nested_signal_metadata = execution_metadata.get("signal_metadata")
+        if isinstance(nested_signal_metadata, Mapping):
+            direct = _clean_optional_text(nested_signal_metadata.get("strategy_name"))
+            if direct is not None:
+                return direct
+    return None
+
+
+def _resolve_execution_decision_id(
+    *,
+    explicit_decision_id: object,
+    metadata: Mapping[str, Any],
+    existing_position: ExistingPosition | None,
+) -> str | None:
+    decision_id = _clean_optional_text(explicit_decision_id)
+    if decision_id is not None:
+        return decision_id
+    decision_id = _extract_linked_decision_id(metadata)
+    if decision_id is not None:
+        return decision_id
+    if existing_position is not None:
+        decision_id = _extract_linked_decision_id(existing_position.metadata)
+        if decision_id is not None:
+            return decision_id
+    return None
+
+
+def _resolve_execution_trade_id(
+    *,
+    explicit_trade_id: object,
+    metadata: Mapping[str, Any],
+    existing_position: ExistingPosition | None,
+    symbol: str,
+    entry_date: date | None,
+    average_entry_price: float | None,
+    decision_id: str | None,
+) -> str:
+    trade_id = _clean_optional_text(explicit_trade_id)
+    if trade_id is not None:
+        return trade_id
+    trade_id = _clean_optional_text(metadata.get("trade_id"))
+    if trade_id is not None:
+        return trade_id
+    if existing_position is not None:
+        trade_id = _clean_optional_text(existing_position.metadata.get("trade_id"))
+        if trade_id is not None:
+            return trade_id
+    return build_trade_id(
+        symbol=symbol,
+        entry_date=entry_date,
+        average_entry_price=average_entry_price,
+        decision_id=decision_id,
+    )
 
 def _benchmark_symbol_override(raw_value: object) -> str | None:
     if not isinstance(raw_value, str) or not raw_value.strip():
@@ -2850,6 +3666,11 @@ def _run_daily_summary_workflow(
         replace(evaluation, candidate=candidate)
         for evaluation, candidate in zip(evaluations, prioritized_candidates)
     ]
+    evaluations = _attach_evaluation_decision_ids(
+        evaluations,
+        workflow="daily-summary",
+        as_of_date=args.as_of,
+    )
     ranked_evaluations = rank_preset_candidate_evaluations(
         evaluations,
         current_equity=current_equity,
@@ -2885,6 +3706,7 @@ def _run_daily_summary_workflow(
     return {
         "summary": summary,
         "execution_batch": execution_batch,
+        "ranked_evaluations": ranked_evaluations,
         "presets": presets,
         "preset_selection_source": preset_selection_source,
         "current_positions": resolved_current_positions,
@@ -3418,6 +4240,38 @@ def _build_position_trajectory_observation(
     )
 
 
+def _build_trade_outcome_snapshot(
+    position: ExistingPosition,
+    *,
+    price_frame: pd.DataFrame,
+    as_of_date: date,
+) -> TradeOutcomeSnapshot | None:
+    trade_id = _clean_optional_text(position.metadata.get("trade_id"))
+    if trade_id is None:
+        LOGGER.debug(
+            "Skipping trade outcome tracking for %s on %s because trade_id is absent.",
+            position.symbol,
+            as_of_date.isoformat(),
+        )
+        return None
+    entry_date = _position_entry_date(position)
+    if entry_date is None:
+        LOGGER.warning(
+            "Skipping trade outcome tracking for %s on %s because trade_id %s has no entry_date.",
+            position.symbol,
+            as_of_date.isoformat(),
+            trade_id,
+        )
+        return None
+    return compute_trade_outcome_snapshot(
+        price_frame,
+        entry_date=entry_date,
+        entry_price=position.average_entry_price,
+        stop_price=position.current_stop,
+        as_of_date=as_of_date,
+    )
+
+
 def _position_trajectory_observation_from_row(
     row: PortfolioReviewRow,
 ) -> PositionTrajectoryObservation | None:
@@ -3939,6 +4793,11 @@ def _build_portfolio_review_row(
             position_trajectory_observation,
             suggested_action=decision.suggested_action,
         )
+    trade_outcome_snapshot = _build_trade_outcome_snapshot(
+        position,
+        price_frame=prepared_bars,
+        as_of_date=as_of_date,
+    )
     entry_date_used = _position_entry_date(position)
     metadata = {
         "preset_resolution": preset_resolution,
@@ -3962,6 +4821,8 @@ def _build_portfolio_review_row(
         metadata[_POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY] = (
             finalized_position_trajectory_observation.to_dict()
         )
+    if trade_outcome_snapshot is not None:
+        metadata[_TRADE_OUTCOME_SNAPSHOT_METADATA_KEY] = trade_outcome_snapshot.to_dict()
     return PortfolioReviewRow(
         date=as_of_date,
         symbol=position.symbol,
