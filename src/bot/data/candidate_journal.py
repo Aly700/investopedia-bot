@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-import json
 from pathlib import Path
 from typing import Any, Mapping
 
 from bot.logging_utils import get_logger
+from bot.data.state_persistence import (
+    StateArtifactPath,
+    load_json_mapping_file,
+    write_json_file,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -16,6 +20,18 @@ LOGGER = get_logger(__name__)
 CANDIDATE_SCORE_JOURNAL_SCHEMA_VERSION = 1
 DEFAULT_CANDIDATE_SCORE_JOURNAL_STALE_AFTER_DAYS = 30
 CONSECUTIVE_SETUP_GAP_RESET_DAYS = 5
+_CANDIDATE_SCORE_JOURNAL_PATH = StateArtifactPath(
+    preferred_relative_path=(
+        "data",
+        "processed",
+        "state",
+        "journals",
+        "candidate_scores.json",
+    ),
+    legacy_relative_paths=(
+        ("data", "processed", "state", "candidate_scores.json"),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -138,10 +154,31 @@ class CandidateScoreJournal:
         }
 
 
+@dataclass(frozen=True)
+class CandidateScoreJournalStore:
+    """Project-scoped loader/saver for the candidate score journal."""
+
+    project_root: Path
+    stale_after_days: int = DEFAULT_CANDIDATE_SCORE_JOURNAL_STALE_AFTER_DAYS
+
+    @property
+    def path(self) -> Path:
+        return default_candidate_score_journal_path(self.project_root)
+
+    def load(self) -> CandidateScoreJournal:
+        return load_candidate_score_journal(
+            self.path,
+            stale_after_days=self.stale_after_days,
+        )
+
+    def save(self, journal: CandidateScoreJournal) -> Path:
+        return write_candidate_score_journal(journal, self.path)
+
+
 def default_candidate_score_journal_path(project_root: Path) -> Path:
     """Return the repo-relative journal path used by daily candidate workflows."""
 
-    return project_root / "data" / "processed" / "state" / "candidate_scores.json"
+    return _CANDIDATE_SCORE_JOURNAL_PATH.resolve(project_root)
 
 
 def load_candidate_score_journal(
@@ -151,51 +188,19 @@ def load_candidate_score_journal(
 ) -> CandidateScoreJournal:
     """Load the journal, falling back to an empty state on missing/corrupt files."""
 
-    resolved_path = journal_path.resolve()
-    if not resolved_path.exists():
-        return CandidateScoreJournal(entries={}, stale_after_days=stale_after_days)
-
-    try:
-        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("Journal payload must be a mapping.")
-        raw_symbols = payload.get("symbols", {})
-        if not isinstance(raw_symbols, dict):
-            raise ValueError("Journal payload 'symbols' must be a mapping.")
-
-        entries: dict[str, CandidateJournalEntry] = {}
-        for symbol, raw_entry in raw_symbols.items():
-            if not isinstance(symbol, str) or not symbol.strip():
-                raise ValueError("Journal symbol keys must be non-empty strings.")
-            if not isinstance(raw_entry, dict):
-                raise ValueError(f"Journal entry for {symbol!r} must be a mapping.")
-            normalized_symbol = symbol.strip().upper()
-            entries[normalized_symbol] = CandidateJournalEntry.from_mapping(
-                normalized_symbol,
-                raw_entry,
-            )
-
-        updated_at = _optional_date(payload.get("updated_at"))
-        configured_stale_after_days = payload.get("stale_after_days", stale_after_days)
-        return CandidateScoreJournal(
-            entries=entries,
-            updated_at=updated_at,
-            stale_after_days=_coerce_positive_int(
-                configured_stale_after_days,
-                "stale_after_days",
-            ),
-            schema_version=_coerce_positive_int(
-                payload.get("schema_version", CANDIDATE_SCORE_JOURNAL_SCHEMA_VERSION),
-                "schema_version",
-            ),
-        )
-    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-        LOGGER.warning(
-            "Ignoring candidate score journal at %s because it could not be loaded: %s",
-            resolved_path,
-            exc,
-        )
-        return CandidateScoreJournal(entries={}, stale_after_days=stale_after_days)
+    return load_json_mapping_file(
+        journal_path,
+        artifact_label="candidate score journal",
+        logger=LOGGER,
+        empty_value=lambda: CandidateScoreJournal(
+            entries={},
+            stale_after_days=stale_after_days,
+        ),
+        build=lambda payload, _resolved_path: _build_candidate_score_journal(
+            payload,
+            stale_after_days=stale_after_days,
+        ),
+    )
 
 
 def write_candidate_score_journal(
@@ -204,13 +209,7 @@ def write_candidate_score_journal(
 ) -> Path:
     """Persist the journal as JSON."""
 
-    resolved_path = journal_path.resolve()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    resolved_path.write_text(
-        json.dumps(journal.to_dict(), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    return resolved_path
+    return write_json_file(journal_path, journal.to_dict())
 
 
 def build_candidate_memory_features(
@@ -259,8 +258,11 @@ def update_candidate_score_journal(
     updated_entries: dict[str, CandidateJournalEntry] = {}
 
     for symbol, observation in observations.items():
-        existing_entry = journal.entries.get(symbol)
-        updated_entries[symbol] = _next_candidate_journal_entry(
+        normalized_symbol = symbol.strip().upper()
+        if observation.symbol.strip().upper() != normalized_symbol:
+            raise ValueError("Observation symbol must match the journal update key.")
+        existing_entry = journal.entries.get(normalized_symbol)
+        updated_entries[normalized_symbol] = _next_candidate_journal_entry(
             existing_entry,
             observation=observation,
             as_of_date=as_of_date,
@@ -278,6 +280,43 @@ def update_candidate_score_journal(
         updated_at=as_of_date,
         stale_after_days=journal.stale_after_days,
         schema_version=journal.schema_version,
+    )
+
+
+def _build_candidate_score_journal(
+    payload: Mapping[str, Any],
+    *,
+    stale_after_days: int,
+) -> CandidateScoreJournal:
+    raw_symbols = payload.get("symbols", {})
+    if not isinstance(raw_symbols, Mapping):
+        raise ValueError("Journal payload 'symbols' must be a mapping.")
+
+    entries: dict[str, CandidateJournalEntry] = {}
+    for symbol, raw_entry in raw_symbols.items():
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("Journal symbol keys must be non-empty strings.")
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(f"Journal entry for {symbol!r} must be a mapping.")
+        normalized_symbol = symbol.strip().upper()
+        entries[normalized_symbol] = CandidateJournalEntry.from_mapping(
+            normalized_symbol,
+            raw_entry,
+        )
+
+    updated_at = _optional_date(payload.get("updated_at"))
+    configured_stale_after_days = payload.get("stale_after_days", stale_after_days)
+    return CandidateScoreJournal(
+        entries=dict(sorted(entries.items())),
+        updated_at=updated_at,
+        stale_after_days=_coerce_positive_int(
+            configured_stale_after_days,
+            "stale_after_days",
+        ),
+        schema_version=_coerce_positive_int(
+            payload.get("schema_version", CANDIDATE_SCORE_JOURNAL_SCHEMA_VERSION),
+            "schema_version",
+        ),
     )
 
 

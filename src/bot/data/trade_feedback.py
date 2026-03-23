@@ -12,12 +12,25 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 
 from bot.logging_utils import get_logger
+from bot.data.state_persistence import StateArtifactPath
 
 
 LOGGER = get_logger(__name__)
 
 TRADE_FEEDBACK_SCHEMA_VERSION = 1
 DEFAULT_TRADE_OUTCOME_WINDOWS = (1, 5, 10)
+_TRADE_FEEDBACK_LOG_PATH = StateArtifactPath(
+    preferred_relative_path=(
+        "data",
+        "processed",
+        "state",
+        "logs",
+        "trade_feedback.jsonl",
+    ),
+    legacy_relative_paths=(
+        ("data", "processed", "state", "trade_decision_log.jsonl"),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -234,10 +247,27 @@ class TradeFeedbackEvent:
         )
 
 
+@dataclass(frozen=True)
+class TradeFeedbackLogStore:
+    """Project-scoped loader/appender for trade feedback events."""
+
+    project_root: Path
+
+    @property
+    def path(self) -> Path:
+        return default_trade_feedback_log_path(self.project_root)
+
+    def load(self) -> tuple[TradeFeedbackEvent, ...]:
+        return load_trade_feedback_events(self.path)
+
+    def append(self, events: Sequence[TradeFeedbackEvent]) -> Path:
+        return append_trade_feedback_events(events, self.path)
+
+
 def default_trade_feedback_log_path(project_root: Path) -> Path:
     """Return the repo-relative JSONL path for persisted feedback events."""
 
-    return project_root / "data" / "processed" / "state" / "trade_decision_log.jsonl"
+    return _TRADE_FEEDBACK_LOG_PATH.resolve(project_root)
 
 
 def build_trade_decision_id(
@@ -351,29 +381,34 @@ def append_trade_feedback_events(
     resolved_path = log_path.resolve()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-    existing_event_ids = {
-        event.event_id
-        for event in load_trade_feedback_events(resolved_path)
-    }
-    ordered_events = sorted(
-        events,
-        key=lambda event: (
-            event.as_of_date.isoformat() if event.as_of_date is not None else "",
-            event.symbol,
-            event.workflow,
-            event.event_type,
-            event.decision_id or "",
-            event.trade_id or "",
-        ),
-    )
+    existing_events = load_trade_feedback_events(resolved_path)
+    existing_event_ids = {event.event_id for event in existing_events}
+    merged_events = merge_trade_feedback_events(existing_events, events)
+    ordered_events = [
+        event for event in merged_events if event.event_id not in existing_event_ids
+    ]
     with resolved_path.open("a", encoding="utf-8") as handle:
         for event in ordered_events:
-            if event.event_id in existing_event_ids:
-                continue
             handle.write(json.dumps(event.to_dict(), sort_keys=True))
             handle.write("\n")
-            existing_event_ids.add(event.event_id)
     return resolved_path
+
+
+def merge_trade_feedback_events(
+    existing_events: Sequence[TradeFeedbackEvent],
+    new_events: Sequence[TradeFeedbackEvent],
+) -> tuple[TradeFeedbackEvent, ...]:
+    """Return a deduplicated, deterministically ordered event sequence."""
+
+    events_by_id = {event.event_id: event for event in existing_events}
+    for event in new_events:
+        events_by_id[event.event_id] = event
+    return tuple(
+        sorted(
+            events_by_id.values(),
+            key=_trade_feedback_event_sort_key,
+        )
+    )
 
 
 def summarize_trade_feedback_events(
@@ -484,6 +519,19 @@ def _stable_id(prefix: str, payload: Mapping[str, Any]) -> str:
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     digest = hashlib.sha1(serialized.encode("utf-8")).hexdigest()[:16]
     return f"{prefix}_{digest}"
+
+
+def _trade_feedback_event_sort_key(
+    event: TradeFeedbackEvent,
+) -> tuple[str, str, str, str, str, str]:
+    return (
+        event.as_of_date.isoformat() if event.as_of_date is not None else "",
+        event.symbol,
+        event.workflow,
+        event.event_type,
+        event.decision_id or "",
+        event.trade_id or "",
+    )
 
 
 def _clean_text(value: object) -> str | None:

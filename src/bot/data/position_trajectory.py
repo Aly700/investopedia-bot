@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from bot.logging_utils import get_logger
+from bot.data.state_persistence import (
+    StateArtifactPath,
+    load_json_mapping_file,
+    write_json_file,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -16,6 +20,18 @@ LOGGER = get_logger(__name__)
 POSITION_TRAJECTORY_JOURNAL_SCHEMA_VERSION = 1
 DEFAULT_POSITION_PERSISTENT_WEAKNESS_DAY_THRESHOLD = 3
 DEFAULT_POSITION_RECOVERY_MIN_WEAK_DAYS = 2
+_POSITION_TRAJECTORY_JOURNAL_PATH = StateArtifactPath(
+    preferred_relative_path=(
+        "data",
+        "processed",
+        "state",
+        "journals",
+        "position_trajectory.json",
+    ),
+    legacy_relative_paths=(
+        ("data", "processed", "state", "position_trajectory.json"),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -141,10 +157,27 @@ class PositionTrajectoryJournal:
         }
 
 
+@dataclass(frozen=True)
+class PositionTrajectoryJournalStore:
+    """Project-scoped loader/saver for the position trajectory journal."""
+
+    project_root: Path
+
+    @property
+    def path(self) -> Path:
+        return default_position_trajectory_journal_path(self.project_root)
+
+    def load(self) -> PositionTrajectoryJournal:
+        return load_position_trajectory_journal(self.path)
+
+    def save(self, journal: PositionTrajectoryJournal) -> Path:
+        return write_position_trajectory_journal(journal, self.path)
+
+
 def default_position_trajectory_journal_path(project_root: Path) -> Path:
     """Return the repo-relative journal path for daily held-position state."""
 
-    return project_root / "data" / "processed" / "state" / "position_trajectory.json"
+    return _POSITION_TRAJECTORY_JOURNAL_PATH.resolve(project_root)
 
 
 def load_position_trajectory_journal(
@@ -152,60 +185,15 @@ def load_position_trajectory_journal(
 ) -> PositionTrajectoryJournal:
     """Load the journal, falling back to empty state on missing/corrupt files."""
 
-    resolved_path = journal_path.resolve()
-    if not resolved_path.exists():
-        return PositionTrajectoryJournal(entries={})
-
-    try:
-        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("Journal payload must be a mapping.")
-        raw_symbols = payload.get("symbols", {})
-        if not isinstance(raw_symbols, dict):
-            raise ValueError("Journal payload 'symbols' must be a mapping.")
-
-        entries: dict[str, tuple[PositionTrajectoryObservation, ...]] = {}
-        for symbol, raw_entry in raw_symbols.items():
-            if not isinstance(symbol, str) or not symbol.strip():
-                raise ValueError("Journal symbol keys must be non-empty strings.")
-            if not isinstance(raw_entry, dict):
-                raise ValueError(f"Journal entry for {symbol!r} must be a mapping.")
-            raw_observations = raw_entry.get("observations", [])
-            if not isinstance(raw_observations, list):
-                raise ValueError(f"Journal observations for {symbol!r} must be a list.")
-            normalized_symbol = symbol.strip().upper()
-            observations = tuple(
-                sorted(
-                    (
-                        PositionTrajectoryObservation.from_mapping(
-                            normalized_symbol,
-                            raw_observation,
-                        )
-                        for raw_observation in raw_observations
-                    ),
-                    key=lambda observation: observation.as_of_date,
-                )
-            )
-            entries[normalized_symbol] = observations
-
-        return PositionTrajectoryJournal(
-            entries=dict(sorted(entries.items())),
-            updated_at=_mapping_optional_text(payload, "updated_at"),
-            schema_version=_coerce_positive_int(
-                payload.get(
-                    "schema_version",
-                    POSITION_TRAJECTORY_JOURNAL_SCHEMA_VERSION,
-                ),
-                "schema_version",
-            ),
-        )
-    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-        LOGGER.warning(
-            "Ignoring position trajectory journal at %s because it could not be loaded: %s",
-            resolved_path,
-            exc,
-        )
-        return PositionTrajectoryJournal(entries={})
+    return load_json_mapping_file(
+        journal_path,
+        artifact_label="position trajectory journal",
+        logger=LOGGER,
+        empty_value=lambda: PositionTrajectoryJournal(entries={}),
+        build=lambda payload, _resolved_path: _build_position_trajectory_journal(
+            payload,
+        ),
+    )
 
 
 def write_position_trajectory_journal(
@@ -214,15 +202,7 @@ def write_position_trajectory_journal(
 ) -> Path:
     """Persist the journal as JSON with an atomic replace in the target directory."""
 
-    resolved_path = journal_path.resolve()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = resolved_path.with_suffix(resolved_path.suffix + ".tmp")
-    temp_path.write_text(
-        json.dumps(journal.to_dict(), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    temp_path.replace(resolved_path)
-    return resolved_path
+    return write_json_file(journal_path, journal.to_dict())
 
 
 def update_position_trajectory_journal(
@@ -270,6 +250,50 @@ def update_position_trajectory_journal(
         },
         updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         schema_version=journal.schema_version,
+    )
+
+
+def _build_position_trajectory_journal(
+    payload: Mapping[str, Any],
+) -> PositionTrajectoryJournal:
+    raw_symbols = payload.get("symbols", {})
+    if not isinstance(raw_symbols, Mapping):
+        raise ValueError("Journal payload 'symbols' must be a mapping.")
+
+    entries: dict[str, tuple[PositionTrajectoryObservation, ...]] = {}
+    for symbol, raw_entry in raw_symbols.items():
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("Journal symbol keys must be non-empty strings.")
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(f"Journal entry for {symbol!r} must be a mapping.")
+        raw_observations = raw_entry.get("observations", [])
+        if not isinstance(raw_observations, list):
+            raise ValueError(f"Journal observations for {symbol!r} must be a list.")
+        normalized_symbol = symbol.strip().upper()
+        observations = tuple(
+            sorted(
+                (
+                    PositionTrajectoryObservation.from_mapping(
+                        normalized_symbol,
+                        raw_observation,
+                    )
+                    for raw_observation in raw_observations
+                ),
+                key=lambda observation: observation.as_of_date,
+            )
+        )
+        entries[normalized_symbol] = observations
+
+    return PositionTrajectoryJournal(
+        entries=dict(sorted(entries.items())),
+        updated_at=_mapping_optional_text(payload, "updated_at"),
+        schema_version=_coerce_positive_int(
+            payload.get(
+                "schema_version",
+                POSITION_TRAJECTORY_JOURNAL_SCHEMA_VERSION,
+            ),
+            "schema_version",
+        ),
     )
 
 
