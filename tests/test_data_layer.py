@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 import json
 from pathlib import Path
+from typing import Mapping
 
 import pandas as pd
 import pytest
@@ -77,7 +78,18 @@ from bot.data.providers import (
     load_provider_environment,
 )
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
+from bot.reporting.daily_report import PortfolioReviewRow, build_portfolio_review_report
 from bot.reporting.trade_review import build_trade_review_analytics_summary
+from bot.state.market_state import (
+    MarketStateActionState,
+    MarketStateBreadthContext,
+    MarketStateCandidateState,
+    MarketStateSectorSummary,
+    MarketStateSnapshot,
+    MarketStateStore,
+    MarketStateVolatilityContext,
+    diff_market_state_snapshots,
+)
 
 
 class FakeDailyBarProvider(DailyBarProvider):
@@ -2598,3 +2610,226 @@ def test_universe_builder_can_skip_configured_max_symbol_cap(tmp_path: Path) -> 
     assert len(selected) == 105
     assert selected[:3] == ["SYM000", "SYM001", "SYM002"]
     assert selected[-1] == "SYM104"
+
+
+def test_market_state_store_first_run_creates_snapshot(tmp_path: Path) -> None:
+    store = MarketStateStore(tmp_path)
+    report = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        current_positions=[],
+        rows=[
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=None,
+                latest_close=98.0,
+                unrealized_pl_pct=-0.02,
+                distance_to_stop_pct=0.03,
+                regime_passed=True,
+                above_entry=False,
+                suggested_action="WATCH CLOSELY",
+                preset_name="standard_breakout",
+                rationale="Position is weakening.",
+            )
+        ],
+        benchmark_symbol="SPY",
+    )
+
+    result = store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="review-portfolio",
+        portfolio_review=report,
+        portfolio_path=str(tmp_path / "portfolio.csv"),
+    )
+
+    assert result.change_set.baseline_established is True
+    assert result.change_set.transition_count == 0
+    assert result.current_path.exists()
+    assert result.current_snapshot.current_action_states_by_symbol["AAPL"].action == "WATCH CLOSELY"
+    assert result.current_snapshot.portfolio_review_summary is not None
+    assert result.current_snapshot.portfolio_review_summary.watch_closely_count == 1
+
+
+def test_market_state_diff_no_change_is_stable() -> None:
+    snapshot = _market_state_snapshot(
+        action_states={"AAPL": "WATCH CLOSELY"},
+        top_priority_symbols=("NVDA",),
+    )
+
+    change_set = diff_market_state_snapshots(snapshot, snapshot)
+
+    assert change_set.baseline_established is False
+    assert change_set.transition_count == 0
+
+
+def test_market_state_diff_detects_hold_to_watch_transition() -> None:
+    previous = _market_state_snapshot(action_states={"AAPL": "HOLD"})
+    current = _market_state_snapshot(action_states={"AAPL": "WATCH CLOSELY"})
+
+    change_set = diff_market_state_snapshots(previous, current)
+
+    assert change_set.transition_count == 1
+    assert change_set.transitions[0].transition_type == "HOLD_TO_WATCH_CLOSELY"
+    assert change_set.transitions[0].symbol == "AAPL"
+
+
+def test_market_state_diff_detects_watch_to_exit_transition() -> None:
+    previous = _market_state_snapshot(action_states={"AAPL": "WATCH CLOSELY"})
+    current = _market_state_snapshot(action_states={"AAPL": "EXIT CANDIDATE"})
+
+    change_set = diff_market_state_snapshots(previous, current)
+
+    assert change_set.transition_count == 1
+    assert change_set.transitions[0].transition_type == "WATCH_CLOSELY_TO_EXIT_CANDIDATE"
+    assert change_set.transitions[0].symbol == "AAPL"
+
+
+def test_market_state_diff_detects_new_top_priority_candidate() -> None:
+    previous = _market_state_snapshot()
+    current = _market_state_snapshot(top_priority_symbols=("NVDA",))
+
+    change_set = diff_market_state_snapshots(previous, current)
+
+    assert change_set.transition_count == 1
+    assert change_set.transitions[0].transition_type == "TOP_PRIORITY_CANDIDATE_ENTERED"
+    assert change_set.transitions[0].symbol == "NVDA"
+
+
+def test_market_state_diff_detects_regime_and_sector_block_changes() -> None:
+    previous = _market_state_snapshot(
+        breadth_state="healthy",
+        volatility_state="calm",
+    )
+    current = _market_state_snapshot(
+        breadth_state="weak",
+        volatility_state="stressed",
+        blocked_sectors=("Energy",),
+    )
+
+    change_set = diff_market_state_snapshots(previous, current)
+    transition_types = {transition.transition_type for transition in change_set.transitions}
+
+    assert "BREADTH_REGIME_CHANGED" in transition_types
+    assert "VOLATILITY_REGIME_CHANGED" in transition_types
+    assert "SECTOR_BLOCK_ENTERED" in transition_types
+
+
+def test_market_state_store_does_not_retrigger_unchanged_state(tmp_path: Path) -> None:
+    store = MarketStateStore(tmp_path)
+    report = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        current_positions=[],
+        rows=[
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=None,
+                latest_close=98.0,
+                unrealized_pl_pct=-0.02,
+                distance_to_stop_pct=0.03,
+                regime_passed=True,
+                above_entry=False,
+                suggested_action="WATCH CLOSELY",
+                preset_name="standard_breakout",
+                rationale="Position is weakening.",
+            )
+        ],
+        benchmark_symbol="SPY",
+    )
+
+    first = store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="review-portfolio",
+        portfolio_review=report,
+    )
+    second = store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="review-portfolio",
+        portfolio_review=report,
+    )
+
+    assert first.change_set.baseline_established is True
+    assert second.change_set.baseline_established is False
+    assert second.change_set.transition_count == 0
+
+
+def test_market_state_store_ignores_malformed_previous_snapshot(tmp_path: Path) -> None:
+    store = MarketStateStore(tmp_path)
+    store.previous_path.parent.mkdir(parents=True, exist_ok=True)
+    store.previous_path.write_text("{bad json", encoding="utf-8")
+    report = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        current_positions=[],
+        rows=[],
+        benchmark_symbol="SPY",
+    )
+
+    loaded_previous = store.load_previous()
+    result = store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="review-portfolio",
+        portfolio_review=report,
+    )
+
+    assert loaded_previous is None
+    assert result.current_path.exists()
+    assert result.change_set.baseline_established is True
+
+
+def _market_state_snapshot(
+    *,
+    action_states: Mapping[str, str] | None = None,
+    top_priority_symbols: tuple[str, ...] = (),
+    breadth_state: str | None = None,
+    volatility_state: str | None = None,
+    blocked_sectors: tuple[str, ...] = (),
+) -> MarketStateSnapshot:
+    resolved_action_states = {
+        symbol: MarketStateActionState(
+            symbol=symbol,
+            action=action,
+            source_workflow="review-portfolio",
+            rationale=f"{action} rationale.",
+        )
+        for symbol, action in sorted((action_states or {}).items())
+    }
+    return MarketStateSnapshot(
+        schema_version=1,
+        as_of_timestamp="2024-01-05T15:30:00+00:00",
+        as_of_date=date(2024, 1, 5),
+        breadth_context=(
+            MarketStateBreadthContext(market_breadth_state=breadth_state)
+            if breadth_state is not None
+            else None
+        ),
+        volatility_context=(
+            MarketStateVolatilityContext(volatility_regime_state=volatility_state)
+            if volatility_state is not None
+            else None
+        ),
+        sector_context_summary=tuple(
+            MarketStateSectorSummary(
+                sector_name=sector_name,
+                blocked_by_portfolio_heat=True,
+                blocked_candidate_count=1,
+            )
+            for sector_name in blocked_sectors
+        ),
+        approved_candidate_queue=tuple(
+            MarketStateCandidateState(
+                symbol=symbol,
+                rank=index,
+                preset_name="standard_breakout",
+                actionable_now=True,
+                priority_bucket="top_priority",
+            )
+            for index, symbol in enumerate(top_priority_symbols, start=1)
+        ),
+        current_action_states_by_symbol=resolved_action_states,
+    )

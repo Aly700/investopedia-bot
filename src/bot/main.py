@@ -187,6 +187,11 @@ from bot.strategy.breakout_momentum import (
     resolve_breakout_strategy_presets,
 )
 from bot.strategy.regime_filter import regime_is_bullish
+from bot.state.market_state import (
+    MarketStateStore,
+    write_market_state_change_set,
+    write_market_state_change_summary,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -214,6 +219,50 @@ class PortfolioReviewRowState:
 
     def to_record(self) -> dict[str, str]:
         return self.row.to_record()
+
+
+def _persist_market_state(
+    *,
+    project_root: Path,
+    output_dir: Path,
+    as_of_date: date,
+    workflow: str,
+    portfolio_path: str | None = None,
+    daily_summary: Any | None = None,
+    portfolio_review: PortfolioReviewReport | None = None,
+    intraday_review: IntradayPortfolioReviewReport | None = None,
+) -> tuple[dict[str, str], int, bool]:
+    """Update the live market state snapshot and write compact change outputs."""
+
+    state_store = MarketStateStore(project_root)
+    update_result = state_store.update(
+        as_of_date=as_of_date,
+        workflow=workflow,
+        daily_summary=daily_summary,
+        portfolio_review=portfolio_review,
+        intraday_review=intraday_review,
+        portfolio_path=portfolio_path,
+    )
+    change_json_path = write_market_state_change_set(
+        update_result.change_set,
+        output_dir / "market_state_changes.json",
+    )
+    change_text_path = write_market_state_change_summary(
+        update_result.change_set,
+        output_dir / "market_state_changes.txt",
+    )
+    outputs = {
+        "current_market_state_snapshot": str(update_result.current_path),
+        "market_state_changes_json": str(change_json_path),
+        "market_state_changes_text": str(change_text_path),
+    }
+    if update_result.previous_path.exists():
+        outputs["previous_market_state_snapshot"] = str(update_result.previous_path)
+    return (
+        outputs,
+        update_result.change_set.transition_count,
+        update_result.change_set.baseline_established,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1790,6 +1839,16 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         sanitized_report,
         output_dir / "portfolio_review.csv",
     )
+    market_state_outputs, state_change_count, market_state_baseline_established = (
+        _persist_market_state(
+            project_root=config.project_root,
+            output_dir=output_dir,
+            as_of_date=args.as_of,
+            workflow="review-portfolio",
+            portfolio_path=str(args.portfolio_file.resolve()),
+            portfolio_review=sanitized_report,
+        )
+    )
     position_trajectory_journal_path = default_position_trajectory_journal_path(
         config.project_root,
     ).resolve()
@@ -1804,10 +1863,13 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         "portfolio_path": str(args.portfolio_file.resolve()),
         "position_count": len(current_positions),
         "symbols_reviewed": report_payload["reviewed_symbols"],
+        "state_change_count": state_change_count,
+        "market_state_baseline_established": market_state_baseline_established,
         **action_counts,
         "outputs": {
             "portfolio_review_json": str(review_json_path),
             "portfolio_review_csv": str(review_csv_path),
+            **market_state_outputs,
         },
     }
     if position_trajectory_journal_path.exists():
@@ -1893,6 +1955,16 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         report,
         output_dir / "portfolio_review_intraday_brief.txt",
     )
+    market_state_outputs, state_change_count, market_state_baseline_established = (
+        _persist_market_state(
+            project_root=config.project_root,
+            output_dir=output_dir,
+            as_of_date=args.as_of,
+            workflow="review-portfolio-intraday",
+            portfolio_path=str(args.portfolio_file.resolve()),
+            intraday_review=report,
+        )
+    )
     intraday_state_journal_path = default_intraday_state_journal_path(
         config.project_root,
         args.as_of,
@@ -1909,11 +1981,14 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         "interval_minutes": args.interval_minutes,
         "position_count": len(current_positions),
         "symbols_reviewed": report_payload["reviewed_symbols"],
+        "state_change_count": state_change_count,
+        "market_state_baseline_established": market_state_baseline_established,
         **action_counts,
         "outputs": {
             "portfolio_review_intraday_json": str(review_json_path),
             "portfolio_review_intraday_csv": str(review_csv_path),
             "portfolio_review_intraday_brief": str(review_brief_path),
+            **market_state_outputs,
         },
     }
     if intraday_state_journal_path.exists():
@@ -1970,6 +2045,19 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         monitor_report,
         output_dir / "market_monitor_brief.txt",
     )
+    market_state_outputs, state_change_count, market_state_baseline_established = (
+        _persist_market_state(
+            project_root=config.project_root,
+            output_dir=output_dir,
+            as_of_date=args.as_of,
+            workflow="monitor-market",
+            portfolio_path=(
+                str(args.portfolio_file.resolve()) if args.portfolio_file else None
+            ),
+            daily_summary=summary,
+            portfolio_review=portfolio_review,
+        )
+    )
     report_payload = monitor_report.to_dict()
     summary_payload = summary.to_dict()
     candidate_score_journal_path = summary_result.get("candidate_score_journal_path")
@@ -2025,9 +2113,12 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         "approved_count": summary_payload["approved_count"],
         "rejected_count": summary_payload["rejected_count"],
         "alert_count": report_payload["alert_count"],
+        "state_change_count": state_change_count,
+        "market_state_baseline_established": market_state_baseline_established,
         **flat_category_counts,
         "outputs": outputs,
     }
+    payload["outputs"].update(market_state_outputs)
     _print_structured(payload, output_format=args.format)
     return 0
 

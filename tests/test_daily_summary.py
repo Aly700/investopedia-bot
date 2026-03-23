@@ -1485,8 +1485,13 @@ def test_handle_monitor_market_payload_includes_daily_summary_status_counts(
     assert payload["approved_count"] == payload["buy_candidate_count"]
     assert payload["universe_count"] == 3
     assert payload["buy_candidate_count"] == 1
+    assert payload["state_change_count"] == 0
+    assert payload["market_state_baseline_established"] is True
     assert Path(payload["outputs"]["market_monitor_json"]).exists()
     assert Path(payload["outputs"]["market_monitor_brief"]).exists()
+    assert Path(payload["outputs"]["current_market_state_snapshot"]).exists()
+    assert Path(payload["outputs"]["market_state_changes_json"]).exists()
+    assert Path(payload["outputs"]["market_state_changes_text"]).exists()
 
 
 def test_run_portfolio_review_workflow_skips_symbols_with_provider_errors(
@@ -1734,10 +1739,15 @@ def test_handle_review_portfolio_writes_position_trajectory_journal(
     payload = json.loads(capsys.readouterr().out)
 
     assert result == 0
+    assert payload["state_change_count"] == 0
+    assert payload["market_state_baseline_established"] is True
     assert payload["watch_closely_count"] == 1
     assert Path(payload["outputs"]["portfolio_review_json"]).exists()
     assert Path(payload["outputs"]["portfolio_review_csv"]).exists()
     assert Path(payload["outputs"]["position_trajectory_journal"]).exists()
+    assert Path(payload["outputs"]["current_market_state_snapshot"]).exists()
+    assert Path(payload["outputs"]["market_state_changes_json"]).exists()
+    assert Path(payload["outputs"]["market_state_changes_text"]).exists()
 
     journal_payload = json.loads(
         Path(payload["outputs"]["position_trajectory_journal"]).read_text(encoding="utf-8")
@@ -2304,10 +2314,15 @@ def test_handle_review_portfolio_intraday_writes_outputs(
     # AAPL: -2.7% from open, below VWAP, underperforms benchmark, 7.8% giveback → EXIT CANDIDATE
     assert payload["watch_closely_count"] == 0
     assert payload["exit_candidate_count"] == 1
+    assert payload["state_change_count"] == 0
+    assert payload["market_state_baseline_established"] is True
     assert Path(payload["outputs"]["portfolio_review_intraday_json"]).exists()
     assert Path(payload["outputs"]["portfolio_review_intraday_csv"]).exists()
     assert Path(payload["outputs"]["portfolio_review_intraday_brief"]).exists()
     assert Path(payload["outputs"]["intraday_state_journal"]).exists()
+    assert Path(payload["outputs"]["current_market_state_snapshot"]).exists()
+    assert Path(payload["outputs"]["market_state_changes_json"]).exists()
+    assert Path(payload["outputs"]["market_state_changes_text"]).exists()
     assert provider.refresh_values == [True, True]
 
 
