@@ -32,6 +32,14 @@ from bot.data.intraday_state_journal import (
     update_intraday_state_journal,
     write_intraday_state_journal,
 )
+from bot.data.position_trajectory import (
+    PositionTrajectoryObservation,
+    build_position_trajectory_features,
+    default_position_trajectory_journal_path,
+    load_position_trajectory_journal,
+    update_position_trajectory_journal,
+    write_position_trajectory_journal,
+)
 from bot.data.sector_context import (
     SymbolSectorClassification,
     build_sector_feature_contexts,
@@ -1190,6 +1198,228 @@ def test_intraday_state_journal_ignores_boolean_float_fields(
     assert "Ignoring intraday state journal" in caplog.text
 
 
+def test_position_trajectory_journal_updates_and_persists_repeated_reviews(
+    tmp_path: Path,
+) -> None:
+    journal_path = default_position_trajectory_journal_path(tmp_path)
+    journal = load_position_trajectory_journal(journal_path)
+
+    first_observation = _position_trajectory_observation(
+        as_of_date=date(2024, 1, 5),
+        latest_close=98.0,
+        above_entry=False,
+        stale_position=False,
+        weak_relative_strength=False,
+        suggested_action="WATCH CLOSELY",
+    )
+    second_observation = _position_trajectory_observation(
+        as_of_date=date(2024, 1, 8),
+        latest_close=96.5,
+        above_entry=False,
+        stale_position=True,
+        weak_relative_strength=True,
+        suggested_action="EXIT CANDIDATE",
+    )
+
+    journal = update_position_trajectory_journal(
+        journal,
+        observations={"AAPL": first_observation},
+        active_symbols=("AAPL",),
+    )
+    write_position_trajectory_journal(journal, journal_path)
+    reloaded = load_position_trajectory_journal(journal_path)
+    updated = update_position_trajectory_journal(
+        reloaded,
+        observations={"AAPL": second_observation},
+        active_symbols=("AAPL",),
+    )
+    reloaded = load_position_trajectory_journal(
+        write_position_trajectory_journal(updated, journal_path),
+    )
+
+    assert journal_path.exists()
+    assert [observation.as_of_date for observation in reloaded.entries["AAPL"]] == [
+        date(2024, 1, 5),
+        date(2024, 1, 8),
+    ]
+    assert reloaded.entries["AAPL"][-1].suggested_action == "EXIT CANDIDATE"
+
+
+def test_position_trajectory_journal_same_day_rerun_is_idempotent() -> None:
+    journal = update_position_trajectory_journal(
+        load_position_trajectory_journal(Path("/tmp/does-not-exist-position-trajectory.json")),
+        observations={
+            "AAPL": _position_trajectory_observation(
+                as_of_date=date(2024, 1, 5),
+                latest_close=98.0,
+                above_entry=False,
+                stale_position=False,
+                weak_relative_strength=False,
+                suggested_action="WATCH CLOSELY",
+            )
+        },
+        active_symbols=("AAPL",),
+    )
+
+    rerun = update_position_trajectory_journal(
+        journal,
+        observations={
+            "AAPL": _position_trajectory_observation(
+                as_of_date=date(2024, 1, 5),
+                latest_close=101.0,
+                above_entry=True,
+                stale_position=False,
+                weak_relative_strength=False,
+                suggested_action="HOLD",
+            )
+        },
+        active_symbols=("AAPL",),
+    )
+
+    assert len(rerun.entries["AAPL"]) == 1
+    assert rerun.entries["AAPL"][0].latest_close == pytest.approx(101.0)
+    assert rerun.entries["AAPL"][0].suggested_action == "HOLD"
+
+
+def test_position_trajectory_journal_ignores_corrupt_files(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    journal_path = default_position_trajectory_journal_path(tmp_path)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{not-json", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        journal = load_position_trajectory_journal(journal_path)
+
+    assert journal.entries == {}
+    assert "Ignoring position trajectory journal" in caplog.text
+
+
+def test_position_trajectory_journal_ignores_boolean_float_fields(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    journal_path = default_position_trajectory_journal_path(tmp_path)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "updated_at": None,
+                "symbols": {
+                    "AAPL": {
+                        "observations": [
+                            {
+                                "as_of_date": "2024-01-05",
+                                "average_entry_price": True,
+                                "current_stop": 95.0,
+                                "latest_close": 98.0,
+                                "unrealized_pl_pct": -0.02,
+                                "above_entry": False,
+                                "high_water_close": 110.0,
+                                "high_water_close_date": "2024-01-02",
+                                "days_since_new_high": 3,
+                                "stale_position": False,
+                                "relative_strength_return_diff": -0.01,
+                                "weak_relative_strength": False,
+                                "suggested_action": "WATCH CLOSELY",
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        journal = load_position_trajectory_journal(journal_path)
+
+    assert journal.entries == {}
+    assert "Ignoring position trajectory journal" in caplog.text
+
+
+def test_position_trajectory_features_count_consecutive_below_entry_days() -> None:
+    trajectory = build_position_trajectory_features(
+        [
+            _position_trajectory_observation(
+                as_of_date=date(2024, 1, 3),
+                latest_close=101.0,
+                above_entry=True,
+                stale_position=False,
+                weak_relative_strength=False,
+                suggested_action="HOLD",
+            ),
+            _position_trajectory_observation(
+                as_of_date=date(2024, 1, 4),
+                latest_close=98.0,
+                above_entry=False,
+                stale_position=False,
+                weak_relative_strength=False,
+                suggested_action="WATCH CLOSELY",
+            ),
+            _position_trajectory_observation(
+                as_of_date=date(2024, 1, 5),
+                latest_close=97.0,
+                above_entry=False,
+                stale_position=False,
+                weak_relative_strength=True,
+                suggested_action="WATCH CLOSELY",
+            ),
+            _position_trajectory_observation(
+                as_of_date=date(2024, 1, 8),
+                latest_close=96.0,
+                above_entry=False,
+                stale_position=True,
+                weak_relative_strength=True,
+                suggested_action=None,
+            ),
+        ]
+    )
+
+    assert trajectory.observation_count == 4
+    assert trajectory.days_in_position_state == 4
+    assert trajectory.consecutive_days_below_entry == 3
+    assert trajectory.consecutive_weak_position_days == 3
+    assert trajectory.persistent_underperformance is True
+
+
+def test_position_trajectory_features_count_repeated_watch_states() -> None:
+    trajectory = build_position_trajectory_features(
+        [
+            _position_trajectory_observation(
+                as_of_date=date(2024, 1, 3),
+                latest_close=99.0,
+                above_entry=False,
+                stale_position=False,
+                weak_relative_strength=False,
+                suggested_action="WATCH CLOSELY",
+            ),
+            _position_trajectory_observation(
+                as_of_date=date(2024, 1, 4),
+                latest_close=98.0,
+                above_entry=False,
+                stale_position=True,
+                weak_relative_strength=False,
+                suggested_action="WATCH CLOSELY",
+            ),
+            _position_trajectory_observation(
+                as_of_date=date(2024, 1, 5),
+                latest_close=97.5,
+                above_entry=False,
+                stale_position=True,
+                weak_relative_strength=True,
+                suggested_action=None,
+            ),
+        ]
+    )
+
+    assert trajectory.consecutive_watch_closely_days == 2
+    assert trajectory.consecutive_hold_days == 0
+    assert trajectory.consecutive_stale_position_days == 2
+
+
 def test_load_candidate_symbols_supports_text_and_csv(tmp_path: Path) -> None:
     text_path = tmp_path / "candidates.txt"
     text_path.write_text("aapl\nmsft, nvda\nbrk.b\n# comment\nAAPL\n", encoding="utf-8")
@@ -1226,6 +1456,33 @@ def _intraday_state_observation(
         intraday_momentum_fade=False,
         stacked_intraday_weakness=False,
         stop_breached_intraday=False,
+        suggested_action=suggested_action,
+    )
+
+
+def _position_trajectory_observation(
+    *,
+    as_of_date: date,
+    latest_close: float,
+    above_entry: bool,
+    stale_position: bool,
+    weak_relative_strength: bool,
+    suggested_action: str | None,
+) -> PositionTrajectoryObservation:
+    return PositionTrajectoryObservation(
+        symbol="AAPL",
+        as_of_date=as_of_date,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        latest_close=latest_close,
+        unrealized_pl_pct=(latest_close / 100.0) - 1.0,
+        above_entry=above_entry,
+        high_water_close=110.0,
+        high_water_close_date=date(2024, 1, 2),
+        days_since_new_high=3 if stale_position else 1,
+        stale_position=stale_position,
+        relative_strength_return_diff=(-0.06 if weak_relative_strength else 0.01),
+        weak_relative_strength=weak_relative_strength,
         suggested_action=suggested_action,
     )
 

@@ -7,9 +7,11 @@ import pytest
 
 from bot.data.earnings import EarningsRiskContext
 from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
+from bot.data.position_trajectory import PositionTrajectoryFeatures
 from bot.data.sector_context import SectorFeatureContext
 from bot.features import (
     apply_intraday_trajectory_features,
+    apply_position_trajectory_features,
     build_candidate_features,
     build_intraday_position_features,
     build_market_context,
@@ -476,6 +478,46 @@ def test_apply_intraday_trajectory_features_enriches_intraday_position_features(
     assert enriched.consecutive_polls_below_vwap == 3
     assert enriched.giveback_worsening_from_pct == pytest.approx(0.021)
     assert enriched.repeated_watch_closely_count == 2
+
+
+def test_apply_position_trajectory_features_enriches_daily_position_features() -> None:
+    features = build_position_features(
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        average_entry_price=100.0,
+        latest_close=98.0,
+        current_stop=95.0,
+        regime_passed=True,
+        high_water_close=110.0,
+        days_since_new_high=3,
+        stale_high_watch_days=15,
+        relative_strength_return_diff=-0.06,
+        relative_strength_window=20,
+        market_context=build_market_context(as_of_date=date(2024, 1, 5)),
+    )
+
+    enriched = apply_position_trajectory_features(
+        features,
+        PositionTrajectoryFeatures(
+            observation_count=4,
+            days_in_position_state=4,
+            consecutive_days_above_entry=0,
+            consecutive_days_below_entry=3,
+            consecutive_watch_closely_days=2,
+            consecutive_hold_days=0,
+            consecutive_stale_position_days=3,
+            consecutive_weak_relative_strength_days=3,
+            consecutive_weak_position_days=3,
+            repeated_weak_position=True,
+            persistent_underperformance=True,
+            recovery_after_multi_day_weakness=False,
+        ),
+    )
+
+    assert enriched.days_in_position_state == 4
+    assert enriched.consecutive_days_below_entry == 3
+    assert enriched.consecutive_watch_closely_days == 2
+    assert enriched.persistent_underperformance is True
 
 
 def test_review_existing_long_position_intraday_consumes_position_features() -> None:

@@ -10,6 +10,7 @@ import pandas as pd
 
 from bot.data.earnings import EarningsRiskContext
 from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
+from bot.data.position_trajectory import PositionTrajectoryFeatures
 from bot.data.sector_context import SectorFeatureContext
 from bot.strategy.signal_models import StrategySignal
 
@@ -111,6 +112,17 @@ class PositionFeatures:
     stale_position: bool = False
     relative_strength_return_diff: float | None = None
     relative_strength_window: int | None = None
+    days_in_position_state: int = 0
+    consecutive_days_above_entry: int = 0
+    consecutive_days_below_entry: int = 0
+    consecutive_watch_closely_days: int = 0
+    consecutive_hold_days: int = 0
+    consecutive_stale_position_days: int = 0
+    consecutive_weak_relative_strength_days: int = 0
+    consecutive_weak_position_days: int = 0
+    repeated_weak_position: bool = False
+    persistent_underperformance: bool = False
+    recovery_after_multi_day_weakness: bool = False
     sector_name: str | None = None
     industry_name: str | None = None
     sector_etf_symbol: str | None = None
@@ -734,6 +746,35 @@ def apply_intraday_trajectory_features(
         repeated_watch_closely_count=trajectory_features.repeated_watch_closely_count,
         weakening_all_session=trajectory_features.weakening_all_session,
         recovered_after_weakness=trajectory_features.recovered_after_weakness,
+    )
+
+
+def apply_position_trajectory_features(
+    features: PositionFeatures,
+    trajectory_features: PositionTrajectoryFeatures | None,
+) -> PositionFeatures:
+    """Return a copy of daily position features enriched with multi-day state."""
+
+    if trajectory_features is None:
+        return features
+
+    return replace(
+        features,
+        days_in_position_state=trajectory_features.days_in_position_state,
+        consecutive_days_above_entry=trajectory_features.consecutive_days_above_entry,
+        consecutive_days_below_entry=trajectory_features.consecutive_days_below_entry,
+        consecutive_watch_closely_days=trajectory_features.consecutive_watch_closely_days,
+        consecutive_hold_days=trajectory_features.consecutive_hold_days,
+        consecutive_stale_position_days=trajectory_features.consecutive_stale_position_days,
+        consecutive_weak_relative_strength_days=(
+            trajectory_features.consecutive_weak_relative_strength_days
+        ),
+        consecutive_weak_position_days=trajectory_features.consecutive_weak_position_days,
+        repeated_weak_position=trajectory_features.repeated_weak_position,
+        persistent_underperformance=trajectory_features.persistent_underperformance,
+        recovery_after_multi_day_weakness=(
+            trajectory_features.recovery_after_multi_day_weakness
+        ),
     )
 
 

@@ -14,6 +14,11 @@ import bot.main as main_module
 from bot.config import load_app_config
 from bot.data.earnings import EarningsRiskContext
 from bot.data.intraday_state_journal import default_intraday_state_journal_path
+from bot.data.position_trajectory import (
+    PositionTrajectoryJournal,
+    PositionTrajectoryObservation,
+    default_position_trajectory_journal_path,
+)
 from bot.data.sector_context import SectorFeatureContext
 from bot.data.providers import DataProviderError
 from bot.execution.manual_executor import ManualExecutor
@@ -1162,6 +1167,306 @@ def test_run_portfolio_review_workflow_skips_symbols_with_value_errors(
     assert [row.symbol for row in report.rows] == ["AAPL"]
     assert payload["position_count"] == 2
     assert payload["reviewed_symbol_count"] == 1
+
+
+def test_handle_review_portfolio_writes_position_trajectory_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n"
+        "AAPL,10,100,90,standard_breakout,manual,{}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
+    monkeypatch.setattr(main_module, "_portfolio_review_preset_catalog", lambda args, config: {})
+    monkeypatch.setattr(
+        main_module,
+        "_build_portfolio_review_plan",
+        lambda position, *, preset_catalog, base_settings, as_of_date: {
+            "position": position,
+            "settings": SimpleNamespace(enable_regime_filter=False),
+            "fetch_start": as_of_date,
+        },
+    )
+
+    def fake_build_review_row(plan: dict[str, object], **_: object) -> PortfolioReviewRow:
+        position = plan["position"]
+        if not isinstance(position, ExistingPosition):
+            raise TypeError("position must be an ExistingPosition")
+        observation = PositionTrajectoryObservation(
+            symbol=position.symbol,
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            latest_close=98.0,
+            unrealized_pl_pct=-0.02,
+            above_entry=False,
+            high_water_close=110.0,
+            high_water_close_date=date(2024, 1, 2),
+            days_since_new_high=3,
+            stale_position=False,
+            relative_strength_return_diff=-0.01,
+            weak_relative_strength=False,
+            suggested_action="WATCH CLOSELY",
+        )
+        return PortfolioReviewRow(
+            date=date(2024, 1, 5),
+            symbol=position.symbol,
+            quantity=position.shares,
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            suggested_stop=None,
+            latest_close=98.0,
+            unrealized_pl_pct=-0.02,
+            distance_to_stop_pct=(98.0 - 90.0) / 98.0,
+            regime_passed=True,
+            above_entry=False,
+            suggested_action="WATCH CLOSELY",
+            preset_name="standard_breakout",
+            rationale="Position is below the average entry price.",
+            metadata={
+                main_module._POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY: (
+                    observation.to_dict()
+                )
+            },
+        )
+
+    monkeypatch.setattr(main_module, "_build_portfolio_review_row", fake_build_review_row)
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-05",
+            "--output-dir",
+            str(tmp_path / "daily"),
+            "--format",
+            "json",
+        ]
+    )
+
+    result = main_module._handle_review_portfolio(args)
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 0
+    assert payload["watch_closely_count"] == 1
+    assert Path(payload["outputs"]["portfolio_review_json"]).exists()
+    assert Path(payload["outputs"]["portfolio_review_csv"]).exists()
+    assert Path(payload["outputs"]["position_trajectory_journal"]).exists()
+
+    journal_payload = json.loads(
+        Path(payload["outputs"]["position_trajectory_journal"]).read_text(encoding="utf-8")
+    )
+    assert journal_payload["symbols"]["AAPL"]["observations"][0]["suggested_action"] == (
+        "WATCH CLOSELY"
+    )
+
+
+def test_handle_review_portfolio_same_day_position_trajectory_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n"
+        "AAPL,10,100,90,standard_breakout,manual,{}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
+    monkeypatch.setattr(main_module, "_portfolio_review_preset_catalog", lambda args, config: {})
+    monkeypatch.setattr(
+        main_module,
+        "_build_portfolio_review_plan",
+        lambda position, *, preset_catalog, base_settings, as_of_date: {
+            "position": position,
+            "settings": SimpleNamespace(enable_regime_filter=False),
+            "fetch_start": as_of_date,
+        },
+    )
+
+    state = {"calls": 0}
+
+    def fake_build_review_row(plan: dict[str, object], **_: object) -> PortfolioReviewRow:
+        state["calls"] += 1
+        position = plan["position"]
+        if not isinstance(position, ExistingPosition):
+            raise TypeError("position must be an ExistingPosition")
+        latest_close = 98.0 if state["calls"] == 1 else 101.0
+        suggested_action = "WATCH CLOSELY" if state["calls"] == 1 else "HOLD"
+        observation = PositionTrajectoryObservation(
+            symbol=position.symbol,
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            latest_close=latest_close,
+            unrealized_pl_pct=(latest_close / position.average_entry_price) - 1.0,
+            above_entry=latest_close >= position.average_entry_price,
+            high_water_close=110.0,
+            high_water_close_date=date(2024, 1, 2),
+            days_since_new_high=1,
+            stale_position=False,
+            relative_strength_return_diff=0.01,
+            weak_relative_strength=False,
+            suggested_action=suggested_action,
+        )
+        return PortfolioReviewRow(
+            date=date(2024, 1, 5),
+            symbol=position.symbol,
+            quantity=position.shares,
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            suggested_stop=None,
+            latest_close=latest_close,
+            unrealized_pl_pct=(latest_close / position.average_entry_price) - 1.0,
+            distance_to_stop_pct=(latest_close - 90.0) / latest_close,
+            regime_passed=True,
+            above_entry=latest_close >= position.average_entry_price,
+            suggested_action=suggested_action,
+            preset_name="standard_breakout",
+            rationale=f"{suggested_action} rationale.",
+            metadata={
+                main_module._POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY: (
+                    observation.to_dict()
+                )
+            },
+        )
+
+    monkeypatch.setattr(main_module, "_build_portfolio_review_row", fake_build_review_row)
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-05",
+            "--output-dir",
+            str(tmp_path / "daily"),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_review_portfolio(args) == 0
+    capsys.readouterr()
+    assert main_module._handle_review_portfolio(args) == 0
+    capsys.readouterr()
+
+    journal_path = default_position_trajectory_journal_path(tmp_path)
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+
+    assert len(payload["symbols"]["AAPL"]["observations"]) == 1
+    assert payload["symbols"]["AAPL"]["observations"][0]["latest_close"] == pytest.approx(101.0)
+    assert payload["symbols"]["AAPL"]["observations"][0]["suggested_action"] == "HOLD"
+
+
+def test_handle_review_portfolio_ignores_corrupt_position_trajectory_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n"
+        "AAPL,10,100,90,standard_breakout,manual,{}\n",
+        encoding="utf-8",
+    )
+    journal_path = default_position_trajectory_journal_path(tmp_path)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{bad-json", encoding="utf-8")
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: object())
+    monkeypatch.setattr(main_module, "_portfolio_review_preset_catalog", lambda args, config: {})
+    monkeypatch.setattr(
+        main_module,
+        "_build_portfolio_review_plan",
+        lambda position, *, preset_catalog, base_settings, as_of_date: {
+            "position": position,
+            "settings": SimpleNamespace(enable_regime_filter=False),
+            "fetch_start": as_of_date,
+        },
+    )
+
+    def fake_build_review_row(plan: dict[str, object], **_: object) -> PortfolioReviewRow:
+        position = plan["position"]
+        if not isinstance(position, ExistingPosition):
+            raise TypeError("position must be an ExistingPosition")
+        observation = PositionTrajectoryObservation(
+            symbol=position.symbol,
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            latest_close=101.0,
+            unrealized_pl_pct=0.01,
+            above_entry=True,
+            high_water_close=110.0,
+            high_water_close_date=date(2024, 1, 2),
+            days_since_new_high=1,
+            stale_position=False,
+            relative_strength_return_diff=0.01,
+            weak_relative_strength=False,
+            suggested_action="HOLD",
+        )
+        return PortfolioReviewRow(
+            date=date(2024, 1, 5),
+            symbol=position.symbol,
+            quantity=position.shares,
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            suggested_stop=None,
+            latest_close=101.0,
+            unrealized_pl_pct=0.01,
+            distance_to_stop_pct=(101.0 - 90.0) / 101.0,
+            regime_passed=True,
+            above_entry=True,
+            suggested_action="HOLD",
+            preset_name="standard_breakout",
+            rationale="Position remains healthy.",
+            metadata={
+                main_module._POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY: (
+                    observation.to_dict()
+                )
+            },
+        )
+
+    monkeypatch.setattr(main_module, "_build_portfolio_review_row", fake_build_review_row)
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-05",
+            "--output-dir",
+            str(tmp_path / "daily"),
+            "--format",
+            "json",
+        ]
+    )
+
+    with caplog.at_level("WARNING"):
+        assert main_module._handle_review_portfolio(args) == 0
+    capsys.readouterr()
+
+    rewritten_payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert rewritten_payload["symbols"]["AAPL"]["observations"]
+    assert "Ignoring position trajectory journal" in caplog.text
 
 
 def test_intraday_portfolio_review_brief_avoids_duplicate_exit_rows_across_sections(
@@ -3070,6 +3375,112 @@ def test_build_portfolio_review_row_includes_sector_context() -> None:
     assert row.metadata["lagging_sector"] is True
     assert "sector etf xlk is below its trend filter" in row.rationale.lower()
     assert "lagging xlk by 6.0% over 20 trading days" in row.rationale.lower()
+
+
+def test_build_portfolio_review_row_and_monitor_brief_include_position_trajectory_note() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    settings = main_module.BreakoutMomentumSettings.from_configs(
+        _signal_config(),
+        _risk_config(),
+        enable_regime_filter=False,
+    )
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+        preset_name=preset.name,
+    )
+    plan = {
+        "position": position,
+        "preset": preset,
+        "preset_resolution": "portfolio_snapshot",
+        "settings": preset.apply_to_settings(settings),
+        "fetch_start": date(2024, 1, 1),
+    }
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-03", "2024-01-04", "2024-01-05"]),
+                    "open": [100.0, 99.0, 98.0],
+                    "high": [101.0, 100.0, 99.0],
+                    "low": [98.0, 97.0, 96.0],
+                    "close": [99.0, 98.0, 97.0],
+                    "volume": [1_000_000.0] * 3,
+                    "symbol": [symbol] * 3,
+                }
+            )
+
+    position_trajectory_journal = PositionTrajectoryJournal(
+        entries={
+            "AAPL": (
+                PositionTrajectoryObservation(
+                    symbol="AAPL",
+                    as_of_date=date(2024, 1, 3),
+                    average_entry_price=100.0,
+                    current_stop=90.0,
+                    latest_close=99.0,
+                    unrealized_pl_pct=-0.01,
+                    above_entry=False,
+                    high_water_close=110.0,
+                    high_water_close_date=date(2024, 1, 2),
+                    days_since_new_high=1,
+                    stale_position=False,
+                    relative_strength_return_diff=0.01,
+                    weak_relative_strength=False,
+                    suggested_action="WATCH CLOSELY",
+                ),
+                PositionTrajectoryObservation(
+                    symbol="AAPL",
+                    as_of_date=date(2024, 1, 4),
+                    average_entry_price=100.0,
+                    current_stop=90.0,
+                    latest_close=98.0,
+                    unrealized_pl_pct=-0.02,
+                    above_entry=False,
+                    high_water_close=110.0,
+                    high_water_close_date=date(2024, 1, 2),
+                    days_since_new_high=2,
+                    stale_position=False,
+                    relative_strength_return_diff=0.01,
+                    weak_relative_strength=False,
+                    suggested_action="WATCH CLOSELY",
+                ),
+            )
+        }
+    )
+
+    row = main_module._build_portfolio_review_row(
+        plan,
+        provider=FakeProvider(),
+        as_of_date=date(2024, 1, 5),
+        benchmark_frame=None,
+        refresh_cache=False,
+        position_trajectory_journal=position_trajectory_journal,
+    )
+
+    report = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        rows=[row],
+        current_positions=[position],
+    )
+    brief = build_market_monitor_report(
+        as_of_date=date(2024, 1, 5),
+        portfolio_review=report,
+    ).to_brief()
+
+    assert row.suggested_action == "EXIT CANDIDATE"
+    assert "below entry for 3 consecutive review sessions" in row.rationale.lower()
+    assert "below entry for 3 consecutive review sessions" in brief.lower()
 
 
 def test_daily_research_summary_reports_confirmed_breakout_rv_policy_in_header() -> None:

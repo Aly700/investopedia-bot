@@ -42,6 +42,8 @@ PORTFOLIO_REVIEW_ACTIONS = (
     "RAISE STOP",
     "EXIT CANDIDATE",
 )
+DEFAULT_POSITION_PERSISTENT_WEAKNESS_DAY_THRESHOLD = 3
+DEFAULT_POSITION_REPEATED_WATCH_EXIT_THRESHOLD = 2
 
 
 @dataclass(frozen=True)
@@ -399,6 +401,12 @@ def review_existing_long_position(
     relative_strength_return_diff: float | None = None,
     relative_strength_window: int | None = None,
     relative_strength_watch_threshold: float = -0.05,
+    position_persistent_weakness_day_threshold: int = (
+        DEFAULT_POSITION_PERSISTENT_WEAKNESS_DAY_THRESHOLD
+    ),
+    position_repeated_watch_exit_threshold: int = (
+        DEFAULT_POSITION_REPEATED_WATCH_EXIT_THRESHOLD
+    ),
     earnings_date: date | None = None,
     earnings_days_away: int | None = None,
     earnings_watch_days: int = 7,
@@ -420,6 +428,14 @@ def review_existing_long_position(
         raise ValueError("profit_giveback_min_unrealized_pct must be greater than zero.")
     if stale_high_watch_days <= 0:
         raise ValueError("stale_high_watch_days must be greater than zero.")
+    if position_persistent_weakness_day_threshold <= 0:
+        raise ValueError(
+            "position_persistent_weakness_day_threshold must be greater than zero."
+        )
+    if position_repeated_watch_exit_threshold <= 0:
+        raise ValueError(
+            "position_repeated_watch_exit_threshold must be greater than zero."
+        )
     if days_since_new_high is not None and days_since_new_high < 0:
         raise ValueError("days_since_new_high cannot be negative.")
     if relative_strength_window is not None and relative_strength_window <= 0:
@@ -472,6 +488,10 @@ def review_existing_long_position(
         profit_giveback_min_unrealized_pct=profit_giveback_min_unrealized_pct,
         stale_high_watch_days=stale_high_watch_days,
         relative_strength_watch_threshold=relative_strength_watch_threshold,
+        position_persistent_weakness_day_threshold=(
+            position_persistent_weakness_day_threshold
+        ),
+        position_repeated_watch_exit_threshold=position_repeated_watch_exit_threshold,
         earnings_watch_days=earnings_watch_days,
         sector_relative_strength_watch_threshold=sector_relative_strength_watch_threshold,
     )
@@ -486,6 +506,8 @@ def _review_existing_long_position_from_features(
     profit_giveback_min_unrealized_pct: float,
     stale_high_watch_days: int,
     relative_strength_watch_threshold: float,
+    position_persistent_weakness_day_threshold: int,
+    position_repeated_watch_exit_threshold: int,
     earnings_watch_days: int,
     sector_relative_strength_watch_threshold: float,
 ) -> PortfolioReviewDecision:
@@ -494,6 +516,19 @@ def _review_existing_long_position_from_features(
         and features.relative_strength_return_diff <= relative_strength_watch_threshold
     )
     weak_sector_regime = features.sector_regime_passed is False
+    persistent_below_entry = (
+        features.consecutive_days_below_entry >= position_persistent_weakness_day_threshold
+    )
+    persistent_stale_position = (
+        features.consecutive_stale_position_days >= position_persistent_weakness_day_threshold
+    )
+    persistent_relative_weakness = (
+        features.consecutive_weak_relative_strength_days
+        >= position_persistent_weakness_day_threshold
+    )
+    repeated_watch_pressure = (
+        features.consecutive_watch_closely_days >= position_repeated_watch_exit_threshold
+    )
 
     suggested_stop = suggest_long_stop_update(
         current_stop=position.current_stop,
@@ -517,6 +552,29 @@ def _review_existing_long_position_from_features(
         "relative_strength_window": features.relative_strength_window,
         "relative_strength_watch_threshold": relative_strength_watch_threshold,
         "weak_relative_strength": weak_relative_strength,
+        "days_in_position_state": features.days_in_position_state,
+        "consecutive_days_above_entry": features.consecutive_days_above_entry,
+        "consecutive_days_below_entry": features.consecutive_days_below_entry,
+        "consecutive_watch_closely_days": features.consecutive_watch_closely_days,
+        "consecutive_hold_days": features.consecutive_hold_days,
+        "consecutive_stale_position_days": features.consecutive_stale_position_days,
+        "consecutive_weak_relative_strength_days": (
+            features.consecutive_weak_relative_strength_days
+        ),
+        "consecutive_weak_position_days": features.consecutive_weak_position_days,
+        "repeated_weak_position": features.repeated_weak_position,
+        "persistent_underperformance": features.persistent_underperformance,
+        "recovery_after_multi_day_weakness": features.recovery_after_multi_day_weakness,
+        "position_persistent_weakness_day_threshold": (
+            position_persistent_weakness_day_threshold
+        ),
+        "position_repeated_watch_exit_threshold": (
+            position_repeated_watch_exit_threshold
+        ),
+        "persistent_below_entry": persistent_below_entry,
+        "persistent_stale_position": persistent_stale_position,
+        "persistent_relative_weakness": persistent_relative_weakness,
+        "repeated_watch_pressure": repeated_watch_pressure,
         "earnings_date": (
             features.earnings_date.isoformat() if features.earnings_date is not None else None
         ),
@@ -557,6 +615,18 @@ def _review_existing_long_position_from_features(
             f"{features.breakout_failure_reference:.2f}."
         )
         action = "EXIT CANDIDATE"
+    elif repeated_watch_pressure and features.persistent_underperformance:
+        rationale.append(
+            "Position has already been WATCH CLOSELY for "
+            f"{features.consecutive_watch_closely_days} consecutive review sessions."
+        )
+        _append_position_trajectory_rationale(
+            rationale,
+            features=features,
+            persistent_weakness_day_threshold=position_persistent_weakness_day_threshold,
+        )
+        rationale.append("Multi-day weakness increases exit pressure.")
+        action = "EXIT CANDIDATE"
     elif suggested_stop is not None:
         rationale.append("Trailing-stop logic supports a higher stop without lowering risk control.")
         action = "RAISE STOP"
@@ -566,6 +636,10 @@ def _review_existing_long_position_from_features(
         or not features.above_entry
         or features.stale_position
         or weak_relative_strength
+        or persistent_below_entry
+        or persistent_stale_position
+        or persistent_relative_weakness
+        or features.repeated_weak_position
     ):
         if features.distance_to_stop_pct is not None and features.distance_to_stop_pct <= watch_distance_pct:
             rationale.append("Latest close is close to the current stop.")
@@ -587,6 +661,11 @@ def _review_existing_long_position_from_features(
                 rationale.append(
                     f"Relative strength vs benchmark is {features.relative_strength_return_diff:.1%}."
                 )
+        _append_position_trajectory_rationale(
+            rationale,
+            features=features,
+            persistent_weakness_day_threshold=position_persistent_weakness_day_threshold,
+        )
         action = "WATCH CLOSELY"
     else:
         rationale.append("Position remains above entry and sufficiently above the current stop.")
@@ -621,6 +700,9 @@ def _review_existing_long_position_from_features(
                 "Weak sector context still argues for caution, but raising the stop improves risk control."
             )
 
+    if action == "HOLD" and features.recovery_after_multi_day_weakness:
+        rationale.append(_daily_recovery_note(features))
+
     if action == "EXIT CANDIDATE":
         suggested_stop = None
 
@@ -638,6 +720,52 @@ def _review_existing_long_position_from_features(
         rationale=tuple(rationale),
         metadata=metadata,
     )
+
+
+def _append_position_trajectory_rationale(
+    rationale: list[str],
+    *,
+    features: PositionFeatures,
+    persistent_weakness_day_threshold: int,
+) -> None:
+    if features.consecutive_days_below_entry >= persistent_weakness_day_threshold:
+        rationale.append(
+            "Position has remained below entry for "
+            f"{features.consecutive_days_below_entry} consecutive review sessions."
+        )
+    if (
+        features.consecutive_weak_relative_strength_days >= persistent_weakness_day_threshold
+        and features.relative_strength_return_diff is not None
+    ):
+        rationale.append(
+            "Relative strength versus the benchmark has remained weak for "
+            f"{features.consecutive_weak_relative_strength_days} consecutive review sessions."
+        )
+    if features.consecutive_stale_position_days >= persistent_weakness_day_threshold:
+        rationale.append(
+            "Stale-position pressure has persisted for "
+            f"{features.consecutive_stale_position_days} consecutive review sessions."
+        )
+    if (
+        features.repeated_weak_position
+        and features.consecutive_weak_position_days >= 2
+        and not (
+            features.consecutive_days_below_entry >= persistent_weakness_day_threshold
+            or features.consecutive_weak_relative_strength_days
+            >= persistent_weakness_day_threshold
+            or features.consecutive_stale_position_days >= persistent_weakness_day_threshold
+        )
+    ):
+        rationale.append(
+            "Weak position behavior has persisted across "
+            f"{features.consecutive_weak_position_days} consecutive review sessions."
+        )
+
+
+def _daily_recovery_note(features: PositionFeatures) -> str:
+    if features.above_entry:
+        return "Position recovered after multiple weak review sessions and is back above entry."
+    return "Position recovered after multiple weak review sessions."
 
 
 def review_existing_long_position_intraday(

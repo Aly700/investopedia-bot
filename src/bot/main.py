@@ -63,6 +63,15 @@ from bot.data.intraday_state_journal import (
     update_intraday_state_journal,
     write_intraday_state_journal,
 )
+from bot.data.position_trajectory import (
+    PositionTrajectoryJournal,
+    PositionTrajectoryObservation,
+    default_position_trajectory_journal_path,
+    load_position_trajectory_journal,
+    preview_position_trajectory_features,
+    update_position_trajectory_journal,
+    write_position_trajectory_journal,
+)
 from bot.data.sector_context import (
     SectorFeatureContext,
     build_sector_feature_contexts,
@@ -99,6 +108,7 @@ from bot.execution.manual_executor import (
 from bot.features import (
     PositionFeatures,
     apply_intraday_trajectory_features,
+    apply_position_trajectory_features,
     build_candidate_features,
     build_intraday_position_features,
     build_market_context,
@@ -158,6 +168,8 @@ from bot.strategy.regime_filter import regime_is_bullish
 
 
 LOGGER = get_logger(__name__)
+
+_POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY = "_position_trajectory_observation"
 
 
 class NoIntradayDataError(ValueError):
@@ -1398,6 +1410,9 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     review_json_path = write_portfolio_review_report(report, output_dir / "portfolio_review.json")
     review_csv_path = write_portfolio_review_report(report, output_dir / "portfolio_review.csv")
+    position_trajectory_journal_path = default_position_trajectory_journal_path(
+        config.project_root,
+    ).resolve()
     report_payload = report.to_dict()
     action_counts = {
         f"{action.lower().replace(' ', '_')}_count": report_payload[
@@ -1415,6 +1430,10 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
             "portfolio_review_csv": str(review_csv_path),
         },
     }
+    if position_trajectory_journal_path.exists():
+        payload["outputs"]["position_trajectory_journal"] = str(
+            position_trajectory_journal_path
+        )
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -3279,6 +3298,38 @@ def _build_intraday_state_observation(
     )
 
 
+def _build_position_trajectory_observation(
+    features: PositionFeatures,
+    *,
+    high_water_close_date: date | None,
+    weak_relative_strength: bool,
+) -> PositionTrajectoryObservation:
+    return PositionTrajectoryObservation(
+        symbol=features.symbol,
+        as_of_date=features.as_of_date,
+        average_entry_price=features.average_entry_price,
+        current_stop=features.current_stop,
+        latest_close=features.latest_close,
+        unrealized_pl_pct=features.unrealized_pl_pct,
+        above_entry=features.above_entry,
+        high_water_close=features.high_water_close,
+        high_water_close_date=high_water_close_date,
+        days_since_new_high=features.days_since_new_high,
+        stale_position=features.stale_position,
+        relative_strength_return_diff=features.relative_strength_return_diff,
+        weak_relative_strength=weak_relative_strength,
+    )
+
+
+def _position_trajectory_observation_from_row(
+    row: PortfolioReviewRow,
+) -> PositionTrajectoryObservation | None:
+    raw_observation = row.metadata.get(_POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY)
+    if not isinstance(raw_observation, Mapping):
+        return None
+    return PositionTrajectoryObservation.from_mapping(row.symbol, raw_observation)
+
+
 def _intraday_session_metrics(
     intraday_bars: pd.DataFrame,
 ) -> dict[str, float | str | None]:
@@ -3381,6 +3432,15 @@ def _mapping_int_or_none(data: Mapping[str, object], key: str) -> int | None:
     return None
 
 
+def _iso_date_or_none(value: object) -> date | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError:
+        return None
+
+
 def _portfolio_review_preset_catalog(
     args: argparse.Namespace,
     config: AppConfig,
@@ -3439,6 +3499,15 @@ def _run_portfolio_review_workflow(
         )
     if provider is None:
         raise ValueError("A data provider is required when reviewing non-empty portfolios.")
+    position_trajectory_journal: PositionTrajectoryJournal | None = None
+    position_trajectory_journal_path: Path | None = None
+    if getattr(args, "portfolio_file", None) is not None:
+        position_trajectory_journal_path = default_position_trajectory_journal_path(
+            config.project_root,
+        )
+        position_trajectory_journal = load_position_trajectory_journal(
+            position_trajectory_journal_path,
+        )
 
     preset_catalog = _portfolio_review_preset_catalog(args, config)
     base_settings = BreakoutMomentumSettings.from_configs(
@@ -3526,23 +3595,47 @@ def _run_portfolio_review_workflow(
         )
 
     rows: list[PortfolioReviewRow] = []
+    position_trajectory_observations: dict[str, PositionTrajectoryObservation] = {}
     for plan in position_plans:
         position = plan.get("position")
         symbol = position.symbol if isinstance(position, ExistingPosition) else "<unknown>"
         try:
-            rows.append(
-                _build_portfolio_review_row(
-                    plan,
-                    provider=provider,
-                    as_of_date=args.as_of,
-                    benchmark_frame=benchmark_frame,
-                    refresh_cache=args.refresh_cache,
-                    earnings_context=earnings_contexts.get(symbol),
-                    sector_context=sector_contexts.get(symbol),
-                )
+            row = _build_portfolio_review_row(
+                plan,
+                provider=provider,
+                as_of_date=args.as_of,
+                benchmark_frame=benchmark_frame,
+                refresh_cache=args.refresh_cache,
+                earnings_context=earnings_contexts.get(symbol),
+                sector_context=sector_contexts.get(symbol),
+                position_trajectory_journal=position_trajectory_journal,
             )
+            position_trajectory_observation = _position_trajectory_observation_from_row(row)
+            if position_trajectory_observation is not None:
+                position_trajectory_observations[position_trajectory_observation.symbol] = (
+                    position_trajectory_observation
+                )
+                row = replace(
+                    row,
+                    metadata={
+                        key: value
+                        for key, value in row.metadata.items()
+                        if key != _POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY
+                    },
+                )
+            rows.append(row)
         except (DataProviderError, ValueError) as exc:
             LOGGER.warning("Skipping held symbol %s due to review error: %s", symbol, exc)
+    if position_trajectory_journal is not None and position_trajectory_journal_path is not None:
+        updated_position_trajectory_journal = update_position_trajectory_journal(
+            position_trajectory_journal,
+            observations=position_trajectory_observations,
+            active_symbols=[position.symbol for position in resolved_current_positions],
+        )
+        write_position_trajectory_journal(
+            updated_position_trajectory_journal,
+            position_trajectory_journal_path,
+        )
     return build_portfolio_review_report(
         as_of_date=args.as_of,
         rows=rows,
@@ -3582,6 +3675,7 @@ def _build_portfolio_review_row(
     refresh_cache: bool,
     earnings_context: EarningsRiskContext | None = None,
     sector_context: SectorFeatureContext | None = None,
+    position_trajectory_journal: PositionTrajectoryJournal | None = None,
 ) -> PortfolioReviewRow:
     position = plan["position"]
     preset = plan["preset"]
@@ -3670,6 +3764,28 @@ def _build_portfolio_review_row(
         ),
         market_context=market_context,
     )
+    weak_relative_strength = (
+        position_features.relative_strength_return_diff is not None
+        and position_features.relative_strength_return_diff
+        <= settings.relative_strength_watch_threshold
+    )
+    finalized_position_trajectory_observation: PositionTrajectoryObservation | None = None
+    if position_trajectory_journal is not None:
+        position_trajectory_observation = _build_position_trajectory_observation(
+            position_features,
+            high_water_close_date=_iso_date_or_none(
+                high_water_metrics.get("high_water_close_date")
+            ),
+            weak_relative_strength=weak_relative_strength,
+        )
+        position_trajectory_features = preview_position_trajectory_features(
+            position_trajectory_journal,
+            observation=position_trajectory_observation,
+        )
+        position_features = apply_position_trajectory_features(
+            position_features,
+            position_trajectory_features,
+        )
     decision = review_existing_long_position(
         position,
         position_features=position_features,
@@ -3721,7 +3837,34 @@ def _build_portfolio_review_row(
             settings.sector_relative_strength_watch_threshold
         ),
     )
+    if position_trajectory_journal is not None:
+        finalized_position_trajectory_observation = replace(
+            position_trajectory_observation,
+            suggested_action=decision.suggested_action,
+        )
     entry_date_used = _position_entry_date(position)
+    metadata = {
+        "preset_resolution": preset_resolution,
+        "position_source": position.source,
+        "position_metadata": dict(position.metadata),
+        "trailing_stop_candidate": trailing_stop_candidate,
+        "regime_filter_enabled": settings.enable_regime_filter,
+        "regime_filter_mode": settings.regime_filter_mode,
+        "benchmark_symbol": settings.benchmark_symbol if settings.enable_regime_filter else None,
+        "entry_date_used": entry_date_used.isoformat() if entry_date_used is not None else None,
+        "high_water_close": high_water_metrics.get("high_water_close"),
+        "high_water_close_date": high_water_metrics.get("high_water_close_date"),
+        "days_since_new_high": high_water_metrics.get("days_since_new_high"),
+        "relative_strength_window": relative_strength_metrics.get("relative_strength_window"),
+        "relative_strength_symbol_return": relative_strength_metrics.get("symbol_return"),
+        "relative_strength_benchmark_return": relative_strength_metrics.get("benchmark_return"),
+        "relative_strength_return_diff": relative_strength_metrics.get("relative_strength_return_diff"),
+        **decision.metadata,
+    }
+    if finalized_position_trajectory_observation is not None:
+        metadata[_POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY] = (
+            finalized_position_trajectory_observation.to_dict()
+        )
     return PortfolioReviewRow(
         date=as_of_date,
         symbol=position.symbol,
@@ -3737,24 +3880,7 @@ def _build_portfolio_review_row(
         suggested_action=decision.suggested_action,
         preset_name=preset.name,
         rationale=" | ".join(decision.rationale),
-        metadata={
-            "preset_resolution": preset_resolution,
-            "position_source": position.source,
-            "position_metadata": dict(position.metadata),
-            "trailing_stop_candidate": trailing_stop_candidate,
-            "regime_filter_enabled": settings.enable_regime_filter,
-            "regime_filter_mode": settings.regime_filter_mode,
-            "benchmark_symbol": settings.benchmark_symbol if settings.enable_regime_filter else None,
-            "entry_date_used": entry_date_used.isoformat() if entry_date_used is not None else None,
-            "high_water_close": high_water_metrics.get("high_water_close"),
-            "high_water_close_date": high_water_metrics.get("high_water_close_date"),
-            "days_since_new_high": high_water_metrics.get("days_since_new_high"),
-            "relative_strength_window": relative_strength_metrics.get("relative_strength_window"),
-            "relative_strength_symbol_return": relative_strength_metrics.get("symbol_return"),
-            "relative_strength_benchmark_return": relative_strength_metrics.get("benchmark_return"),
-            "relative_strength_return_diff": relative_strength_metrics.get("relative_strength_return_diff"),
-            **decision.metadata,
-        },
+        metadata=metadata,
     )
 
 

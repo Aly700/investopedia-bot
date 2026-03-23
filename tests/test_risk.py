@@ -7,11 +7,14 @@ from pathlib import Path
 import pytest
 
 from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
+from bot.data.position_trajectory import PositionTrajectoryFeatures
 from bot.features import (
     apply_intraday_trajectory_features,
+    apply_position_trajectory_features,
     build_candidate_features,
     build_intraday_position_features,
     build_market_context,
+    build_position_features,
 )
 from bot.risk.portfolio_rules import (
     ExistingPosition,
@@ -1198,6 +1201,219 @@ def test_review_existing_long_position_reports_earnings_today_cleanly() -> None:
 
     joined_rationale = " ".join(decision.rationale).lower()
     assert "scheduled on 2024-01-10 (today)" in joined_rationale
+
+
+def test_review_existing_long_position_escalates_multi_day_weakness_after_repeated_watchs() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+    features = apply_position_trajectory_features(
+        build_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            latest_close=97.0,
+            current_stop=90.0,
+            regime_passed=True,
+            high_water_close=110.0,
+            days_since_new_high=18,
+            stale_high_watch_days=15,
+            relative_strength_return_diff=-0.07,
+            relative_strength_window=20,
+        ),
+        PositionTrajectoryFeatures(
+            observation_count=4,
+            days_in_position_state=4,
+            consecutive_days_above_entry=0,
+            consecutive_days_below_entry=3,
+            consecutive_watch_closely_days=2,
+            consecutive_hold_days=0,
+            consecutive_stale_position_days=3,
+            consecutive_weak_relative_strength_days=3,
+            consecutive_weak_position_days=3,
+            repeated_weak_position=True,
+            persistent_underperformance=True,
+            recovery_after_multi_day_weakness=False,
+        ),
+    )
+
+    decision = review_existing_long_position(
+        position,
+        position_features=features,
+        latest_close=97.0,
+        regime_passed=True,
+    )
+
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["consecutive_watch_closely_days"] == 2
+    assert "watch closely for 2 consecutive review sessions" in joined_rationale
+    assert "below entry for 3 consecutive review sessions" in joined_rationale
+    assert "multi-day weakness increases exit pressure" in joined_rationale
+
+
+def test_review_existing_long_position_recovery_after_multi_day_weakness_is_not_over_punished() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+    features = apply_position_trajectory_features(
+        build_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            latest_close=103.0,
+            current_stop=95.0,
+            regime_passed=True,
+            high_water_close=104.0,
+            days_since_new_high=1,
+            stale_high_watch_days=15,
+            relative_strength_return_diff=0.01,
+            relative_strength_window=20,
+        ),
+        PositionTrajectoryFeatures(
+            observation_count=4,
+            days_in_position_state=4,
+            consecutive_days_above_entry=1,
+            consecutive_days_below_entry=0,
+            consecutive_watch_closely_days=0,
+            consecutive_hold_days=0,
+            consecutive_stale_position_days=0,
+            consecutive_weak_relative_strength_days=0,
+            consecutive_weak_position_days=0,
+            repeated_weak_position=False,
+            persistent_underperformance=False,
+            recovery_after_multi_day_weakness=True,
+        ),
+    )
+
+    decision = review_existing_long_position(
+        position,
+        position_features=features,
+        latest_close=103.0,
+        regime_passed=True,
+    )
+
+    assert decision.suggested_action == "HOLD"
+    assert decision.metadata["recovery_after_multi_day_weakness"] is True
+    assert "recovered after multiple weak review sessions" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_suppresses_recovery_note_when_earnings_promote_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+    features = apply_position_trajectory_features(
+        build_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            latest_close=103.0,
+            current_stop=95.0,
+            regime_passed=True,
+            high_water_close=104.0,
+            days_since_new_high=1,
+            stale_high_watch_days=15,
+            relative_strength_return_diff=0.01,
+            relative_strength_window=20,
+            earnings_date=date(2024, 1, 10),
+            earnings_days_away=3,
+            earnings_watch_days=7,
+        ),
+        PositionTrajectoryFeatures(
+            observation_count=4,
+            days_in_position_state=4,
+            consecutive_days_above_entry=1,
+            consecutive_days_below_entry=0,
+            consecutive_watch_closely_days=0,
+            consecutive_hold_days=0,
+            consecutive_stale_position_days=0,
+            consecutive_weak_relative_strength_days=0,
+            consecutive_weak_position_days=0,
+            repeated_weak_position=False,
+            persistent_underperformance=False,
+            recovery_after_multi_day_weakness=True,
+        ),
+    )
+
+    decision = review_existing_long_position(
+        position,
+        position_features=features,
+        latest_close=103.0,
+        regime_passed=True,
+        earnings_date=date(2024, 1, 10),
+        earnings_days_away=3,
+        earnings_watch_days=7,
+    )
+
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert "recovered after multiple weak review sessions" not in joined_rationale
+    assert "upcoming earnings" in joined_rationale
+
+
+def test_review_existing_long_position_suppresses_recovery_note_when_sector_promotes_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+    features = apply_position_trajectory_features(
+        build_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            latest_close=103.0,
+            current_stop=95.0,
+            regime_passed=True,
+            high_water_close=104.0,
+            days_since_new_high=1,
+            stale_high_watch_days=15,
+            relative_strength_return_diff=0.01,
+            relative_strength_window=20,
+            sector_name="Technology",
+            sector_etf_symbol="XLK",
+            sector_regime_passed=False,
+        ),
+        PositionTrajectoryFeatures(
+            observation_count=4,
+            days_in_position_state=4,
+            consecutive_days_above_entry=1,
+            consecutive_days_below_entry=0,
+            consecutive_watch_closely_days=0,
+            consecutive_hold_days=0,
+            consecutive_stale_position_days=0,
+            consecutive_weak_relative_strength_days=0,
+            consecutive_weak_position_days=0,
+            repeated_weak_position=False,
+            persistent_underperformance=False,
+            recovery_after_multi_day_weakness=True,
+        ),
+    )
+
+    decision = review_existing_long_position(
+        position,
+        position_features=features,
+        latest_close=103.0,
+        regime_passed=True,
+        sector_name="Technology",
+        sector_etf_symbol="XLK",
+        sector_regime_passed=False,
+    )
+
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert "recovered after multiple weak review sessions" not in joined_rationale
+    assert "sector etf xlk is below its trend filter" in joined_rationale
 
 
 def test_review_existing_long_position_intraday_exits_on_stop_breach() -> None:
