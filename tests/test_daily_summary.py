@@ -14,6 +14,11 @@ import bot.main as main_module
 from bot.config import load_app_config
 from bot.data.earnings import EarningsRiskContext
 from bot.data.intraday_state_journal import default_intraday_state_journal_path
+from bot.data.portfolio_heat import (
+    PortfolioHoldingExposure,
+    build_portfolio_heat_context,
+    project_portfolio_heat_context,
+)
 from bot.data.position_trajectory import (
     PositionTrajectoryJournal,
     PositionTrajectoryObservation,
@@ -22,7 +27,11 @@ from bot.data.position_trajectory import (
 from bot.data.sector_context import SectorFeatureContext, SymbolSectorClassification
 from bot.data.providers import DataProviderError
 from bot.execution.manual_executor import ManualExecutor
-from bot.features import build_market_context
+from bot.execution.prioritization import (
+    annotate_execution_priority,
+    rank_risk_assessed_candidates,
+)
+from bot.features import build_candidate_features, build_market_context
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
 from bot.reporting.daily_report import (
     MARKET_MONITOR_CATEGORIES,
@@ -35,6 +44,7 @@ from bot.reporting.daily_report import (
     build_portfolio_review_report,
     ensure_market_monitor_categories_cover_portfolio_actions,
     market_monitor_flat_count_key,
+    rank_preset_candidate_evaluations,
     write_intraday_portfolio_review_brief,
     write_market_monitor_report,
     write_market_monitor_text_summary,
@@ -47,6 +57,7 @@ from bot.reporting.daily_report import (
 from bot.risk.portfolio_rules import (
     PORTFOLIO_REVIEW_ACTIONS,
     ExistingPosition,
+    PortfolioConstraints,
     RiskAssessedCandidate,
 )
 from bot.risk.position_sizing import PositionSizingResult
@@ -216,6 +227,463 @@ def test_build_daily_research_summary_uses_candidate_memory_to_break_score_ties(
     assert [row.symbol for row in summary.rows] == ["AAA", "BBB"]
     assert summary.rows[0].metadata["score_components"]["candidate_memory_score"] == pytest.approx(0.9)
     assert "setup=high-confidence repeat signal, persisted for 4 sessions, approved on 2 sessions" in summary.rows[0].rationale
+
+
+def test_execution_priority_falls_back_to_deterministic_symbol_order_without_optional_context() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    first = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=30,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    )
+    second = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=True,
+        shares=30,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    )
+
+    prioritized = annotate_execution_priority(
+        [second.candidate, first.candidate],
+        current_equity=100_000.0,
+        current_positions=[],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=4,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+    ranked = rank_risk_assessed_candidates(prioritized, current_equity=100_000.0)
+
+    assert [candidate.signal.symbol for candidate in ranked] == ["AAA", "BBB"]
+    assert ranked[0].execution_priority is not None
+    assert ranked[0].execution_priority.priority_bucket == "top_priority"
+    assert ranked[1].execution_priority is not None
+    assert ranked[1].execution_priority.priority_bucket == "secondary_priority"
+
+
+def test_execution_priority_applies_calm_volatility_market_support_bonus() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    candidate = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=30,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    ).candidate
+    candidate = replace(
+        candidate,
+        features=build_candidate_features(
+            candidate.signal,
+            as_of_date=candidate.signal.date,
+            market_context=build_market_context(
+                as_of_date=candidate.signal.date,
+                benchmark_symbol="SPY",
+                volatility_regime_state="calm",
+                volatility_regime_risk_off=False,
+            ),
+        ),
+    )
+
+    prioritized = annotate_execution_priority(
+        [candidate],
+        current_equity=100_000.0,
+        current_positions=[],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=4,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+
+    assert prioritized[0].execution_priority is not None
+    assert prioritized[0].execution_priority.market_support_score == pytest.approx(0.5)
+
+
+def test_execution_priority_applies_stressed_volatility_market_support_penalty() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    candidate = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=30,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    ).candidate
+    candidate = replace(
+        candidate,
+        features=build_candidate_features(
+            candidate.signal,
+            as_of_date=candidate.signal.date,
+            market_context=build_market_context(
+                as_of_date=candidate.signal.date,
+                benchmark_symbol="SPY",
+                volatility_regime_state="stressed",
+                volatility_regime_risk_off=True,
+            ),
+        ),
+    )
+
+    prioritized = annotate_execution_priority(
+        [candidate],
+        current_equity=100_000.0,
+        current_positions=[],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=4,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+
+    assert prioritized[0].execution_priority is not None
+    assert prioritized[0].execution_priority.market_support_score == pytest.approx(-0.5)
+
+
+def test_execution_priority_top_priority_rationale_reflects_negative_sector_support() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    stronger = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=40,
+        prior_high=98.0,
+        entry_price=102.0,
+        relative_volume=3.0,
+    ).candidate
+    stronger = replace(
+        stronger,
+        features=build_candidate_features(
+            stronger.signal,
+            as_of_date=stronger.signal.date,
+            sector_name="Technology",
+            sector_regime_passed=False,
+            relative_strength_vs_sector=-0.10,
+            sector_relative_strength_window=20,
+        ),
+    )
+    weaker = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=True,
+        shares=40,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=1.8,
+    ).candidate
+
+    prioritized = annotate_execution_priority(
+        [stronger, weaker],
+        current_equity=100_000.0,
+        current_positions=[],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=4,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+    ranked = rank_risk_assessed_candidates(prioritized, current_equity=100_000.0)
+
+    assert ranked[0].signal.symbol == "AAA"
+    assert ranked[0].execution_priority is not None
+    assert ranked[0].execution_priority.priority_bucket == "top_priority"
+    assert "sector context is not supportive" in " ".join(
+        ranked[0].execution_priority.rationale
+    ).lower()
+
+
+def test_daily_research_summary_crowds_out_weaker_approved_candidates_when_slots_are_limited() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    stronger = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=40,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.4,
+    )
+    weaker = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=True,
+        shares=40,
+        prior_high=99.5,
+        entry_price=100.5,
+        relative_volume=1.6,
+    )
+
+    prioritized_candidates = annotate_execution_priority(
+        [stronger.candidate, weaker.candidate],
+        current_equity=100_000.0,
+        current_positions=[
+            ExistingPosition(symbol="MSFT", shares=10, average_entry_price=100.0),
+            ExistingPosition(symbol="NVDA", shares=10, average_entry_price=100.0),
+            ExistingPosition(symbol="JPM", shares=10, average_entry_price=100.0),
+        ],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=4,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+    prioritized_evaluations = [
+        replace(evaluation, candidate=candidate)
+        for evaluation, candidate in zip(
+            [stronger, weaker],
+            prioritized_candidates,
+        )
+    ]
+    ranked_evaluations = rank_preset_candidate_evaluations(
+        prioritized_evaluations,
+        current_equity=100_000.0,
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=ManualExecutor().build_execution_batch(
+            [evaluation.candidate for evaluation in ranked_evaluations],
+            as_of_date=date(2024, 1, 5),
+        ),
+        evaluations=prioritized_evaluations,
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB"],
+        current_positions=[
+            ExistingPosition(symbol="MSFT", shares=10, average_entry_price=100.0),
+            ExistingPosition(symbol="NVDA", shares=10, average_entry_price=100.0),
+            ExistingPosition(symbol="JPM", shares=10, average_entry_price=100.0),
+        ],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={preset.name: ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+    )
+
+    assert len(summary.execution_batch.orders) == 1
+    assert [row.symbol for row in summary.rows[:2]] == ["AAA", "BBB"]
+    assert summary.rows[0].metadata["execution_priority"]["priority_bucket"] == "top_priority"
+    assert summary.rows[1].metadata["execution_priority"]["priority_bucket"] == "capacity_constrained"
+    assert summary.rows[1].quantity == 0
+    assert "crowded out by higher-ranked approved opportunities" in summary.rows[1].rationale.lower()
+
+
+def test_execution_priority_uses_portfolio_heat_to_lower_priority_without_rejecting() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    crowded = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=40,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    )
+    neutral = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=True,
+        shares=40,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    )
+    crowded_heat_context = build_portfolio_heat_context(
+        [
+            PortfolioHoldingExposure(
+                symbol="MSFT",
+                approximate_notional=10_000.0,
+                sector_name="Technology",
+                industry_name="Software",
+            ),
+            PortfolioHoldingExposure(
+                symbol="NVDA",
+                approximate_notional=15_000.0,
+                sector_name="Technology",
+                industry_name="Semiconductors",
+            ),
+            PortfolioHoldingExposure(
+                symbol="JPM",
+                approximate_notional=25_000.0,
+                sector_name="Financials",
+                industry_name="Banks",
+            ),
+        ],
+        candidate_sector="Technology",
+        candidate_industry="Software",
+        max_positions_per_sector=4,
+        max_same_industry_positions=2,
+    )
+    crowded_candidate = replace(
+        crowded.candidate,
+        features=build_candidate_features(
+            crowded.candidate.signal,
+            as_of_date=crowded.candidate.signal.date,
+            sector_name="Technology",
+            industry_name="Software",
+            portfolio_heat_context=crowded_heat_context,
+        ),
+        portfolio_heat_projection=project_portfolio_heat_context(
+            crowded_heat_context,
+            candidate_notional_value=crowded.candidate.sizing.notional_value,
+        ),
+    )
+
+    prioritized = annotate_execution_priority(
+        [crowded_candidate, neutral.candidate],
+        current_equity=100_000.0,
+        current_positions=[],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=4,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+    ranked = rank_risk_assessed_candidates(prioritized, current_equity=100_000.0)
+
+    assert [candidate.signal.symbol for candidate in ranked[:2]] == ["BBB", "AAA"]
+    assert ranked[0].execution_priority is not None
+    assert ranked[1].execution_priority is not None
+    assert ranked[1].execution_priority.portfolio_heat_penalty > ranked[0].execution_priority.portfolio_heat_penalty
+    assert "portfolio heat is already elevated in this sector" in " ".join(
+        ranked[1].execution_priority.rationale
+    ).lower()
+
+
+def test_execution_priority_lower_priority_without_features_does_not_blame_sector_context() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    candidates = [
+        _evaluation(
+            preset,
+            symbol="AAA",
+            approved=True,
+            shares=30,
+            prior_high=99.0,
+            entry_price=102.0,
+            relative_volume=3.0,
+        ).candidate,
+        _evaluation(
+            preset,
+            symbol="BBB",
+            approved=True,
+            shares=30,
+            prior_high=99.0,
+            entry_price=101.5,
+            relative_volume=2.6,
+        ).candidate,
+        _evaluation(
+            preset,
+            symbol="CCC",
+            approved=True,
+            shares=30,
+            prior_high=99.0,
+            entry_price=101.0,
+            relative_volume=2.2,
+        ).candidate,
+        _evaluation(
+            preset,
+            symbol="DDD",
+            approved=True,
+            shares=30,
+            prior_high=99.5,
+            entry_price=100.5,
+            relative_volume=1.5,
+        ).candidate,
+    ]
+
+    prioritized = annotate_execution_priority(
+        candidates,
+        current_equity=100_000.0,
+        current_positions=[],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=4,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+    ranked = rank_risk_assessed_candidates(prioritized, current_equity=100_000.0)
+
+    assert ranked[-1].signal.symbol == "DDD"
+    assert ranked[-1].execution_priority is not None
+    assert ranked[-1].execution_priority.priority_bucket == "lower_priority"
+    assert "sector support is not especially strong" not in " ".join(
+        ranked[-1].execution_priority.rationale
+    ).lower()
+
+
+def test_generate_orders_and_daily_summary_share_execution_priority_order() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    evaluations = [
+        _evaluation(
+            preset,
+            symbol="AAA",
+            approved=True,
+            shares=40,
+            prior_high=99.0,
+            entry_price=101.0,
+            relative_volume=2.4,
+        ),
+        _evaluation(
+            preset,
+            symbol="BBB",
+            approved=True,
+            shares=40,
+            prior_high=99.2,
+            entry_price=100.8,
+            relative_volume=1.9,
+        ),
+        _evaluation(
+            preset,
+            symbol="CCC",
+            approved=True,
+            shares=40,
+            prior_high=99.5,
+            entry_price=100.5,
+            relative_volume=1.6,
+        ),
+    ]
+    prioritized_candidates = annotate_execution_priority(
+        [evaluation.candidate for evaluation in evaluations],
+        current_equity=100_000.0,
+        current_positions=[
+            ExistingPosition(symbol="MSFT", shares=10, average_entry_price=100.0),
+            ExistingPosition(symbol="NVDA", shares=10, average_entry_price=100.0),
+            ExistingPosition(symbol="JPM", shares=10, average_entry_price=100.0),
+        ],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=5,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+    prioritized_evaluations = [
+        replace(evaluation, candidate=candidate)
+        for evaluation, candidate in zip(evaluations, prioritized_candidates)
+    ]
+
+    generate_orders_order = [
+        candidate.signal.symbol
+        for candidate in rank_risk_assessed_candidates(
+            prioritized_candidates,
+            current_equity=100_000.0,
+        )
+    ]
+    daily_summary_order = [
+        evaluation.candidate.signal.symbol
+        for evaluation in rank_preset_candidate_evaluations(
+            prioritized_evaluations,
+            current_equity=100_000.0,
+        )
+    ]
+
+    assert generate_orders_order == daily_summary_order
 
 
 def test_daily_research_summary_handles_empty_no_signal_days(tmp_path: Path) -> None:
@@ -2694,7 +3162,7 @@ def test_run_daily_summary_workflow_serializes_projected_portfolio_heat_metadata
             "vix_close": 20.0,
             "vix_sma_short": 19.5,
             "vix_sma_long": 18.8,
-            "volatility_regime_state": "normal",
+            "volatility_regime_state": "calm",
             "volatility_regime_risk_off": False,
         },
     )
@@ -3476,7 +3944,7 @@ def test_handle_generate_orders_rolls_forward_approved_sector_exposure_between_c
             "vix_close": 20.0,
             "vix_sma_short": 19.5,
             "vix_sma_long": 18.8,
-            "volatility_regime_state": "normal",
+            "volatility_regime_state": "calm",
             "volatility_regime_risk_off": False,
         },
     )

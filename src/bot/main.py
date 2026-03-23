@@ -110,6 +110,10 @@ from bot.execution.manual_executor import (
     write_execution_batch,
     write_manual_order_sheet,
 )
+from bot.execution.prioritization import (
+    annotate_execution_priority,
+    rank_risk_assessed_candidates,
+)
 from bot.features import (
     PositionFeatures,
     apply_intraday_trajectory_features,
@@ -1896,6 +1900,16 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             sector_context=sector_context,
         )
 
+    assessed_candidates = rank_risk_assessed_candidates(
+        annotate_execution_priority(
+            assessed_candidates,
+            current_equity=current_equity,
+            current_positions=current_positions,
+            constraints=constraints,
+        ),
+        current_equity=current_equity,
+    )
+
     executor = ManualExecutor()
     batch = executor.build_execution_batch(assessed_candidates, as_of_date=args.as_of)
     report = build_daily_signal_report(
@@ -1938,7 +1952,14 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         "volatility_regime_risk_off": market_context.volatility_regime_risk_off,
         "universe_count": len(universe_members),
         "signal_count": len(assessed_candidates),
+        "approved_signal_count": sum(candidate.approved for candidate in assessed_candidates),
         "approved_order_count": len(batch.orders),
+        "deferred_approved_count": sum(
+            candidate.approved
+            and candidate.execution_priority is not None
+            and not candidate.execution_priority.actionable_now
+            for candidate in assessed_candidates
+        ),
         "rejected_signal_count": sum(not candidate.approved for candidate in assessed_candidates),
         "no_signal_count": len(no_signal_symbols),
         "order_symbols": [order.symbol for order in batch.orders],
@@ -2819,6 +2840,16 @@ def _run_daily_summary_workflow(
         candidate_score_journal=candidate_score_journal,
         as_of_date=args.as_of,
     )
+    prioritized_candidates = annotate_execution_priority(
+        [evaluation.candidate for evaluation in evaluations],
+        current_equity=current_equity,
+        current_positions=resolved_current_positions,
+        constraints=constraints,
+    )
+    evaluations = [
+        replace(evaluation, candidate=candidate)
+        for evaluation, candidate in zip(evaluations, prioritized_candidates)
+    ]
     ranked_evaluations = rank_preset_candidate_evaluations(
         evaluations,
         current_equity=current_equity,

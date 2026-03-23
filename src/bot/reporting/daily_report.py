@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from bot.execution.interface import ExecutionBatch, ExecutionOrder
+from bot.execution.prioritization import (
+    execution_priority_note,
+    risk_candidate_sort_key,
+    score_risk_candidate_opportunity as _score_risk_candidate_opportunity,
+)
 from bot.features import MarketContext
 from bot.risk.portfolio_rules import (
     PORTFOLIO_REVIEW_ACTIONS,
@@ -441,6 +446,8 @@ class DailyResearchSummary:
         """Return a human-readable trader brief for the daily summary."""
 
         approved_rows = [row for row in self.rows if row.status == "approved"]
+        actionable_approved_rows = [row for row in approved_rows if _row_actionable_now(row)]
+        deferred_approved_rows = [row for row in approved_rows if not _row_actionable_now(row)]
         rejected_rows = [row for row in self.rows if row.status == "rejected"]
         current_symbols = [position.symbol for position in self.current_positions]
 
@@ -465,14 +472,23 @@ class DailyResearchSummary:
             lines.append(volatility_line)
 
         lines.extend(("", "Top opportunities"))
-        if approved_rows:
-            for row in approved_rows[:5]:
+        if actionable_approved_rows:
+            for row in actionable_approved_rows[:5]:
                 lines.extend(_daily_research_brief_card(row))
+        elif approved_rows:
+            lines.append(
+                "No approved buy candidates are currently actionable under portfolio capacity."
+            )
         else:
             lines.append("No approved buy candidates today.")
 
         lines.extend(("", "Lower-priority / rejected candidates"))
-        if rejected_rows:
+        if deferred_approved_rows or rejected_rows:
+            for row in deferred_approved_rows[:3]:
+                lines.append(
+                    f"- {row.symbol} | preset={row.preset_name} | "
+                    f"note={_single_line(row.rationale)}"
+                )
             for row in rejected_rows[:5]:
                 reason = row.rejection_reasons[0] if row.rejection_reasons else row.rationale
                 lines.append(
@@ -879,9 +895,18 @@ class MarketMonitorReport:
 
         counts = self.category_counts
         approved_buy_rows = [
-            row for row in self.ranked_opportunity_rows if row.status == "approved"
+            row
+            for row in self.ranked_opportunity_rows
+            if row.status == "approved" and _row_actionable_now(row)
         ]
-        lower_priority_buy_rows = list(approved_buy_rows[MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT:]) + [
+        deferred_buy_rows = [
+            row
+            for row in self.ranked_opportunity_rows
+            if row.status == "approved" and not _row_actionable_now(row)
+        ]
+        lower_priority_buy_rows = deferred_buy_rows + list(
+            approved_buy_rows[MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT:]
+        ) + [
             row for row in self.ranked_opportunity_rows if row.status != "approved"
         ]
         top_buy_rows = approved_buy_rows[:MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT]
@@ -950,6 +975,8 @@ class MarketMonitorReport:
         if top_buy_rows:
             for row in top_buy_rows:
                 lines.append(_daily_research_monitor_brief_line(row))
+        elif deferred_buy_rows:
+            lines.append("No approved buy candidates are currently actionable under portfolio capacity.")
         else:
             lines.append("No approved buy candidates.")
 
@@ -1023,7 +1050,7 @@ def build_market_monitor_report(
         preset_names.extend(preset.name for preset in daily_summary.selected_presets)
         benchmark_symbol = daily_summary.benchmark_symbol or benchmark_symbol
         for row in daily_summary.rows:
-            if row.status != "approved":
+            if row.status != "approved" or not _row_actionable_now(row):
                 continue
             alerts.append(
                 MarketMonitorAlertRow(
@@ -1042,6 +1069,7 @@ def build_market_monitor_report(
                         "parameter_id": row.parameter_id,
                         "score": row.score,
                         "score_components": dict(row.metadata.get("score_components", {})),
+                        "execution_priority": dict(row.metadata.get("execution_priority", {})),
                         "strategy_name": row.strategy_name,
                         "signal_metadata": dict(row.metadata.get("signal_metadata", {})),
                     },
@@ -1401,60 +1429,10 @@ def score_risk_candidate_opportunity(
     current_equity: float,
 ) -> tuple[float, dict[str, float]]:
     """Return a deterministic score and its components for a risk candidate."""
-
-    prior_high = (
-        candidate.features.prior_high
-        if candidate.features is not None
-        else _optional_float(candidate.signal.metadata.get("prior_high"))
+    return _score_risk_candidate_opportunity(
+        candidate,
+        current_equity=current_equity,
     )
-    relative_volume = (
-        candidate.features.relative_volume
-        if candidate.features is not None
-        else _optional_float(candidate.signal.metadata.get("relative_volume"))
-    )
-    relative_volume_threshold = _optional_float(candidate.signal.metadata.get("relative_volume_threshold"))
-
-    breakout_pct = (
-        candidate.features.breakout_strength
-        if candidate.features is not None and candidate.features.breakout_strength is not None
-        else 0.0
-    )
-    if breakout_pct == 0.0 and prior_high is not None and prior_high > 0 and candidate.entry_price > 0:
-        breakout_pct = max((candidate.entry_price - prior_high) / prior_high, 0.0)
-
-    relative_volume_ratio = 0.0
-    if relative_volume is not None:
-        if relative_volume_threshold is not None and relative_volume_threshold > 0:
-            relative_volume_ratio = max(relative_volume / relative_volume_threshold, 0.0)
-        else:
-            relative_volume_ratio = max(relative_volume, 0.0)
-
-    position_pct_equity = (
-        max(candidate.sizing.notional_value / current_equity, 0.0)
-        if current_equity > 0
-        else 0.0
-    )
-    candidate_memory_score = max(
-        (
-            candidate.features.setup_quality_score
-            if candidate.features is not None
-            else _optional_float(candidate.signal.metadata.get("setup_quality_score"))
-        )
-        or 0.0,
-        0.0,
-    )
-    score = (
-        breakout_pct * 1000.0
-        + relative_volume_ratio * 100.0
-        + position_pct_equity * 25.0
-        + candidate_memory_score * 15.0
-    )
-    return score, {
-        "breakout_pct": breakout_pct,
-        "relative_volume_ratio": relative_volume_ratio,
-        "position_pct_equity": position_pct_equity,
-        "candidate_memory_score": candidate_memory_score,
-    }
 
 
 def rank_preset_candidate_evaluations(
@@ -1464,17 +1442,10 @@ def rank_preset_candidate_evaluations(
 ) -> list[PresetCandidateEvaluation]:
     """Return evaluations sorted by approval status and deterministic opportunity score."""
 
-    def sort_key(evaluation: PresetCandidateEvaluation) -> tuple[int, float, str, str]:
-        score, _components = score_risk_candidate_opportunity(
+    def sort_key(evaluation: PresetCandidateEvaluation) -> tuple[int, int, float, int, str, str]:
+        return risk_candidate_sort_key(
             evaluation.candidate,
             current_equity=current_equity,
-        )
-        approval_rank = 1 if evaluation.candidate.approved else 0
-        return (
-            -approval_rank,
-            -score,
-            evaluation.preset_name,
-            evaluation.candidate.signal.symbol,
         )
 
     return sorted(evaluations, key=sort_key)
@@ -1647,6 +1618,8 @@ def _row_from_candidate(
         )
     if candidate.portfolio_heat_projection is not None:
         metadata["portfolio_heat_projection"] = candidate.portfolio_heat_projection.to_dict()
+    if candidate.execution_priority is not None:
+        metadata["execution_priority"] = candidate.execution_priority.to_dict()
     if candidate.existing_position is not None:
         metadata["existing_position"] = candidate.existing_position.to_dict()
     if order is not None:
@@ -1699,6 +1672,8 @@ def _daily_research_row_from_evaluation(
         )
     if candidate.portfolio_heat_projection is not None:
         metadata["portfolio_heat_projection"] = candidate.portfolio_heat_projection.to_dict()
+    if candidate.execution_priority is not None:
+        metadata["execution_priority"] = candidate.execution_priority.to_dict()
     if candidate.existing_position is not None:
         metadata["existing_position"] = candidate.existing_position.to_dict()
     if order is not None:
@@ -1734,10 +1709,14 @@ def _daily_research_row_from_evaluation(
 
 
 def _candidate_rationale(candidate: RiskAssessedCandidate) -> str:
-    return build_breakout_rationale(
+    rationale = build_breakout_rationale(
         candidate.signal.entry_reason,
         candidate.signal.metadata,
     )
+    priority_note = execution_priority_note(candidate.execution_priority)
+    if priority_note is None:
+        return rationale
+    return f"{rationale} | {priority_note}"
 
 
 def _market_breadth_brief_line(
@@ -1890,6 +1869,16 @@ def _daily_research_monitor_brief_line(row: DailyResearchOpportunityRow) -> str:
         f"- {row.rank}. {row.symbol} | preset={row.preset_name} | "
         f"status={row.status} | reason={_single_line(reason)}"
     )
+
+
+def _row_actionable_now(row: DailyResearchOpportunityRow) -> bool:
+    execution_priority = row.metadata.get("execution_priority")
+    if not isinstance(execution_priority, Mapping):
+        return row.status == "approved"
+    actionable_now = execution_priority.get("actionable_now")
+    if isinstance(actionable_now, bool):
+        return actionable_now
+    return row.status == "approved"
 
 
 def _market_monitor_brief_line(alert: MarketMonitorAlertRow) -> str:

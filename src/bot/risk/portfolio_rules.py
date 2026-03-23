@@ -8,7 +8,7 @@ from datetime import date
 import json
 from math import isfinite
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from bot.config import RiskConfig, RulesConfig
 from bot.data.portfolio_heat import (
@@ -26,6 +26,9 @@ from bot.features import (
 )
 from bot.risk.position_sizing import PositionSizingResult, size_position
 from bot.strategy.signal_models import StrategySignal
+
+if TYPE_CHECKING:
+    from bot.execution.prioritization import ExecutionPriority
 
 
 class PortfolioInputError(ValueError):
@@ -183,6 +186,7 @@ class RiskAssessedCandidate:
     existing_position: ExistingPosition | None = None
     features: CandidateFeatures | None = None
     portfolio_heat_projection: PortfolioHeatProjection | None = None
+    execution_priority: ExecutionPriority | None = None
 
 
 @dataclass(frozen=True)

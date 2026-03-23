@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from bot.execution.interface import CandidateExecutor, ExecutionBatch, ExecutionOrder
+from bot.execution.prioritization import execution_priority_note
 from bot.risk.portfolio_rules import RiskAssessedCandidate
 from bot.strategy.breakout_momentum import build_breakout_rationale
 
@@ -208,7 +209,12 @@ class ManualExecutor(CandidateExecutor):
                 time_in_force=self.time_in_force,
             )
             for candidate in candidates
-            if candidate.approved and candidate.sizing.shares > 0
+            if candidate.approved
+            and candidate.sizing.shares > 0
+            and (
+                candidate.execution_priority is None
+                or candidate.execution_priority.actionable_now
+            )
         )
         return ExecutionBatch(
             executor_name=self.executor_name,
@@ -278,6 +284,11 @@ def _candidate_to_execution_order(
             "notional_value": candidate.sizing.notional_value,
             "capped_by_notional": candidate.sizing.capped_by_notional,
             "signal_metadata": dict(candidate.signal.metadata),
+            "execution_priority": (
+                candidate.execution_priority.to_dict()
+                if candidate.execution_priority is not None
+                else None
+            ),
             "existing_position": (
                 candidate.existing_position.to_dict()
                 if candidate.existing_position is not None
@@ -288,10 +299,14 @@ def _candidate_to_execution_order(
 
 
 def _build_rationale(candidate: RiskAssessedCandidate) -> str:
-    return build_breakout_rationale(
+    rationale = build_breakout_rationale(
         candidate.signal.entry_reason,
         candidate.signal.metadata,
     )
+    priority_note = execution_priority_note(candidate.execution_priority)
+    if priority_note is None:
+        return rationale
+    return f"{rationale} | {priority_note}"
 
 
 def _execution_order_record(
