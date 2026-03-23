@@ -11,7 +11,7 @@ from datetime import timedelta
 import json
 from pathlib import Path
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
 import pandas as pd
 import yaml
@@ -133,9 +133,15 @@ from bot.features import (
 )
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
+from bot.orchestration.live_runner import (
+    LiveMarketCycleRequest,
+    LiveMarketRunner,
+    PersistedMarketStateArtifacts,
+)
 from bot.reporting.daily_report import (
     DailyResearchSummary,
     IntradayPortfolioReviewReport,
+    MarketMonitorReport,
     PresetCandidateEvaluation,
     PortfolioReviewReport,
     PortfolioReviewRow,
@@ -232,7 +238,7 @@ def _persist_market_state(
     daily_summary: DailyResearchSummary | None = None,
     portfolio_review: PortfolioReviewReport | None = None,
     intraday_review: IntradayPortfolioReviewReport | None = None,
-) -> tuple[dict[str, str], int, bool]:
+) -> PersistedMarketStateArtifacts:
     """Update the live market state snapshot and write compact change outputs."""
 
     state_store = MarketStateStore(project_root)
@@ -259,10 +265,9 @@ def _persist_market_state(
     }
     if update_result.previous_path.exists():
         outputs["previous_market_state_snapshot"] = str(update_result.previous_path)
-    return (
-        outputs,
-        update_result.change_set.transition_count,
-        update_result.change_set.baseline_established,
+    return PersistedMarketStateArtifacts(
+        update_result=update_result,
+        output_paths=outputs,
     )
 
 
@@ -1783,12 +1788,39 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         if current_positions
         else None
     )
-    report = _run_portfolio_review_workflow(
-        args,
-        config=config,
-        provider=provider,
-        current_positions=current_positions,
+    output_dir = (
+        args.output_dir or _default_daily_output_dir(config.project_root, args.as_of)
+    ).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cycle = LiveMarketRunner(
+        run_portfolio_review=lambda: _run_portfolio_review_workflow(
+            args,
+            config=config,
+            provider=provider,
+            current_positions=current_positions,
+        ),
+        persist_market_state=lambda as_of_date, workflow, daily_summary, portfolio_review, intraday_review, portfolio_path: _persist_market_state(
+            project_root=config.project_root,
+            output_dir=output_dir,
+            as_of_date=as_of_date,
+            workflow=workflow,
+            portfolio_path=portfolio_path,
+            portfolio_review=(
+                _strip_internal_portfolio_review_report(portfolio_review)
+                if portfolio_review is not None
+                else None
+            ),
+        ),
+    ).run_cycle(
+        LiveMarketCycleRequest(
+            workflow="review-portfolio",
+            as_of_date=args.as_of,
+            portfolio_path=str(args.portfolio_file.resolve()),
+            include_portfolio_review=True,
+            portfolio_review_required=True,
+        )
     )
+    report = cast(PortfolioReviewReport, cycle.portfolio_review)
     report = replace(
         report,
         rows=tuple(
@@ -1830,8 +1862,6 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         events=trade_feedback_events,
     )
     sanitized_report = _strip_internal_portfolio_review_report(report)
-    output_dir = (args.output_dir or _default_daily_output_dir(config.project_root, args.as_of)).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
     review_json_path = write_portfolio_review_report(
         sanitized_report,
         output_dir / "portfolio_review.json",
@@ -1840,16 +1870,7 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         sanitized_report,
         output_dir / "portfolio_review.csv",
     )
-    market_state_outputs, state_change_count, market_state_baseline_established = (
-        _persist_market_state(
-            project_root=config.project_root,
-            output_dir=output_dir,
-            as_of_date=args.as_of,
-            workflow="review-portfolio",
-            portfolio_path=str(args.portfolio_file.resolve()),
-            portfolio_review=sanitized_report,
-        )
-    )
+    state_artifacts = cast(PersistedMarketStateArtifacts, cycle.state_artifacts)
     position_trajectory_journal_path = default_position_trajectory_journal_path(
         config.project_root,
     ).resolve()
@@ -1864,13 +1885,13 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         "portfolio_path": str(args.portfolio_file.resolve()),
         "position_count": len(current_positions),
         "symbols_reviewed": report_payload["reviewed_symbols"],
-        "state_change_count": state_change_count,
-        "market_state_baseline_established": market_state_baseline_established,
+        "state_change_count": cycle.state_change_count,
+        "market_state_baseline_established": state_artifacts.baseline_established,
         **action_counts,
         "outputs": {
             "portfolio_review_json": str(review_json_path),
             "portfolio_review_csv": str(review_csv_path),
-            **market_state_outputs,
+            **cycle.paths_written,
         },
     }
     if position_trajectory_journal_path.exists():
@@ -1892,12 +1913,35 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         if current_positions
         else None
     )
+    output_dir = (
+        args.output_dir
+        or _default_intraday_portfolio_output_dir(config.project_root, args.as_of)
+    ).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        report = _run_portfolio_review_intraday_workflow(
-            args,
-            config=config,
-            provider=provider,
-            current_positions=current_positions,
+        cycle = LiveMarketRunner(
+            run_intraday_review=lambda: _run_portfolio_review_intraday_workflow(
+                args,
+                config=config,
+                provider=provider,
+                current_positions=current_positions,
+            ),
+            persist_market_state=lambda as_of_date, workflow, daily_summary, portfolio_review, intraday_review, portfolio_path: _persist_market_state(
+                project_root=config.project_root,
+                output_dir=output_dir,
+                as_of_date=as_of_date,
+                workflow=workflow,
+                portfolio_path=portfolio_path,
+                intraday_review=intraday_review,
+            ),
+        ).run_cycle(
+            LiveMarketCycleRequest(
+                workflow="review-portfolio-intraday",
+                as_of_date=args.as_of,
+                portfolio_path=str(args.portfolio_file.resolve()),
+                include_intraday_review=True,
+                intraday_review_required=True,
+            )
         )
     except NoIntradayDataError as exc:
         payload = {
@@ -1912,6 +1956,7 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         }
         _print_structured(payload, output_format=args.format)
         return 0
+    report = cast(IntradayPortfolioReviewReport, cycle.intraday_review)
     report = replace(
         report,
         rows=tuple(
@@ -1939,11 +1984,6 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
             for row in report.rows
         ],
     )
-    output_dir = (
-        args.output_dir
-        or _default_intraday_portfolio_output_dir(config.project_root, args.as_of)
-    ).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
     review_json_path = write_intraday_portfolio_review_report(
         report,
         output_dir / "portfolio_review_intraday.json",
@@ -1956,16 +1996,7 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         report,
         output_dir / "portfolio_review_intraday_brief.txt",
     )
-    market_state_outputs, state_change_count, market_state_baseline_established = (
-        _persist_market_state(
-            project_root=config.project_root,
-            output_dir=output_dir,
-            as_of_date=args.as_of,
-            workflow="review-portfolio-intraday",
-            portfolio_path=str(args.portfolio_file.resolve()),
-            intraday_review=report,
-        )
-    )
+    state_artifacts = cast(PersistedMarketStateArtifacts, cycle.state_artifacts)
     intraday_state_journal_path = default_intraday_state_journal_path(
         config.project_root,
         args.as_of,
@@ -1982,14 +2013,14 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         "interval_minutes": args.interval_minutes,
         "position_count": len(current_positions),
         "symbols_reviewed": report_payload["reviewed_symbols"],
-        "state_change_count": state_change_count,
-        "market_state_baseline_established": market_state_baseline_established,
+        "state_change_count": cycle.state_change_count,
+        "market_state_baseline_established": state_artifacts.baseline_established,
         **action_counts,
         "outputs": {
             "portfolio_review_intraday_json": str(review_json_path),
             "portfolio_review_intraday_csv": str(review_csv_path),
             "portfolio_review_intraday_brief": str(review_brief_path),
-            **market_state_outputs,
+            **cycle.paths_written,
         },
     }
     if intraday_state_journal_path.exists():
@@ -2005,36 +2036,68 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     provider = create_daily_bar_provider(config, env_file=args.env_file)
     current_positions = _load_current_positions(args.portfolio_file)
-    summary_result = _run_daily_summary_workflow(
-        args,
-        config=config,
-        provider=provider,
-        current_positions=current_positions,
-    )
-    summary = summary_result["summary"]
-
-    portfolio_review = None
-    if args.portfolio_file is not None:
-        portfolio_review = _strip_internal_portfolio_review_report(
-            _run_portfolio_review_workflow(
-                args,
-                config=config,
-                provider=provider,
-                current_positions=current_positions,
-            )
-        )
-
-    monitor_report = build_market_monitor_report(
-        as_of_date=args.as_of,
-        daily_summary=summary,
-        portfolio_review=portfolio_review,
-        portfolio_path=str(args.portfolio_file.resolve()) if args.portfolio_file else None,
-    )
     output_dir = (
         args.output_dir
         or (config.project_root / "data" / "processed" / "monitor_market" / args.as_of.isoformat())
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    cycle = LiveMarketRunner(
+        run_daily_summary=lambda: _run_daily_summary_workflow(
+            args,
+            config=config,
+            provider=provider,
+            current_positions=current_positions,
+        ),
+        run_portfolio_review=(
+            lambda: _run_portfolio_review_workflow(
+                args,
+                config=config,
+                provider=provider,
+                current_positions=current_positions,
+            )
+            if args.portfolio_file is not None
+            else None
+        ),
+        build_monitor_report=lambda as_of_date, daily_summary, portfolio_review, intraday_review, portfolio_path: build_market_monitor_report(
+            as_of_date=as_of_date,
+            daily_summary=daily_summary,
+            portfolio_review=(
+                _strip_internal_portfolio_review_report(portfolio_review)
+                if portfolio_review is not None
+                else None
+            ),
+            portfolio_path=portfolio_path,
+        ),
+        persist_market_state=lambda as_of_date, workflow, daily_summary, portfolio_review, intraday_review, portfolio_path: _persist_market_state(
+            project_root=config.project_root,
+            output_dir=output_dir,
+            as_of_date=as_of_date,
+            workflow=workflow,
+            portfolio_path=portfolio_path,
+            daily_summary=daily_summary,
+            portfolio_review=(
+                _strip_internal_portfolio_review_report(portfolio_review)
+                if portfolio_review is not None
+                else None
+            ),
+        ),
+    ).run_cycle(
+        LiveMarketCycleRequest(
+            workflow="monitor-market",
+            as_of_date=args.as_of,
+            portfolio_path=(
+                str(args.portfolio_file.resolve()) if args.portfolio_file else None
+            ),
+            include_daily_summary=True,
+            include_portfolio_review=args.portfolio_file is not None,
+            daily_summary_required=True,
+            portfolio_review_required=False,
+        )
+    )
+    summary_result = cast(Mapping[str, object], cycle.daily_summary_result)
+    summary = cast(DailyResearchSummary, cycle.daily_summary)
+    monitor_report = cast(MarketMonitorReport, cycle.monitor_report)
+    state_artifacts = cast(PersistedMarketStateArtifacts, cycle.state_artifacts)
 
     alert_json_path = write_market_monitor_report(monitor_report, output_dir / "market_monitor.json")
     alert_csv_path = write_market_monitor_report(monitor_report, output_dir / "market_monitor.csv")
@@ -2045,19 +2108,6 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
     alert_brief_path = write_market_monitor_brief(
         monitor_report,
         output_dir / "market_monitor_brief.txt",
-    )
-    market_state_outputs, state_change_count, market_state_baseline_established = (
-        _persist_market_state(
-            project_root=config.project_root,
-            output_dir=output_dir,
-            as_of_date=args.as_of,
-            workflow="monitor-market",
-            portfolio_path=(
-                str(args.portfolio_file.resolve()) if args.portfolio_file else None
-            ),
-            daily_summary=summary,
-            portfolio_review=portfolio_review,
-        )
     )
     report_payload = monitor_report.to_dict()
     summary_payload = summary.to_dict()
@@ -2114,12 +2164,12 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         "approved_count": summary_payload["approved_count"],
         "rejected_count": summary_payload["rejected_count"],
         "alert_count": report_payload["alert_count"],
-        "state_change_count": state_change_count,
-        "market_state_baseline_established": market_state_baseline_established,
+        "state_change_count": cycle.state_change_count,
+        "market_state_baseline_established": state_artifacts.baseline_established,
         **flat_category_counts,
         "outputs": outputs,
     }
-    payload["outputs"].update(market_state_outputs)
+    payload["outputs"].update(cycle.paths_written)
     _print_structured(payload, output_format=args.format)
     return 0
 
