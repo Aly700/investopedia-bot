@@ -10,6 +10,7 @@ import pandas as pd
 
 from bot.data.earnings import EarningsRiskContext
 from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
+from bot.data.portfolio_heat import PortfolioHeatContext
 from bot.data.position_trajectory import PositionTrajectoryFeatures
 from bot.data.sector_context import SectorFeatureContext
 from bot.strategy.signal_models import StrategySignal
@@ -88,6 +89,7 @@ class CandidateFeatures:
     days_approved: int | None = None
     repeated_high_quality_signal: bool = False
     market_context: MarketContext | None = None
+    portfolio_heat_context: PortfolioHeatContext | None = None
 
 
 @dataclass(frozen=True)
@@ -293,6 +295,7 @@ def build_candidate_features(
     sector_regime_passed: bool | None = None,
     relative_strength_vs_sector: float | None = None,
     sector_relative_strength_window: int | None = None,
+    portfolio_heat_context: PortfolioHeatContext | None = None,
 ) -> CandidateFeatures:
     """Build a typed candidate feature vector from one evaluated signal."""
 
@@ -410,6 +413,7 @@ def build_candidate_features(
         days_approved=_optional_int(signal.metadata.get("days_approved")),
         repeated_high_quality_signal=bool(signal.metadata.get("repeated_high_quality_signal")),
         market_context=market_context,
+        portfolio_heat_context=portfolio_heat_context,
     )
 
 

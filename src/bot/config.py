@@ -185,6 +185,9 @@ class SignalConfig:
     sector_relative_strength_window: int = 20
     sector_relative_strength_entry_reject_threshold: float = -0.05
     sector_relative_strength_watch_threshold: float = -0.05
+    max_positions_per_sector: int | None = 3
+    max_same_industry_positions: int | None = 2
+    max_sector_notional_pct: float | None = None
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "SignalConfig":
@@ -208,6 +211,12 @@ class SignalConfig:
             data,
             "sector_relative_strength_watch_threshold",
         )
+        max_positions_per_sector = _as_optional_int(data, "max_positions_per_sector")
+        max_same_industry_positions = _as_optional_int(
+            data,
+            "max_same_industry_positions",
+        )
+        max_sector_notional_pct = _as_optional_float(data, "max_sector_notional_pct")
         return cls(
             breakout_lookback=_as_int(data, "breakout_lookback"),
             benchmark_symbol=_as_str(data, "benchmark_symbol"),
@@ -254,6 +263,21 @@ class SignalConfig:
                 sector_relative_strength_watch_threshold
                 if sector_relative_strength_watch_threshold is not None
                 else -0.05
+            ),
+            max_positions_per_sector=(
+                max_positions_per_sector
+                if max_positions_per_sector is not None
+                else 3
+            ),
+            max_same_industry_positions=(
+                max_same_industry_positions
+                if max_same_industry_positions is not None
+                else 2
+            ),
+            max_sector_notional_pct=(
+                max_sector_notional_pct
+                if max_sector_notional_pct is not None
+                else None
             ),
         )
 
@@ -304,6 +328,24 @@ class SignalConfig:
         if self.sector_relative_strength_watch_threshold > 0:
             raise ConfigError(
                 "Expected 'sector_relative_strength_watch_threshold' to be less than or equal to zero."
+            )
+        if self.max_positions_per_sector is not None and self.max_positions_per_sector <= 0:
+            raise ConfigError(
+                "Expected 'max_positions_per_sector' to be greater than zero when provided."
+            )
+        if (
+            self.max_same_industry_positions is not None
+            and self.max_same_industry_positions <= 0
+        ):
+            raise ConfigError(
+                "Expected 'max_same_industry_positions' to be greater than zero when provided."
+            )
+        if self.max_sector_notional_pct is not None and (
+            self.max_sector_notional_pct <= 0
+            or self.max_sector_notional_pct >= 1
+        ):
+            raise ConfigError(
+                "Expected 'max_sector_notional_pct' to be between zero and one when provided."
             )
 
 

@@ -63,6 +63,10 @@ from bot.data.intraday_state_journal import (
     update_intraday_state_journal,
     write_intraday_state_journal,
 )
+from bot.data.portfolio_heat import (
+    PortfolioHoldingExposure,
+    build_portfolio_heat_context,
+)
 from bot.data.position_trajectory import (
     PositionTrajectoryJournal,
     PositionTrajectoryObservation,
@@ -74,6 +78,7 @@ from bot.data.position_trajectory import (
 )
 from bot.data.sector_context import (
     SectorFeatureContext,
+    SymbolSectorClassification,
     build_sector_feature_contexts,
     load_symbol_sector_classifications,
     sector_context_history_start,
@@ -148,6 +153,7 @@ from bot.risk.portfolio_rules import (
     PortfolioConstraints,
     PortfolioInputError,
     PORTFOLIO_REVIEW_ACTIONS,
+    RiskAssessedCandidate,
     assess_signal_candidate,
     initialize_portfolio_snapshot,
     load_existing_positions,
@@ -1750,6 +1756,18 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         refresh_cache=args.refresh_cache,
         log_label="generate-orders",
     )
+    current_position_classifications = _load_position_sector_classifications(
+        current_positions,
+        config=config,
+        env_file=getattr(args, "env_file", None),
+        as_of_date=args.as_of,
+        refresh_cache=args.refresh_cache,
+        log_label="generate-orders",
+    )
+    portfolio_holding_exposures = _build_portfolio_holding_exposures(
+        current_positions,
+        current_position_classifications,
+    )
 
     for member in universe_members:
         bars = symbol_frames.get(member.symbol)
@@ -1771,6 +1789,18 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
 
         earnings_context = earnings_contexts.get(member.symbol.strip().upper())
         sector_context = sector_contexts.get(member.symbol.strip().upper())
+        portfolio_heat_context = build_portfolio_heat_context(
+            portfolio_holding_exposures,
+            candidate_sector=(
+                sector_context.sector_name if sector_context is not None else None
+            ),
+            candidate_industry=(
+                sector_context.industry_name if sector_context is not None else None
+            ),
+            max_positions_per_sector=strategy_settings.max_positions_per_sector,
+            max_same_industry_positions=strategy_settings.max_same_industry_positions,
+            max_sector_notional_pct=strategy_settings.max_sector_notional_pct,
+        )
         if strategy_settings.require_sector_regime_for_entries and sector_context is None:
             _warn_missing_sector_context_for_entry(
                 member.symbol,
@@ -1800,65 +1830,70 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             earnings_context=earnings_context,
             sector_context=sector_context,
             market_context=market_context,
+            portfolio_heat_context=portfolio_heat_context,
         )
-        assessed_candidates.append(
-            assess_signal_candidate(
-                signal,
-                current_equity=current_equity,
-                base_risk_per_trade=config.strategy.risk.risk_per_trade,
-                constraints=constraints,
-                candidate_features=candidate_features,
-                current_positions=current_positions,
-                current_drawdown=float(args.current_drawdown),
-                earnings_date=(
-                    earnings_context.earnings_date
-                    if earnings_context is not None
-                    else None
-                ),
-                earnings_days_away=(
-                    earnings_context.earnings_days_away
-                    if earnings_context is not None
-                    else None
-                ),
-                earnings_entry_block_days=strategy_settings.earnings_entry_block_days,
-                sector_name=(
-                    sector_context.sector_name
-                    if sector_context is not None
-                    else None
-                ),
-                sector_etf_symbol=(
-                    sector_context.sector_etf_symbol
-                    if sector_context is not None
-                    else None
-                ),
-                sector_regime_passed=(
-                    sector_context.sector_regime_passed
-                    if sector_context is not None
-                    else None
-                ),
-                relative_strength_vs_sector=(
-                    sector_context.relative_strength_vs_sector
-                    if sector_context is not None
-                    else None
-                ),
-                sector_relative_strength_window=(
-                    sector_context.relative_strength_window
-                    if sector_context is not None
-                    else None
-                ),
-                market_breadth_entry_floor_200ma=(
-                    strategy_settings.market_breadth_entry_floor_200ma
-                ),
-                vix_entry_block_threshold=(
-                    strategy_settings.vix_entry_block_threshold
-                ),
-                require_sector_regime_for_entries=(
-                    strategy_settings.require_sector_regime_for_entries
-                ),
-                sector_relative_strength_entry_reject_threshold=(
-                    strategy_settings.sector_relative_strength_entry_reject_threshold
-                ),
-            )
+        assessed_candidate = assess_signal_candidate(
+            signal,
+            current_equity=current_equity,
+            base_risk_per_trade=config.strategy.risk.risk_per_trade,
+            constraints=constraints,
+            candidate_features=candidate_features,
+            current_positions=current_positions,
+            current_drawdown=float(args.current_drawdown),
+            earnings_date=(
+                earnings_context.earnings_date
+                if earnings_context is not None
+                else None
+            ),
+            earnings_days_away=(
+                earnings_context.earnings_days_away
+                if earnings_context is not None
+                else None
+            ),
+            earnings_entry_block_days=strategy_settings.earnings_entry_block_days,
+            sector_name=(
+                sector_context.sector_name
+                if sector_context is not None
+                else None
+            ),
+            sector_etf_symbol=(
+                sector_context.sector_etf_symbol
+                if sector_context is not None
+                else None
+            ),
+            sector_regime_passed=(
+                sector_context.sector_regime_passed
+                if sector_context is not None
+                else None
+            ),
+            relative_strength_vs_sector=(
+                sector_context.relative_strength_vs_sector
+                if sector_context is not None
+                else None
+            ),
+            sector_relative_strength_window=(
+                sector_context.relative_strength_window
+                if sector_context is not None
+                else None
+            ),
+            market_breadth_entry_floor_200ma=(
+                strategy_settings.market_breadth_entry_floor_200ma
+            ),
+            vix_entry_block_threshold=(
+                strategy_settings.vix_entry_block_threshold
+            ),
+            require_sector_regime_for_entries=(
+                strategy_settings.require_sector_regime_for_entries
+            ),
+            sector_relative_strength_entry_reject_threshold=(
+                strategy_settings.sector_relative_strength_entry_reject_threshold
+            ),
+        )
+        assessed_candidates.append(assessed_candidate)
+        _roll_forward_portfolio_holding_exposures(
+            portfolio_holding_exposures,
+            assessed_candidate,
+            sector_context=sector_context,
         )
 
     executor = ManualExecutor()
@@ -2539,6 +2574,18 @@ def _run_daily_summary_workflow(
         refresh_cache=args.refresh_cache,
         log_label="daily-summary",
     )
+    current_position_classifications = _load_position_sector_classifications(
+        resolved_current_positions,
+        config=config,
+        env_file=getattr(args, "env_file", None),
+        as_of_date=args.as_of,
+        refresh_cache=args.refresh_cache,
+        log_label="daily-summary",
+    )
+    portfolio_holding_exposures = _build_portfolio_holding_exposures(
+        resolved_current_positions,
+        current_position_classifications,
+    )
     sector_contexts = _load_sector_contexts(
         config=config,
         env_file=getattr(args, "env_file", None),
@@ -2647,6 +2694,18 @@ def _run_daily_summary_workflow(
 
             earnings_context = earnings_contexts.get(member.symbol.strip().upper())
             sector_context = sector_contexts.get(member.symbol.strip().upper())
+            portfolio_heat_context = build_portfolio_heat_context(
+                portfolio_holding_exposures,
+                candidate_sector=(
+                    sector_context.sector_name if sector_context is not None else None
+                ),
+                candidate_industry=(
+                    sector_context.industry_name if sector_context is not None else None
+                ),
+                max_positions_per_sector=strategy_settings.max_positions_per_sector,
+                max_same_industry_positions=strategy_settings.max_same_industry_positions,
+                max_sector_notional_pct=strategy_settings.max_sector_notional_pct,
+            )
             if strategy_settings.require_sector_regime_for_entries and sector_context is None:
                 _warn_missing_sector_context_for_entry(
                     member.symbol,
@@ -2681,69 +2740,76 @@ def _run_daily_summary_workflow(
                 earnings_context=earnings_context,
                 sector_context=sector_context,
                 market_context=market_context,
+                portfolio_heat_context=portfolio_heat_context,
+            )
+            assessed_candidate = assess_signal_candidate(
+                signal,
+                current_equity=current_equity,
+                base_risk_per_trade=preset.risk_per_trade,
+                constraints=constraints,
+                candidate_features=candidate_features,
+                current_positions=resolved_current_positions,
+                current_drawdown=float(args.current_drawdown),
+                earnings_date=(
+                    earnings_context.earnings_date
+                    if earnings_context is not None
+                    else None
+                ),
+                earnings_days_away=(
+                    earnings_context.earnings_days_away
+                    if earnings_context is not None
+                    else None
+                ),
+                earnings_entry_block_days=strategy_settings.earnings_entry_block_days,
+                sector_name=(
+                    sector_context.sector_name
+                    if sector_context is not None
+                    else None
+                ),
+                sector_etf_symbol=(
+                    sector_context.sector_etf_symbol
+                    if sector_context is not None
+                    else None
+                ),
+                sector_regime_passed=(
+                    sector_context.sector_regime_passed
+                    if sector_context is not None
+                    else None
+                ),
+                relative_strength_vs_sector=(
+                    sector_context.relative_strength_vs_sector
+                    if sector_context is not None
+                    else None
+                ),
+                sector_relative_strength_window=(
+                    sector_context.relative_strength_window
+                    if sector_context is not None
+                    else None
+                ),
+                market_breadth_entry_floor_200ma=(
+                    strategy_settings.market_breadth_entry_floor_200ma
+                ),
+                vix_entry_block_threshold=(
+                    strategy_settings.vix_entry_block_threshold
+                ),
+                require_sector_regime_for_entries=(
+                    strategy_settings.require_sector_regime_for_entries
+                ),
+                sector_relative_strength_entry_reject_threshold=(
+                    strategy_settings.sector_relative_strength_entry_reject_threshold
+                ),
             )
             evaluations.append(
                 PresetCandidateEvaluation(
                     preset_name=preset.name,
                     parameter_id=preset.parameter_id,
-                    candidate=assess_signal_candidate(
-                        signal,
-                        current_equity=current_equity,
-                        base_risk_per_trade=preset.risk_per_trade,
-                        constraints=constraints,
-                        candidate_features=candidate_features,
-                        current_positions=resolved_current_positions,
-                        current_drawdown=float(args.current_drawdown),
-                        earnings_date=(
-                            earnings_context.earnings_date
-                            if earnings_context is not None
-                            else None
-                        ),
-                        earnings_days_away=(
-                            earnings_context.earnings_days_away
-                            if earnings_context is not None
-                            else None
-                        ),
-                        earnings_entry_block_days=strategy_settings.earnings_entry_block_days,
-                        sector_name=(
-                            sector_context.sector_name
-                            if sector_context is not None
-                            else None
-                        ),
-                        sector_etf_symbol=(
-                            sector_context.sector_etf_symbol
-                            if sector_context is not None
-                            else None
-                        ),
-                        sector_regime_passed=(
-                            sector_context.sector_regime_passed
-                            if sector_context is not None
-                            else None
-                        ),
-                        relative_strength_vs_sector=(
-                            sector_context.relative_strength_vs_sector
-                            if sector_context is not None
-                            else None
-                        ),
-                        sector_relative_strength_window=(
-                            sector_context.relative_strength_window
-                            if sector_context is not None
-                            else None
-                        ),
-                        market_breadth_entry_floor_200ma=(
-                            strategy_settings.market_breadth_entry_floor_200ma
-                        ),
-                        vix_entry_block_threshold=(
-                            strategy_settings.vix_entry_block_threshold
-                        ),
-                        require_sector_regime_for_entries=(
-                            strategy_settings.require_sector_regime_for_entries
-                        ),
-                        sector_relative_strength_entry_reject_threshold=(
-                            strategy_settings.sector_relative_strength_entry_reject_threshold
-                        ),
-                    ),
+                    candidate=assessed_candidate,
                 )
+            )
+            _roll_forward_portfolio_holding_exposures(
+                portfolio_holding_exposures,
+                assessed_candidate,
+                sector_context=sector_context,
             )
 
     symbol_observations = _candidate_journal_observations(evaluations)
@@ -4208,6 +4274,81 @@ def _warn_missing_sector_context_for_entry(
         "Sector regime enforcement is enabled but sector context is unavailable for %s during %s; proceeding without sector gate.",
         symbol,
         context_label,
+    )
+
+
+def _load_position_sector_classifications(
+    current_positions: Sequence[ExistingPosition],
+    *,
+    config: AppConfig,
+    env_file: Path | None,
+    as_of_date: date,
+    refresh_cache: bool,
+    log_label: str,
+) -> dict[str, SymbolSectorClassification]:
+    if not current_positions:
+        return {}
+
+    try:
+        return load_symbol_sector_classifications(
+            [position.symbol for position in current_positions],
+            config=config,
+            env_file=env_file,
+            as_of_date=as_of_date,
+            refresh_cache=refresh_cache,
+        )
+    except (DataProviderConfigurationError, DataProviderError, ValueError) as exc:
+        LOGGER.warning("Portfolio heat context unavailable for %s: %s", log_label, exc)
+        return {}
+
+
+def _build_portfolio_holding_exposures(
+    current_positions: Sequence[ExistingPosition],
+    classifications: Mapping[str, SymbolSectorClassification],
+) -> list[PortfolioHoldingExposure]:
+    exposures: list[PortfolioHoldingExposure] = []
+    for position in sorted(current_positions, key=lambda current_position: current_position.symbol):
+        classification = classifications.get(position.symbol.strip().upper())
+        exposures.append(
+            PortfolioHoldingExposure(
+                symbol=position.symbol,
+                approximate_notional=position.average_entry_price * position.shares,
+                sector_name=classification.sector if classification is not None else None,
+                industry_name=classification.industry if classification is not None else None,
+            )
+        )
+    return exposures
+
+
+def _roll_forward_portfolio_holding_exposures(
+    portfolio_holding_exposures: list[PortfolioHoldingExposure],
+    candidate: RiskAssessedCandidate,
+    *,
+    sector_context: SectorFeatureContext | None,
+) -> None:
+    """Update the same-run exposure baseline after an approved candidate."""
+
+    if (
+        not candidate.approved
+        or not candidate.sizing.is_valid
+        or candidate.sizing.notional_value <= 0
+    ):
+        return
+
+    normalized_symbol = candidate.signal.symbol.strip().upper()
+    if any(
+        exposure.symbol.strip().upper() == normalized_symbol
+        for exposure in portfolio_holding_exposures
+    ):
+        return
+
+    portfolio_holding_exposures.append(
+        PortfolioHoldingExposure(
+            symbol=normalized_symbol,
+            approximate_notional=candidate.sizing.notional_value,
+            sector_name=sector_context.sector_name if sector_context is not None else None,
+            industry_name=sector_context.industry_name if sector_context is not None else None,
+        )
     )
 
 

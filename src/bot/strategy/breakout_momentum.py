@@ -53,6 +53,9 @@ class BreakoutMomentumSettings:
     sector_relative_strength_window: int = 20
     sector_relative_strength_entry_reject_threshold: float = -0.05
     sector_relative_strength_watch_threshold: float = -0.05
+    max_positions_per_sector: int | None = 3
+    max_same_industry_positions: int | None = 2
+    max_sector_notional_pct: float | None = None
 
     @classmethod
     def from_configs(
@@ -93,6 +96,9 @@ class BreakoutMomentumSettings:
             sector_relative_strength_watch_threshold=(
                 signal_config.sector_relative_strength_watch_threshold
             ),
+            max_positions_per_sector=signal_config.max_positions_per_sector,
+            max_same_industry_positions=signal_config.max_same_industry_positions,
+            max_sector_notional_pct=signal_config.max_sector_notional_pct,
         )
 
     def __post_init__(self) -> None:
@@ -152,6 +158,23 @@ class BreakoutMomentumSettings:
         if self.sector_relative_strength_watch_threshold > 0:
             raise ValueError(
                 "sector_relative_strength_watch_threshold must be less than or equal to zero."
+            )
+        if self.max_positions_per_sector is not None and self.max_positions_per_sector <= 0:
+            raise ValueError(
+                "max_positions_per_sector must be greater than zero when provided."
+            )
+        if (
+            self.max_same_industry_positions is not None
+            and self.max_same_industry_positions <= 0
+        ):
+            raise ValueError(
+                "max_same_industry_positions must be greater than zero when provided."
+            )
+        if self.max_sector_notional_pct is not None and (
+            self.max_sector_notional_pct <= 0 or self.max_sector_notional_pct >= 1
+        ):
+            raise ValueError(
+                "max_sector_notional_pct must be between zero and one when provided."
             )
         if self.regime_filter_mode not in VALID_REGIME_FILTER_MODES:
             raise ValueError(

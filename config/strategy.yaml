@@ -20,6 +20,9 @@ signals:
   sector_relative_strength_window: 20
   sector_relative_strength_entry_reject_threshold: -0.05
   sector_relative_strength_watch_threshold: -0.05
+  max_positions_per_sector: 3
+  max_same_industry_positions: 2
+  max_sector_notional_pct: null
 
 risk:
   risk_per_trade: 0.01

@@ -19,7 +19,7 @@ from bot.data.position_trajectory import (
     PositionTrajectoryObservation,
     default_position_trajectory_journal_path,
 )
-from bot.data.sector_context import SectorFeatureContext
+from bot.data.sector_context import SectorFeatureContext, SymbolSectorClassification
 from bot.data.providers import DataProviderError
 from bot.execution.manual_executor import ManualExecutor
 from bot.features import build_market_context
@@ -2459,6 +2459,301 @@ def test_run_daily_summary_workflow_rejects_candidate_on_weak_sector_context(
     assert "sector=XLK (below trend filter, lags by 4.0% over 20d)" in payload["rejected_candidates"][0]["rationale"]
 
 
+def test_run_daily_summary_workflow_rejects_candidate_on_portfolio_heat_and_reports_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config()
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+    current_positions = [
+        ExistingPosition(symbol="MSFT", shares=10, average_entry_price=100.0),
+        ExistingPosition(symbol="NVDA", shares=10, average_entry_price=100.0),
+        ExistingPosition(symbol="AMD", shares=10, average_entry_price=100.0),
+    ]
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts",
+        lambda **kwargs: {
+            "AAPL": SectorFeatureContext(
+                symbol="AAPL",
+                sector_name="Technology",
+                industry_name="Software",
+                sector_etf_symbol="XLK",
+                sector_regime_passed=True,
+                sector_return=0.04,
+                symbol_return=0.06,
+                relative_strength_vs_sector=0.02,
+                relative_strength_window=20,
+                sector_trend_state="supportive",
+                mapping_source="test",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_position_sector_classifications",
+        lambda *args, **kwargs: {
+            "MSFT": SymbolSectorClassification(
+                symbol="MSFT",
+                sector="Technology",
+                industry="Software",
+                sector_etf_symbol="XLK",
+                mapping_source="test",
+            ),
+            "NVDA": SymbolSectorClassification(
+                symbol="NVDA",
+                sector="Technology",
+                industry="Semiconductors",
+                sector_etf_symbol="XLK",
+                mapping_source="test",
+            ),
+            "AMD": SymbolSectorClassification(
+                symbol="AMD",
+                sector="Technology",
+                industry="Semiconductors",
+                sector_etf_symbol="XLK",
+                mapping_source="test",
+            ),
+        },
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=101.0,
+            stop_hint=96.0,
+            metadata={"prior_high": 100.0, "relative_volume": 1.8},
+        ),
+    )
+
+    workflow = main_module._run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=current_positions,
+    )
+    summary = workflow["summary"]
+    payload = summary.to_dict()
+    brief = build_market_monitor_report(
+        as_of_date=date(2024, 1, 5),
+        daily_summary=summary,
+    ).to_brief()
+
+    assert payload["approved_count"] == 0
+    assert payload["rejected_count"] == 1
+    assert payload["rejected_candidates"][0]["rejection_reasons"] == [
+        "Portfolio already has 3 Technology positions; adding another would exceed the per-sector limit of 3."
+    ]
+    assert payload["rejected_candidates"][0]["metadata"]["portfolio_heat_context"][
+        "same_sector_position_count"
+    ] == 3
+    assert "portfolio already has 3 technology positions" in brief.lower()
+
+
+def test_run_daily_summary_workflow_serializes_projected_portfolio_heat_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config()
+    config = replace(
+        config,
+        strategy=replace(
+            config.strategy,
+            signals=replace(
+                config.strategy.signals,
+                max_positions_per_sector=4,
+                max_same_industry_positions=4,
+                max_sector_notional_pct=0.60,
+            ),
+        ),
+    )
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+    current_positions = [
+        ExistingPosition(symbol="MSFT", shares=100, average_entry_price=100.0),
+        ExistingPosition(symbol="NVDA", shares=150, average_entry_price=100.0),
+        ExistingPosition(symbol="JPM", shares=250, average_entry_price=100.0),
+    ]
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts",
+        lambda **kwargs: {
+            "AAPL": SectorFeatureContext(
+                symbol="AAPL",
+                sector_name="Technology",
+                industry_name="Software",
+                sector_etf_symbol="XLK",
+                sector_regime_passed=True,
+                sector_return=0.03,
+                symbol_return=0.05,
+                relative_strength_vs_sector=0.02,
+                relative_strength_window=20,
+                sector_trend_state="supportive",
+                mapping_source="test",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_position_sector_classifications",
+        lambda *args, **kwargs: {
+            "MSFT": SymbolSectorClassification(
+                symbol="MSFT",
+                sector="Technology",
+                industry="Software",
+                sector_etf_symbol="XLK",
+                mapping_source="test",
+            ),
+            "NVDA": SymbolSectorClassification(
+                symbol="NVDA",
+                sector="Technology",
+                industry="Semiconductors",
+                sector_etf_symbol="XLK",
+                mapping_source="test",
+            ),
+            "JPM": SymbolSectorClassification(
+                symbol="JPM",
+                sector="Financials",
+                industry="Banks",
+                sector_etf_symbol="XLF",
+                mapping_source="test",
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "compute_market_breadth_from_frames",
+        lambda *args, **kwargs: {
+            "market_breadth_pct_above_200ma": 0.72,
+            "market_breadth_pct_above_50ma": 0.76,
+            "market_breadth_state": "healthy",
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context",
+        lambda **kwargs: {
+            "vix_close": 20.0,
+            "vix_sma_short": 19.5,
+            "vix_sma_long": 18.8,
+            "volatility_regime_state": "normal",
+            "volatility_regime_risk_off": False,
+        },
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=100.0,
+            stop_hint=95.0,
+            metadata={"prior_high": 99.0, "relative_volume": 1.8},
+        ),
+    )
+
+    workflow = main_module._run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=current_positions,
+    )
+    payload = workflow["summary"].to_dict()
+    rejected_candidate = payload["rejected_candidates"][0]
+    projection = rejected_candidate["metadata"]["portfolio_heat_projection"]
+
+    assert rejected_candidate["rejection_reasons"] == [
+        "Technology already accounts for 50.0% of approximate portfolio notional; adding this position would raise it to 64.3%, above the 60% limit."
+    ]
+    assert projection["projected_sector_notional_pct"] == pytest.approx(45_000.0 / 70_000.0)
+    assert projection["sector_notional_concentration_risk"] is True
+    assert projection["sector_concentration_risk"] is True
+    assert projection["crowded_exposure_bucket"] is True
+
+
 def test_run_daily_summary_workflow_warns_and_proceeds_without_sector_context(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -3061,6 +3356,160 @@ def test_handle_generate_orders_blocks_candidate_near_earnings(
         "Upcoming earnings on 2024-01-09 are 2 trading days away; new entries are blocked within 3 trading days."
     ]
     assert report_payload["rows"][0]["metadata"]["signal_metadata"]["earnings_days_away"] == 2
+
+
+def test_handle_generate_orders_rolls_forward_approved_sector_exposure_between_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate_path = tmp_path / "candidates.txt"
+    candidate_path.write_text("AAPL\nSNOW\n", encoding="utf-8")
+    output_dir = tmp_path / "orders"
+    args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(output_dir),
+            "--format",
+            "json",
+        ]
+    )
+    current_positions = [
+        ExistingPosition(symbol="MSFT", shares=100, average_entry_price=100.0),
+        ExistingPosition(symbol="NVDA", shares=100, average_entry_price=100.0),
+    ]
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [99.0],
+                    "high": [101.0],
+                    "low": [98.0],
+                    "close": [100.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: current_positions)
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts",
+        lambda **kwargs: {
+            "AAPL": SectorFeatureContext(
+                symbol="AAPL",
+                sector_name="Technology",
+                industry_name="Software",
+                sector_etf_symbol="XLK",
+                sector_regime_passed=True,
+                sector_return=0.03,
+                symbol_return=0.05,
+                relative_strength_vs_sector=0.02,
+                relative_strength_window=20,
+                sector_trend_state="supportive",
+                mapping_source="test",
+            ),
+            "SNOW": SectorFeatureContext(
+                symbol="SNOW",
+                sector_name="Technology",
+                industry_name="Semiconductors",
+                sector_etf_symbol="XLK",
+                sector_regime_passed=True,
+                sector_return=0.03,
+                symbol_return=0.05,
+                relative_strength_vs_sector=0.02,
+                relative_strength_window=20,
+                sector_trend_state="supportive",
+                mapping_source="test",
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_position_sector_classifications",
+        lambda *args, **kwargs: {
+            "MSFT": SymbolSectorClassification(
+                symbol="MSFT",
+                sector="Technology",
+                industry="Software",
+                sector_etf_symbol="XLK",
+                mapping_source="test",
+            ),
+            "NVDA": SymbolSectorClassification(
+                symbol="NVDA",
+                sector="Technology",
+                industry="Semiconductors",
+                sector_etf_symbol="XLK",
+                mapping_source="test",
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "compute_market_breadth_from_frames",
+        lambda *args, **kwargs: {
+            "market_breadth_pct_above_200ma": 0.72,
+            "market_breadth_pct_above_50ma": 0.76,
+            "market_breadth_state": "healthy",
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context",
+        lambda **kwargs: {
+            "vix_close": 20.0,
+            "vix_sma_short": 19.5,
+            "vix_sma_long": 18.8,
+            "volatility_regime_state": "normal",
+            "volatility_regime_risk_off": False,
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=100.0,
+            stop_hint=95.0,
+            metadata={"prior_high": 99.0, "relative_volume": 1.8},
+        ),
+    )
+
+    result = main_module._handle_generate_orders(args)
+    payload = json.loads(capsys.readouterr().out)
+    report_payload = json.loads(
+        (output_dir / "daily_signal_report.json").read_text(encoding="utf-8")
+    )
+
+    assert result == 0
+    assert payload["signal_count"] == 2
+    assert payload["approved_order_count"] == 1
+    assert payload["rejected_signal_count"] == 1
+    assert report_payload["rows"][0]["status"] == "approved"
+    assert report_payload["rows"][1]["status"] == "rejected"
+    assert report_payload["rows"][1]["rejection_reasons"] == [
+        "Portfolio already has 3 Technology positions; adding another would exceed the per-sector limit of 3."
+    ]
 
 
 def test_handle_daily_summary_uses_workflow_universe_count(

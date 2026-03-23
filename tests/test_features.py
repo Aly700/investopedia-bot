@@ -7,6 +7,10 @@ import pytest
 
 from bot.data.earnings import EarningsRiskContext
 from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
+from bot.data.portfolio_heat import (
+    PortfolioHoldingExposure,
+    build_portfolio_heat_context,
+)
 from bot.data.position_trajectory import PositionTrajectoryFeatures
 from bot.data.sector_context import SectorFeatureContext
 from bot.features import (
@@ -117,6 +121,51 @@ def test_build_candidate_features_captures_current_contexts() -> None:
     assert features.market_context.vix_close == pytest.approx(18.4)
     assert features.market_context.volatility_regime_state == "calm"
     assert features.market_context.volatility_regime_risk_off is False
+
+
+def test_build_candidate_features_captures_portfolio_heat_context() -> None:
+    signal = StrategySignal(
+        strategy_name="breakout_momentum:standard_breakout",
+        symbol="AAPL",
+        date=date(2024, 1, 5),
+        side="BUY",
+        entry_reason="close_above_prior_20_day_high",
+        entry_price_hint=101.0,
+        stop_hint=96.0,
+        metadata={"prior_high": 100.0, "relative_volume": 1.9},
+    )
+    portfolio_heat_context = build_portfolio_heat_context(
+        [
+            PortfolioHoldingExposure(
+                symbol="MSFT",
+                approximate_notional=10_000.0,
+                sector_name="Technology",
+                industry_name="Software",
+            ),
+            PortfolioHoldingExposure(
+                symbol="NVDA",
+                approximate_notional=15_000.0,
+                sector_name="Technology",
+                industry_name="Semiconductors",
+            ),
+        ],
+        candidate_sector="Technology",
+        candidate_industry="Software",
+        max_positions_per_sector=3,
+        max_same_industry_positions=2,
+    )
+
+    features = build_candidate_features(
+        signal,
+        as_of_date=date(2024, 1, 5),
+        sector_name="Technology",
+        industry_name="Software",
+        portfolio_heat_context=portfolio_heat_context,
+    )
+
+    assert features.portfolio_heat_context is not None
+    assert features.portfolio_heat_context.same_sector_position_count == 2
+    assert features.portfolio_heat_context.same_industry_position_count == 1
 
 
 def test_compute_market_breadth_from_frames_is_deterministic() -> None:

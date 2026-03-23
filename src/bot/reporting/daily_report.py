@@ -1641,6 +1641,12 @@ def _row_from_candidate(
     }
     if candidate.features is not None and candidate.features.market_context is not None:
         metadata["market_context"] = candidate.features.market_context.to_dict()
+    if candidate.features is not None and candidate.features.portfolio_heat_context is not None:
+        metadata["portfolio_heat_context"] = (
+            candidate.features.portfolio_heat_context.to_dict()
+        )
+    if candidate.portfolio_heat_projection is not None:
+        metadata["portfolio_heat_projection"] = candidate.portfolio_heat_projection.to_dict()
     if candidate.existing_position is not None:
         metadata["existing_position"] = candidate.existing_position.to_dict()
     if order is not None:
@@ -1687,6 +1693,12 @@ def _daily_research_row_from_evaluation(
     }
     if candidate.features is not None and candidate.features.market_context is not None:
         metadata["market_context"] = candidate.features.market_context.to_dict()
+    if candidate.features is not None and candidate.features.portfolio_heat_context is not None:
+        metadata["portfolio_heat_context"] = (
+            candidate.features.portfolio_heat_context.to_dict()
+        )
+    if candidate.portfolio_heat_projection is not None:
+        metadata["portfolio_heat_projection"] = candidate.portfolio_heat_projection.to_dict()
     if candidate.existing_position is not None:
         metadata["existing_position"] = candidate.existing_position.to_dict()
     if order is not None:

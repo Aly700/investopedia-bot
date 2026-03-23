@@ -7,6 +7,10 @@ from pathlib import Path
 import pytest
 
 from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
+from bot.data.portfolio_heat import (
+    PortfolioHoldingExposure,
+    build_portfolio_heat_context,
+)
 from bot.data.position_trajectory import PositionTrajectoryFeatures
 from bot.features import (
     apply_intraday_trajectory_features,
@@ -289,6 +293,292 @@ def test_assess_signal_candidate_does_not_block_unknown_sector_regime() -> None:
 
     assert candidate.approved is True
     assert candidate.rejection_reasons == ()
+
+
+def test_assess_signal_candidate_blocks_sector_exposure_when_sector_bucket_is_crowded() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=10,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        sector_name="Technology",
+        industry_name="Software",
+        portfolio_heat_context=build_portfolio_heat_context(
+            [
+                PortfolioHoldingExposure(
+                    symbol="MSFT",
+                    approximate_notional=10_000.0,
+                    sector_name="Technology",
+                    industry_name="Software",
+                ),
+                PortfolioHoldingExposure(
+                    symbol="NVDA",
+                    approximate_notional=15_000.0,
+                    sector_name="Technology",
+                    industry_name="Semiconductors",
+                ),
+                PortfolioHoldingExposure(
+                    symbol="AMD",
+                    approximate_notional=12_000.0,
+                    sector_name="Technology",
+                    industry_name="Semiconductors",
+                ),
+            ],
+            candidate_sector="Technology",
+            candidate_industry="Software",
+            max_positions_per_sector=3,
+            max_same_industry_positions=4,
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Portfolio already has 3 Technology positions; adding another would exceed the per-sector limit of 3.",
+    )
+
+
+def test_assess_signal_candidate_allows_acceptable_sector_exposure() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=10,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        sector_name="Technology",
+        industry_name="Software",
+        portfolio_heat_context=build_portfolio_heat_context(
+            [
+                PortfolioHoldingExposure(
+                    symbol="MSFT",
+                    approximate_notional=10_000.0,
+                    sector_name="Technology",
+                    industry_name="Software",
+                ),
+                PortfolioHoldingExposure(
+                    symbol="JPM",
+                    approximate_notional=15_000.0,
+                    sector_name="Financials",
+                    industry_name="Banks",
+                ),
+            ],
+            candidate_sector="Technology",
+            candidate_industry="Software",
+            max_positions_per_sector=3,
+            max_same_industry_positions=2,
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+    )
+
+    assert candidate.approved is True
+    assert candidate.rejection_reasons == ()
+
+
+def test_assess_signal_candidate_blocks_same_industry_crowding() -> None:
+    signal = _signal(symbol="SNOW", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=10,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        sector_name="Technology",
+        industry_name="Software",
+        portfolio_heat_context=build_portfolio_heat_context(
+            [
+                PortfolioHoldingExposure(
+                    symbol="MSFT",
+                    approximate_notional=10_000.0,
+                    sector_name="Technology",
+                    industry_name="Software",
+                ),
+                PortfolioHoldingExposure(
+                    symbol="CRM",
+                    approximate_notional=12_000.0,
+                    sector_name="Technology",
+                    industry_name="Software",
+                ),
+            ],
+            candidate_sector="Technology",
+            candidate_industry="Software",
+            max_positions_per_sector=4,
+            max_same_industry_positions=2,
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Portfolio already has 2 Software positions; adding another would exceed the same-industry limit of 2.",
+    )
+
+
+def test_assess_signal_candidate_blocks_sector_notional_concentration_when_enabled() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=10,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        sector_name="Technology",
+        industry_name="Software",
+        portfolio_heat_context=build_portfolio_heat_context(
+            [
+                PortfolioHoldingExposure(
+                    symbol="MSFT",
+                    approximate_notional=10_000.0,
+                    sector_name="Technology",
+                    industry_name="Software",
+                ),
+                PortfolioHoldingExposure(
+                    symbol="NVDA",
+                    approximate_notional=15_000.0,
+                    sector_name="Technology",
+                    industry_name="Semiconductors",
+                ),
+                PortfolioHoldingExposure(
+                    symbol="JPM",
+                    approximate_notional=25_000.0,
+                    sector_name="Financials",
+                    industry_name="Banks",
+                ),
+            ],
+            candidate_sector="Technology",
+            candidate_industry="Software",
+            max_positions_per_sector=4,
+            max_same_industry_positions=4,
+            max_sector_notional_pct=0.60,
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Technology already accounts for 50.0% of approximate portfolio notional; adding this position would raise it to 64.3%, above the 60% limit.",
+    )
+
+
+def test_assess_signal_candidate_does_not_block_missing_portfolio_heat_context() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=10,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        sector_name="Technology",
+        industry_name="Software",
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+    )
+
+    assert candidate.approved is True
+    assert candidate.rejection_reasons == ()
+
+
+def test_assess_signal_candidate_surfaces_sector_count_rejection_when_sizing_is_invalid() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=100.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=10,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        sector_name="Technology",
+        industry_name="Software",
+        portfolio_heat_context=build_portfolio_heat_context(
+            [
+                PortfolioHoldingExposure(
+                    symbol="MSFT",
+                    approximate_notional=10_000.0,
+                    sector_name="Technology",
+                    industry_name="Software",
+                ),
+                PortfolioHoldingExposure(
+                    symbol="NVDA",
+                    approximate_notional=15_000.0,
+                    sector_name="Technology",
+                    industry_name="Semiconductors",
+                ),
+                PortfolioHoldingExposure(
+                    symbol="AMD",
+                    approximate_notional=12_000.0,
+                    sector_name="Technology",
+                    industry_name="Semiconductors",
+                ),
+            ],
+            candidate_sector="Technology",
+            candidate_industry="Software",
+            max_positions_per_sector=3,
+            max_same_industry_positions=4,
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Stop price (100.0) must be below entry price (100.0) for a long position.",
+        "Portfolio already has 3 Technology positions; adding another would exceed the per-sector limit of 3.",
+    )
+    assert candidate.portfolio_heat_projection is not None
+    assert candidate.portfolio_heat_projection.sector_count_concentration_risk is True
 
 
 def test_assess_signal_candidate_blocks_weak_market_breadth() -> None:

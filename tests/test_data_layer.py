@@ -32,6 +32,11 @@ from bot.data.intraday_state_journal import (
     update_intraday_state_journal,
     write_intraday_state_journal,
 )
+from bot.data.portfolio_heat import (
+    PortfolioHoldingExposure,
+    build_portfolio_heat_context,
+    project_portfolio_heat_context,
+)
 from bot.data.position_trajectory import (
     PositionTrajectoryObservation,
     build_position_trajectory_features,
@@ -1418,6 +1423,115 @@ def test_position_trajectory_features_count_repeated_watch_states() -> None:
     assert trajectory.consecutive_watch_closely_days == 2
     assert trajectory.consecutive_hold_days == 0
     assert trajectory.consecutive_stale_position_days == 2
+
+
+def test_build_portfolio_heat_context_tracks_sector_counts_and_notional_share() -> None:
+    context = build_portfolio_heat_context(
+        [
+            PortfolioHoldingExposure(
+                symbol="MSFT",
+                approximate_notional=10_000.0,
+                sector_name="Technology",
+                industry_name="Software",
+            ),
+            PortfolioHoldingExposure(
+                symbol="NVDA",
+                approximate_notional=15_000.0,
+                sector_name="Technology",
+                industry_name="Semiconductors",
+            ),
+            PortfolioHoldingExposure(
+                symbol="JPM",
+                approximate_notional=25_000.0,
+                sector_name="Financials",
+                industry_name="Banks",
+            ),
+        ],
+        candidate_sector="Technology",
+        candidate_industry="Software",
+        max_positions_per_sector=3,
+        max_same_industry_positions=2,
+        max_sector_notional_pct=0.60,
+    )
+
+    assert context.current_position_count == 3
+    assert context.same_sector_position_count == 2
+    assert context.same_industry_position_count == 1
+    assert context.projected_same_sector_position_count == 3
+    assert context.sector_concentration_risk is False
+    assert context.sector_notional_pct_by_sector["Technology"] == pytest.approx(0.50)
+
+
+def test_project_portfolio_heat_context_flags_projected_notional_breach() -> None:
+    context = build_portfolio_heat_context(
+        [
+            PortfolioHoldingExposure(
+                symbol="MSFT",
+                approximate_notional=10_000.0,
+                sector_name="Technology",
+                industry_name="Software",
+            ),
+            PortfolioHoldingExposure(
+                symbol="NVDA",
+                approximate_notional=15_000.0,
+                sector_name="Technology",
+                industry_name="Semiconductors",
+            ),
+            PortfolioHoldingExposure(
+                symbol="JPM",
+                approximate_notional=25_000.0,
+                sector_name="Financials",
+                industry_name="Banks",
+            ),
+        ],
+        candidate_sector="Technology",
+        candidate_industry="Software",
+        max_positions_per_sector=4,
+        max_same_industry_positions=3,
+        max_sector_notional_pct=0.60,
+    )
+
+    projection = project_portfolio_heat_context(
+        context,
+        candidate_notional_value=20_000.0,
+    )
+
+    assert projection.projected_sector_notional_pct == pytest.approx(45_000.0 / 70_000.0)
+    assert projection.sector_notional_concentration_risk is True
+    assert projection.sector_concentration_risk is True
+    assert projection.crowded_exposure_bucket is True
+
+
+def test_build_portfolio_heat_context_normalizes_sector_labels_case_insensitively() -> None:
+    context = build_portfolio_heat_context(
+        [
+            PortfolioHoldingExposure(
+                symbol="MSFT",
+                approximate_notional=10_000.0,
+                sector_name="TECHNOLOGY",
+                industry_name="SOFTWARE",
+            ),
+            PortfolioHoldingExposure(
+                symbol="NVDA",
+                approximate_notional=15_000.0,
+                sector_name="Technology",
+                industry_name="Semiconductors",
+            ),
+        ],
+        candidate_sector="technology",
+        candidate_industry="software",
+        max_positions_per_sector=2,
+        max_same_industry_positions=1,
+    )
+
+    assert context.candidate_sector == "Technology"
+    assert context.candidate_industry == "Software"
+    assert context.same_sector_position_count == 2
+    assert context.same_industry_position_count == 1
+    assert context.projected_same_sector_position_count == 3
+    assert context.sector_concentration_risk is True
+    assert context.correlated_exposure_risk is True
+    assert context.sector_position_count_by_sector["Technology"] == 2
 
 
 def test_load_candidate_symbols_supports_text_and_csv(tmp_path: Path) -> None:

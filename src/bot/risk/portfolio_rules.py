@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from bot.config import RiskConfig, RulesConfig
+from bot.data.portfolio_heat import (
+    PortfolioHeatContext,
+    PortfolioHeatProjection,
+    project_portfolio_heat_context,
+)
 from bot.features import (
     CandidateFeatures,
     MarketContext,
@@ -177,6 +182,7 @@ class RiskAssessedCandidate:
     rejection_reasons: tuple[str, ...] = ()
     existing_position: ExistingPosition | None = None
     features: CandidateFeatures | None = None
+    portfolio_heat_projection: PortfolioHeatProjection | None = None
 
 
 @dataclass(frozen=True)
@@ -1242,6 +1248,7 @@ def assess_signal_candidate(
     base_risk_per_trade: float,
     constraints: PortfolioConstraints,
     candidate_features: CandidateFeatures | None = None,
+    portfolio_heat_context: PortfolioHeatContext | None = None,
     current_positions: Sequence[ExistingPosition] = (),
     current_drawdown: float = 0.0,
     stop_price: float | None = None,
@@ -1265,6 +1272,10 @@ def assess_signal_candidate(
     if candidate_features is not None and market_context is not None:
         raise ValueError(
             "Pass market_context via candidate_features, not as a separate argument."
+        )
+    if candidate_features is not None and portfolio_heat_context is not None:
+        raise ValueError(
+            "Pass portfolio_heat_context via candidate_features, not as a separate argument."
         )
 
     existing_position = _find_existing_position(current_positions, signal.symbol)
@@ -1293,6 +1304,7 @@ def assess_signal_candidate(
         relative_strength_vs_sector=relative_strength_vs_sector,
         sector_relative_strength_window=sector_relative_strength_window,
         market_context=market_context,
+        portfolio_heat_context=portfolio_heat_context,
     )
 
     if resolved_stop_price is None:
@@ -1388,6 +1400,12 @@ def _assess_signal_candidate_from_features(
         stop_price=stop_price,
         max_position_pct_equity=constraints.max_position_pct_equity,
     )
+    portfolio_heat_projection = project_portfolio_heat_context(
+        features.portfolio_heat_context,
+        candidate_notional_value=(
+            sizing.notional_value if sizing.is_valid and sizing.notional_value > 0 else None
+        ),
+    )
 
     rejection_reasons: list[str] = []
     if not sizing.is_valid and sizing.rejection_reason is not None:
@@ -1480,6 +1498,38 @@ def _assess_signal_candidate_from_features(
             )
         )
 
+    if features.portfolio_heat_context is not None:
+        heat_context = features.portfolio_heat_context
+        if heat_context.sector_concentration_risk:
+            rejection_reasons.append(
+                _sector_exposure_entry_reject_reason(
+                    candidate_sector=heat_context.candidate_sector,
+                    same_sector_position_count=heat_context.same_sector_position_count,
+                    max_positions_per_sector=heat_context.max_positions_per_sector,
+                )
+            )
+        if sizing.is_valid and portfolio_heat_projection.sector_notional_concentration_risk:
+            rejection_reasons.append(
+                _sector_notional_exposure_entry_reject_reason(
+                    candidate_sector=heat_context.candidate_sector,
+                    current_sector_notional_pct=heat_context.sector_notional_pct_by_sector.get(
+                        heat_context.candidate_sector or "",
+                    ),
+                    projected_sector_notional_pct=(
+                        portfolio_heat_projection.projected_sector_notional_pct
+                    ),
+                    max_sector_notional_pct=heat_context.max_sector_notional_pct,
+                )
+            )
+        if heat_context.correlated_exposure_risk:
+            rejection_reasons.append(
+                _industry_exposure_entry_reject_reason(
+                    candidate_industry=heat_context.candidate_industry,
+                    same_industry_position_count=heat_context.same_industry_position_count,
+                    max_same_industry_positions=heat_context.max_same_industry_positions,
+                )
+            )
+
     approved = sizing.is_valid and not rejection_reasons
     return RiskAssessedCandidate(
         signal=signal,
@@ -1491,6 +1541,7 @@ def _assess_signal_candidate_from_features(
         rejection_reasons=tuple(rejection_reasons),
         existing_position=existing_position,
         features=features,
+        portfolio_heat_projection=portfolio_heat_projection,
     )
 
 
@@ -1613,6 +1664,65 @@ def _sector_entry_lag_reject_reason(
     return (
         f"Stock is lagging {target} by {abs(relative_strength_vs_sector):.1%}{window_text}; "
         "new entries require sector-relative strength."
+    )
+
+
+def _sector_exposure_entry_reject_reason(
+    *,
+    candidate_sector: str | None,
+    same_sector_position_count: int,
+    max_positions_per_sector: int | None,
+) -> str:
+    sector_label = candidate_sector or "the same sector"
+    limit_text = (
+        str(max_positions_per_sector)
+        if max_positions_per_sector is not None
+        else "the configured limit"
+    )
+    return (
+        f"Portfolio already has {same_sector_position_count} {sector_label} positions; "
+        f"adding another would exceed the per-sector limit of {limit_text}."
+    )
+
+
+def _industry_exposure_entry_reject_reason(
+    *,
+    candidate_industry: str | None,
+    same_industry_position_count: int,
+    max_same_industry_positions: int | None,
+) -> str:
+    industry_label = candidate_industry or "the same industry"
+    limit_text = (
+        str(max_same_industry_positions)
+        if max_same_industry_positions is not None
+        else "the configured limit"
+    )
+    return (
+        f"Portfolio already has {same_industry_position_count} {industry_label} positions; "
+        f"adding another would exceed the same-industry limit of {limit_text}."
+    )
+
+
+def _sector_notional_exposure_entry_reject_reason(
+    *,
+    candidate_sector: str | None,
+    current_sector_notional_pct: float | None,
+    projected_sector_notional_pct: float | None,
+    max_sector_notional_pct: float | None,
+) -> str:
+    sector_label = candidate_sector or "the same sector"
+    if (
+        current_sector_notional_pct is None
+        or projected_sector_notional_pct is None
+        or max_sector_notional_pct is None
+    ):
+        return (
+            f"{sector_label} exposure would exceed the configured sector notional limit."
+        )
+    return (
+        f"{sector_label} already accounts for {current_sector_notional_pct:.1%} of approximate portfolio notional; "
+        f"adding this position would raise it to {projected_sector_notional_pct:.1%}, "
+        f"above the {max_sector_notional_pct:.0%} limit."
     )
 
 
