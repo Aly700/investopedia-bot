@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from bot.execution.interface import ExecutionBatch, ExecutionOrder
+from bot.features import MarketContext
 from bot.risk.portfolio_rules import (
     PORTFOLIO_REVIEW_ACTIONS,
     ExistingPosition,
@@ -325,6 +326,7 @@ class DailyResearchSummary:
     preset_summaries: tuple[DailyPresetSummaryRow, ...]
     rows: tuple[DailyResearchOpportunityRow, ...]
     execution_batch: ExecutionBatch
+    market_context: MarketContext | None = None
     force_require_relative_volume_confirmation: bool = False
 
     @property
@@ -401,6 +403,11 @@ class DailyResearchSummary:
             "benchmark_symbol": self.benchmark_symbol,
             "preset_selection_source": self.preset_selection_source,
             "selected_presets": [preset.to_dict() for preset in self.selected_presets],
+            "market_context": (
+                self.market_context.to_dict()
+                if self.market_context is not None
+                else None
+            ),
             "relative_volume_confirmation_required": self.relative_volume_confirmation_required,
             "relative_volume_policy": self.relative_volume_policy,
             "relative_volume_policy_by_preset": self.relative_volume_policy_by_preset,
@@ -450,6 +457,12 @@ class DailyResearchSummary:
             f"Relative-volume policy: {self.relative_volume_policy} | "
             f"Preset selection: {self.preset_selection_source or 'n/a'}"
         )
+        breadth_line = _market_breadth_brief_line(self.market_context)
+        if breadth_line is not None:
+            lines.append(breadth_line)
+        volatility_line = _volatility_regime_brief_line(self.market_context)
+        if volatility_line is not None:
+            lines.append(volatility_line)
 
         lines.extend(("", "Top opportunities"))
         if approved_rows:
@@ -796,6 +809,7 @@ class MarketMonitorReport:
     alerts: tuple[MarketMonitorAlertRow, ...]
     ranked_opportunity_rows: tuple[DailyResearchOpportunityRow, ...] = ()
     portfolio_review_rows: tuple[PortfolioReviewRow, ...] = ()
+    market_context: MarketContext | None = None
 
     @property
     def category_counts(self) -> dict[str, int]:
@@ -820,6 +834,11 @@ class MarketMonitorReport:
             "portfolio_path": self.portfolio_path,
             "preset_names": list(self.preset_names),
             "benchmark_symbol": self.benchmark_symbol,
+            "market_context": (
+                self.market_context.to_dict()
+                if self.market_context is not None
+                else None
+            ),
             "alert_count": len(self.alerts),
             "category_counts": dict(category_counts),
             **flat_count_fields,
@@ -892,6 +911,15 @@ class MarketMonitorReport:
             "Presets: "
             + (", ".join(self.preset_names) if self.preset_names else "none")
         )
+        breadth_line = _market_breadth_brief_line(self.market_context, label="Breadth")
+        if breadth_line is not None:
+            lines.append(breadth_line)
+        volatility_line = _volatility_regime_brief_line(
+            self.market_context,
+            label="Volatility",
+        )
+        if volatility_line is not None:
+            lines.append(volatility_line)
 
         lines.extend(("", "Best actions now"))
         if not urgent_holding_rows and not top_buy_rows:
@@ -1084,6 +1112,11 @@ def build_market_monitor_report(
             tuple(portfolio_review.rows)
             if portfolio_review is not None
             else ()
+        ),
+        market_context=(
+            daily_summary.market_context
+            if daily_summary is not None
+            else None
         ),
     )
 
@@ -1458,6 +1491,7 @@ def build_daily_research_summary(
     current_equity: float,
     no_signal_symbols_by_preset: Mapping[str, Sequence[str]] | None = None,
     benchmark_symbol: str | None = None,
+    market_context: MarketContext | None = None,
     preset_selection_source: str | None = None,
     force_require_relative_volume_confirmation: bool = False,
 ) -> DailyResearchSummary:
@@ -1511,6 +1545,7 @@ def build_daily_research_summary(
         preset_summaries=preset_summaries,
         rows=rows,
         execution_batch=execution_batch,
+        market_context=market_context,
         force_require_relative_volume_confirmation=force_require_relative_volume_confirmation,
     )
 
@@ -1604,6 +1639,8 @@ def _row_from_candidate(
         "notional_value": candidate.sizing.notional_value,
         "signal_metadata": dict(candidate.signal.metadata),
     }
+    if candidate.features is not None and candidate.features.market_context is not None:
+        metadata["market_context"] = candidate.features.market_context.to_dict()
     if candidate.existing_position is not None:
         metadata["existing_position"] = candidate.existing_position.to_dict()
     if order is not None:
@@ -1648,6 +1685,8 @@ def _daily_research_row_from_evaluation(
         "notional_value": candidate.sizing.notional_value,
         "signal_metadata": dict(candidate.signal.metadata),
     }
+    if candidate.features is not None and candidate.features.market_context is not None:
+        metadata["market_context"] = candidate.features.market_context.to_dict()
     if candidate.existing_position is not None:
         metadata["existing_position"] = candidate.existing_position.to_dict()
     if order is not None:
@@ -1687,6 +1726,42 @@ def _candidate_rationale(candidate: RiskAssessedCandidate) -> str:
         candidate.signal.entry_reason,
         candidate.signal.metadata,
     )
+
+
+def _market_breadth_brief_line(
+    market_context: MarketContext | None,
+    *,
+    label: str = "Market breadth",
+) -> str | None:
+    if market_context is None or market_context.market_breadth_pct_above_200ma is None:
+        return None
+
+    line = f"{label}: "
+    if market_context.market_breadth_state is not None:
+        line += f"{market_context.market_breadth_state} | "
+    line += f"{market_context.market_breadth_pct_above_200ma:.0%} above 200d"
+    if market_context.market_breadth_pct_above_50ma is not None:
+        line += f" | {market_context.market_breadth_pct_above_50ma:.0%} above 50d"
+    return line
+
+
+def _volatility_regime_brief_line(
+    market_context: MarketContext | None,
+    *,
+    label: str = "Volatility regime",
+) -> str | None:
+    if market_context is None or market_context.vix_close is None:
+        return None
+
+    line = f"{label}: "
+    if market_context.volatility_regime_state is not None:
+        line += f"{market_context.volatility_regime_state} | "
+    line += f"VIX {market_context.vix_close:.1f}"
+    if market_context.vix_sma_short is not None:
+        line += f" | 5d {market_context.vix_sma_short:.1f}"
+    if market_context.vix_sma_long is not None:
+        line += f" | 20d {market_context.vix_sma_long:.1f}"
+    return line
 
 
 def _build_daily_preset_summaries(

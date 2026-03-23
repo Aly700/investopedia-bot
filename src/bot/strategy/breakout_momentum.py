@@ -46,6 +46,9 @@ class BreakoutMomentumSettings:
     intraday_high_profit_giveback_threshold: float = 0.07
     earnings_entry_block_days: int = 3
     earnings_watch_days: int = 7
+    market_breadth_entry_floor_200ma: float | None = 0.40
+    vix_caution_threshold: float | None = 25.0
+    vix_entry_block_threshold: float | None = 30.0
     require_sector_regime_for_entries: bool = True
     sector_relative_strength_window: int = 20
     sector_relative_strength_entry_reject_threshold: float = -0.05
@@ -79,6 +82,9 @@ class BreakoutMomentumSettings:
             relative_volume_window=relative_volume_window,
             earnings_entry_block_days=signal_config.earnings_entry_block_days,
             earnings_watch_days=signal_config.earnings_watch_days,
+            market_breadth_entry_floor_200ma=signal_config.market_breadth_entry_floor_200ma,
+            vix_caution_threshold=signal_config.vix_caution_threshold,
+            vix_entry_block_threshold=signal_config.vix_entry_block_threshold,
             require_sector_regime_for_entries=signal_config.require_sector_regime_for_entries,
             sector_relative_strength_window=signal_config.sector_relative_strength_window,
             sector_relative_strength_entry_reject_threshold=(
@@ -116,6 +122,27 @@ class BreakoutMomentumSettings:
             raise ValueError("earnings_entry_block_days must be greater than zero.")
         if self.earnings_watch_days <= 0:
             raise ValueError("earnings_watch_days must be greater than zero.")
+        if self.market_breadth_entry_floor_200ma is not None and (
+            self.market_breadth_entry_floor_200ma <= 0
+            or self.market_breadth_entry_floor_200ma >= 1
+        ):
+            raise ValueError(
+                "market_breadth_entry_floor_200ma must be between zero and one when provided."
+            )
+        if self.vix_caution_threshold is not None and self.vix_caution_threshold <= 0:
+            raise ValueError("vix_caution_threshold must be greater than zero when provided.")
+        if self.vix_entry_block_threshold is not None and self.vix_entry_block_threshold <= 0:
+            raise ValueError(
+                "vix_entry_block_threshold must be greater than zero when provided."
+            )
+        if (
+            self.vix_caution_threshold is not None
+            and self.vix_entry_block_threshold is not None
+            and self.vix_caution_threshold >= self.vix_entry_block_threshold
+        ):
+            raise ValueError(
+                "vix_caution_threshold must be less than vix_entry_block_threshold when both are provided."
+            )
         if self.sector_relative_strength_window <= 0:
             raise ValueError("sector_relative_strength_window must be greater than zero.")
         if self.sector_relative_strength_entry_reject_threshold > 0:
@@ -600,6 +627,33 @@ def build_breakout_rationale(
                 )
         if sector_notes:
             parts.append(f"sector={sector_etf_symbol} ({', '.join(sector_notes)})")
+
+    market_breadth_pct_above_200ma = _metadata_float(
+        metadata.get("market_breadth_pct_above_200ma")
+    )
+    market_breadth_state = _metadata_text(metadata.get("market_breadth_state"))
+    if market_breadth_pct_above_200ma is not None and market_breadth_state in {
+        "weak",
+        "strong",
+    }:
+        parts.append(
+            f"breadth={market_breadth_state} ({market_breadth_pct_above_200ma:.0%} above 200d)"
+        )
+
+    volatility_regime_state = _metadata_text(metadata.get("volatility_regime_state"))
+    vix_close = _metadata_float(metadata.get("vix_close"))
+    vix_caution_threshold = _metadata_float(metadata.get("vix_caution_threshold"))
+    vix_entry_block_threshold = _metadata_float(metadata.get("vix_entry_block_threshold"))
+    if volatility_regime_state == "elevated":
+        detail = f"VIX {vix_close:.1f}" if vix_close is not None else "VIX elevated"
+        if vix_close is not None and vix_caution_threshold is not None:
+            detail += f" above {vix_caution_threshold:.1f} caution"
+        parts.append(f"volatility={volatility_regime_state} ({detail})")
+    elif volatility_regime_state == "stressed":
+        detail = f"VIX {vix_close:.1f}" if vix_close is not None else "VIX elevated"
+        if vix_close is not None and vix_entry_block_threshold is not None:
+            detail += f" above {vix_entry_block_threshold:.1f} block"
+        parts.append(f"volatility={volatility_regime_state} ({detail})")
 
     return "; ".join(parts)
 

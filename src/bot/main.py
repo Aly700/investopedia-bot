@@ -54,6 +54,15 @@ from bot.data.earnings import (
     create_earnings_calendar_provider,
     earnings_context_metadata,
 )
+from bot.data.intraday_state_journal import (
+    IntradayStateJournal,
+    IntradayStateObservation,
+    default_intraday_state_journal_path,
+    load_intraday_state_journal,
+    preview_intraday_trajectory_features,
+    update_intraday_state_journal,
+    write_intraday_state_journal,
+)
 from bot.data.sector_context import (
     SectorFeatureContext,
     build_sector_feature_contexts,
@@ -66,6 +75,10 @@ from bot.data.providers import (
     DataProviderConfigurationError,
     DataProviderError,
     create_daily_bar_provider,
+)
+from bot.data.volatility_context import (
+    build_volatility_regime_context,
+    volatility_context_history_start,
 )
 from bot.data.reference import create_reference_universe_provider
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
@@ -84,10 +97,14 @@ from bot.execution.manual_executor import (
     write_manual_order_sheet,
 )
 from bot.features import (
+    PositionFeatures,
+    apply_intraday_trajectory_features,
     build_candidate_features,
     build_intraday_position_features,
     build_market_context,
     build_position_features,
+    compute_market_breadth_from_frames,
+    market_context_metadata,
 )
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
@@ -1447,6 +1464,10 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         report,
         output_dir / "portfolio_review_intraday_brief.txt",
     )
+    intraday_state_journal_path = default_intraday_state_journal_path(
+        config.project_root,
+        args.as_of,
+    ).resolve()
     report_payload = report.to_dict()
     action_counts = {
         f"{action.lower().replace(' ', '_')}_count": report_payload[
@@ -1466,6 +1487,8 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
             "portfolio_review_intraday_brief": str(review_brief_path),
         },
     }
+    if intraday_state_journal_path.exists():
+        payload["outputs"]["intraday_state_journal"] = str(intraday_state_journal_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -1534,6 +1557,36 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         "as_of_date": args.as_of.isoformat(),
         "portfolio_file": str(args.portfolio_file.resolve()) if args.portfolio_file else None,
         "preset_names": list(report_payload["preset_names"]),
+        "market_breadth_pct_above_200ma": (
+            summary.market_context.market_breadth_pct_above_200ma
+            if summary.market_context is not None
+            else None
+        ),
+        "market_breadth_pct_above_50ma": (
+            summary.market_context.market_breadth_pct_above_50ma
+            if summary.market_context is not None
+            else None
+        ),
+        "market_breadth_state": (
+            summary.market_context.market_breadth_state
+            if summary.market_context is not None
+            else None
+        ),
+        "vix_close": (
+            summary.market_context.vix_close
+            if summary.market_context is not None
+            else None
+        ),
+        "volatility_regime_state": (
+            summary.market_context.volatility_regime_state
+            if summary.market_context is not None
+            else None
+        ),
+        "volatility_regime_risk_off": (
+            summary.market_context.volatility_regime_risk_off
+            if summary.market_context is not None
+            else None
+        ),
         "universe_count": summary_payload["universe_count"],
         "approved_count": summary_payload["approved_count"],
         "rejected_count": summary_payload["rejected_count"],
@@ -1577,16 +1630,6 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         raise ValueError("equity must be greater than zero.")
     if args.current_drawdown < 0:
         raise ValueError("current_drawdown must be non-negative.")
-    market_context = build_market_context(
-        as_of_date=args.as_of,
-        benchmark_symbol=(
-            strategy_settings.benchmark_symbol
-            if strategy_settings.enable_regime_filter
-            else None
-        ),
-        regime_filter_mode=strategy_settings.regime_filter_mode,
-    )
-
     benchmark_frame = None
     fetch_start = _strategy_warmup_start(args.as_of, strategy_settings)
     if strategy_settings.enable_regime_filter and universe_members:
@@ -1642,6 +1685,39 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
 
         symbol_frames[member.symbol] = bars
 
+    breadth_metrics = _compute_entry_market_breadth(
+        symbol_frames,
+        as_of_date=args.as_of,
+        market_breadth_entry_floor_200ma=(
+            strategy_settings.market_breadth_entry_floor_200ma
+        ),
+        log_label="generate-orders",
+    )
+    market_context = build_market_context(
+        as_of_date=args.as_of,
+        benchmark_symbol=(
+            strategy_settings.benchmark_symbol
+            if strategy_settings.enable_regime_filter
+            else None
+        ),
+        regime_filter_mode=strategy_settings.regime_filter_mode,
+        market_breadth_pct_above_200ma=(
+            breadth_metrics["market_breadth_pct_above_200ma"]
+        ),
+        market_breadth_pct_above_50ma=(
+            breadth_metrics["market_breadth_pct_above_50ma"]
+        ),
+        market_breadth_state=breadth_metrics["market_breadth_state"],
+        **_load_volatility_context(
+            provider=provider,
+            as_of_date=args.as_of,
+            vix_caution_threshold=strategy_settings.vix_caution_threshold,
+            vix_entry_block_threshold=strategy_settings.vix_entry_block_threshold,
+            refresh_cache=args.refresh_cache,
+            log_label="generate-orders",
+        ),
+    )
+
     sector_contexts = _load_sector_contexts(
         config=config,
         env_file=getattr(args, "env_file", None),
@@ -1687,6 +1763,16 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
                 **dict(signal.metadata),
                 **earnings_context_metadata(earnings_context),
                 **sector_context_metadata(sector_context),
+                **market_context_metadata(
+                    market_context,
+                    market_breadth_entry_floor_200ma=(
+                        strategy_settings.market_breadth_entry_floor_200ma
+                    ),
+                    vix_caution_threshold=strategy_settings.vix_caution_threshold,
+                    vix_entry_block_threshold=(
+                        strategy_settings.vix_entry_block_threshold
+                    ),
+                ),
             },
         )
         candidate_features = build_candidate_features(
@@ -1741,6 +1827,12 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
                     if sector_context is not None
                     else None
                 ),
+                market_breadth_entry_floor_200ma=(
+                    strategy_settings.market_breadth_entry_floor_200ma
+                ),
+                vix_entry_block_threshold=(
+                    strategy_settings.vix_entry_block_threshold
+                ),
                 require_sector_regime_for_entries=(
                     strategy_settings.require_sector_regime_for_entries
                 ),
@@ -1784,6 +1876,12 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             if strategy_settings.require_relative_volume_confirmation
             else "optional"
         ),
+        "market_breadth_pct_above_200ma": market_context.market_breadth_pct_above_200ma,
+        "market_breadth_pct_above_50ma": market_context.market_breadth_pct_above_50ma,
+        "market_breadth_state": market_context.market_breadth_state,
+        "vix_close": market_context.vix_close,
+        "volatility_regime_state": market_context.volatility_regime_state,
+        "volatility_regime_risk_off": market_context.volatility_regime_risk_off,
         "universe_count": len(universe_members),
         "signal_count": len(assessed_candidates),
         "approved_order_count": len(batch.orders),
@@ -2073,6 +2171,11 @@ def _handle_compare_strategies(args: argparse.Namespace) -> int:
         max_sector_relative_strength_window=(
             config.strategy.signals.sector_relative_strength_window
         ),
+        market_breadth_long_window=(
+            200
+            if config.strategy.signals.market_breadth_entry_floor_200ma is not None
+            else 1
+        ),
         enable_regime_filter=not args.disable_regime_filter,
     )
     symbol_frames: dict[str, object] = {}
@@ -2239,6 +2342,36 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         "relative_volume_policy": summary.relative_volume_policy,
         "relative_volume_policy_by_preset": summary.relative_volume_policy_by_preset,
         "recommended_preset": summary.recommended_preset,
+        "market_breadth_pct_above_200ma": (
+            summary.market_context.market_breadth_pct_above_200ma
+            if summary.market_context is not None
+            else None
+        ),
+        "market_breadth_pct_above_50ma": (
+            summary.market_context.market_breadth_pct_above_50ma
+            if summary.market_context is not None
+            else None
+        ),
+        "market_breadth_state": (
+            summary.market_context.market_breadth_state
+            if summary.market_context is not None
+            else None
+        ),
+        "vix_close": (
+            summary.market_context.vix_close
+            if summary.market_context is not None
+            else None
+        ),
+        "volatility_regime_state": (
+            summary.market_context.volatility_regime_state
+            if summary.market_context is not None
+            else None
+        ),
+        "volatility_regime_risk_off": (
+            summary.market_context.volatility_regime_risk_off
+            if summary.market_context is not None
+            else None
+        ),
         "equity": current_equity,
         "current_drawdown": float(args.current_drawdown),
         "universe_count": summary_payload["universe_count"],
@@ -2322,6 +2455,11 @@ def _run_daily_summary_workflow(
         max_sector_relative_strength_window=(
             config.strategy.signals.sector_relative_strength_window
         ),
+        market_breadth_long_window=(
+            200
+            if config.strategy.signals.market_breadth_entry_floor_200ma is not None
+            else 1
+        ),
         enable_regime_filter=not args.disable_regime_filter,
     )
 
@@ -2399,6 +2537,35 @@ def _run_daily_summary_workflow(
         refresh_cache=args.refresh_cache,
         log_label="daily-summary",
     )
+    breadth_metrics = _compute_entry_market_breadth(
+        symbol_frames,
+        as_of_date=args.as_of,
+        market_breadth_entry_floor_200ma=(
+            config.strategy.signals.market_breadth_entry_floor_200ma
+        ),
+        log_label="daily-summary",
+    )
+    summary_market_context = build_market_context(
+        as_of_date=args.as_of,
+        benchmark_symbol=benchmark_symbol,
+        market_breadth_pct_above_200ma=(
+            breadth_metrics["market_breadth_pct_above_200ma"]
+        ),
+        market_breadth_pct_above_50ma=(
+            breadth_metrics["market_breadth_pct_above_50ma"]
+        ),
+        market_breadth_state=breadth_metrics["market_breadth_state"],
+        **_load_volatility_context(
+            provider=provider,
+            as_of_date=args.as_of,
+            vix_caution_threshold=config.strategy.signals.vix_caution_threshold,
+            vix_entry_block_threshold=(
+                config.strategy.signals.vix_entry_block_threshold
+            ),
+            refresh_cache=args.refresh_cache,
+            log_label="daily-summary",
+        ),
+    )
     journal_path = default_candidate_score_journal_path(config.project_root)
     candidate_score_journal = load_candidate_score_journal(journal_path)
 
@@ -2428,6 +2595,18 @@ def _run_daily_summary_workflow(
                 else None
             ),
             regime_filter_mode=strategy_settings.regime_filter_mode,
+            market_breadth_pct_above_200ma=(
+                breadth_metrics["market_breadth_pct_above_200ma"]
+            ),
+            market_breadth_pct_above_50ma=(
+                breadth_metrics["market_breadth_pct_above_50ma"]
+            ),
+            market_breadth_state=breadth_metrics["market_breadth_state"],
+            vix_close=summary_market_context.vix_close,
+            vix_sma_short=summary_market_context.vix_sma_short,
+            vix_sma_long=summary_market_context.vix_sma_long,
+            volatility_regime_state=summary_market_context.volatility_regime_state,
+            volatility_regime_risk_off=summary_market_context.volatility_regime_risk_off,
         )
 
         for member in universe_members:
@@ -2458,6 +2637,18 @@ def _run_daily_summary_workflow(
             signal_metadata = dict(signal.metadata)
             signal_metadata.update(earnings_context_metadata(earnings_context))
             signal_metadata.update(sector_context_metadata(sector_context))
+            signal_metadata.update(
+                market_context_metadata(
+                    market_context,
+                    market_breadth_entry_floor_200ma=(
+                        strategy_settings.market_breadth_entry_floor_200ma
+                    ),
+                    vix_caution_threshold=strategy_settings.vix_caution_threshold,
+                    vix_entry_block_threshold=(
+                        strategy_settings.vix_entry_block_threshold
+                    ),
+                )
+            )
             signal_metadata["preset_name"] = preset.name
             signal_metadata["parameter_id"] = preset.parameter_id
             signal = replace(
@@ -2520,6 +2711,12 @@ def _run_daily_summary_workflow(
                             if sector_context is not None
                             else None
                         ),
+                        market_breadth_entry_floor_200ma=(
+                            strategy_settings.market_breadth_entry_floor_200ma
+                        ),
+                        vix_entry_block_threshold=(
+                            strategy_settings.vix_entry_block_threshold
+                        ),
                         require_sector_regime_for_entries=(
                             strategy_settings.require_sector_regime_for_entries
                         ),
@@ -2565,6 +2762,7 @@ def _run_daily_summary_workflow(
         current_equity=current_equity,
         no_signal_symbols_by_preset=no_signal_symbols_by_preset,
         benchmark_symbol=benchmark_symbol,
+        market_context=summary_market_context,
         preset_selection_source=preset_selection_source,
         force_require_relative_volume_confirmation=bool(args.require_relative_volume),
     )
@@ -2737,6 +2935,14 @@ def _run_portfolio_review_intraday_workflow(
         )
     if provider is None:
         raise ValueError("A data provider is required when reviewing non-empty portfolios.")
+    intraday_state_journal_path = default_intraday_state_journal_path(
+        config.project_root,
+        args.as_of,
+    )
+    intraday_state_journal = load_intraday_state_journal(
+        intraday_state_journal_path,
+        session_date=args.as_of,
+    )
 
     preset_catalog = _portfolio_review_preset_catalog(args, config)
     base_settings = BreakoutMomentumSettings.from_configs(
@@ -2817,23 +3023,25 @@ def _run_portfolio_review_intraday_workflow(
         )
 
     rows: list[PortfolioReviewRow] = []
+    intraday_observations: dict[str, IntradayStateObservation] = {}
     for plan in position_plans:
         position = plan.get("position")
         symbol = position.symbol if isinstance(position, ExistingPosition) else "<unknown>"
         try:
-            rows.append(
-                _build_portfolio_review_intraday_row(
-                    plan,
-                    provider=provider,
-                    as_of_date=args.as_of,
-                    interval_minutes=args.interval_minutes,
-                    benchmark_symbol=benchmark_symbol,
-                    benchmark_intraday_metrics=benchmark_intraday_metrics,
-                    refresh_cache=True,
-                    earnings_context=earnings_contexts.get(symbol),
-                    sector_context=sector_contexts.get(symbol),
-                )
+            row, observation = _build_portfolio_review_intraday_row(
+                plan,
+                provider=provider,
+                as_of_date=args.as_of,
+                interval_minutes=args.interval_minutes,
+                benchmark_symbol=benchmark_symbol,
+                benchmark_intraday_metrics=benchmark_intraday_metrics,
+                refresh_cache=True,
+                earnings_context=earnings_contexts.get(symbol),
+                sector_context=sector_contexts.get(symbol),
+                intraday_state_journal=intraday_state_journal,
             )
+            rows.append(row)
+            intraday_observations[observation.symbol] = observation
         except DataProviderConfigurationError:
             raise
         except (DataProviderError, ValueError) as exc:
@@ -2843,6 +3051,11 @@ def _run_portfolio_review_intraday_workflow(
         raise NoIntradayDataError(
             "No held symbols had usable regular-session intraday data for the requested session."
         )
+    updated_intraday_state_journal = update_intraday_state_journal(
+        intraday_state_journal,
+        observations=intraday_observations,
+    )
+    write_intraday_state_journal(updated_intraday_state_journal, intraday_state_journal_path)
 
     return build_intraday_portfolio_review_report(
         as_of_date=args.as_of,
@@ -2865,7 +3078,8 @@ def _build_portfolio_review_intraday_row(
     refresh_cache: bool,
     earnings_context: EarningsRiskContext | None = None,
     sector_context: SectorFeatureContext | None = None,
-) -> PortfolioReviewRow:
+    intraday_state_journal: IntradayStateJournal | None = None,
+) -> tuple[PortfolioReviewRow, IntradayStateObservation]:
     position = plan["position"]
     preset = plan["preset"]
     preset_resolution = plan["preset_resolution"]
@@ -2929,6 +3143,24 @@ def _build_portfolio_review_intraday_row(
         ),
         market_context=market_context,
     )
+    effective_intraday_state_journal = (
+        intraday_state_journal
+        if intraday_state_journal is not None
+        else IntradayStateJournal(session_date=as_of_date, entries={})
+    )
+    latest_bar_time = _mapping_text_or_none(intraday_metrics, "latest_bar_time")
+    state_observation = _build_intraday_state_observation(
+        position_features,
+        timestamp=latest_bar_time or f"{as_of_date.isoformat()}T00:00:00",
+    )
+    trajectory_features = preview_intraday_trajectory_features(
+        effective_intraday_state_journal,
+        observation=state_observation,
+    )
+    position_features = apply_intraday_trajectory_features(
+        position_features,
+        trajectory_features,
+    )
     decision = review_existing_long_position_intraday(
         position,
         position_features=position_features,
@@ -2978,39 +3210,72 @@ def _build_portfolio_review_intraday_row(
             settings.sector_relative_strength_watch_threshold
         ),
     )
-    entry_date_used = _position_entry_date(position)
-    return PortfolioReviewRow(
-        date=as_of_date,
-        symbol=position.symbol,
-        quantity=position.shares,
-        average_entry_price=position.average_entry_price,
-        current_stop=position.current_stop,
-        suggested_stop=decision.suggested_stop,
-        latest_close=decision.latest_close,
-        unrealized_pl_pct=decision.unrealized_pl_pct,
-        distance_to_stop_pct=decision.distance_to_stop_pct,
-        regime_passed=None,
-        above_entry=decision.above_entry,
+    finalized_state_observation = replace(
+        state_observation,
         suggested_action=decision.suggested_action,
-        preset_name=preset.name,
-        rationale=" | ".join(decision.rationale),
-        metadata={
-            "preset_resolution": preset_resolution,
-            "position_source": position.source,
-            "position_metadata": dict(position.metadata),
-            "entry_date_used": entry_date_used.isoformat() if entry_date_used is not None else None,
-            "interval_minutes": interval_minutes,
-            "latest_bar_time": intraday_metrics.get("latest_bar_time"),
-            "benchmark_symbol": benchmark_symbol,
-            "intraday_relative_strength_diff": intraday_relative_strength_diff,
-            "benchmark_intraday_return_vs_open": (
-                benchmark_intraday_metrics.get("intraday_return_vs_open")
-                if benchmark_intraday_metrics is not None
-                else None
-            ),
-            **dict(intraday_metrics),
-            **decision.metadata,
-        },
+    )
+    entry_date_used = _position_entry_date(position)
+    return (
+        PortfolioReviewRow(
+            date=as_of_date,
+            symbol=position.symbol,
+            quantity=position.shares,
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            suggested_stop=decision.suggested_stop,
+            latest_close=decision.latest_close,
+            unrealized_pl_pct=decision.unrealized_pl_pct,
+            distance_to_stop_pct=decision.distance_to_stop_pct,
+            regime_passed=None,
+            above_entry=decision.above_entry,
+            suggested_action=decision.suggested_action,
+            preset_name=preset.name,
+            rationale=" | ".join(decision.rationale),
+            metadata={
+                "preset_resolution": preset_resolution,
+                "position_source": position.source,
+                "position_metadata": dict(position.metadata),
+                "entry_date_used": (
+                    entry_date_used.isoformat() if entry_date_used is not None else None
+                ),
+                "interval_minutes": interval_minutes,
+                "latest_bar_time": intraday_metrics.get("latest_bar_time"),
+                "benchmark_symbol": benchmark_symbol,
+                "intraday_relative_strength_diff": intraday_relative_strength_diff,
+                "benchmark_intraday_return_vs_open": (
+                    benchmark_intraday_metrics.get("intraday_return_vs_open")
+                    if benchmark_intraday_metrics is not None
+                    else None
+                ),
+                **dict(intraday_metrics),
+                **decision.metadata,
+            },
+        ),
+        finalized_state_observation,
+    )
+
+
+def _build_intraday_state_observation(
+    features: PositionFeatures,
+    *,
+    timestamp: str,
+) -> IntradayStateObservation:
+    return IntradayStateObservation(
+        symbol=features.symbol,
+        timestamp=timestamp,
+        latest_close=features.latest_close,
+        session_vwap=features.session_vwap,
+        close_vs_vwap_pct=features.close_vs_vwap_pct,
+        session_high=features.session_high,
+        session_low=features.session_low,
+        session_high_giveback_pct=features.session_high_giveback_pct,
+        intraday_return_vs_open=features.intraday_return_vs_open,
+        intraday_return_vs_benchmark=features.intraday_return_vs_benchmark,
+        weak_intraday_relative_strength=features.weak_intraday_relative_strength,
+        failed_intraday_strength=features.failed_intraday_strength,
+        intraday_momentum_fade=features.intraday_momentum_fade,
+        stacked_intraday_weakness=features.stacked_intraday_weakness,
+        stop_breached_intraday=features.stop_breached_intraday,
     )
 
 
@@ -3095,6 +3360,14 @@ def _mapping_float_or_none(data: Mapping[str, object], key: str) -> float | None
     if isinstance(value, (int, float)):
         return float(value)
     return None
+
+
+def _mapping_text_or_none(data: Mapping[str, object], key: str) -> str | None:
+    value = data.get(key)
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
 
 
 def _mapping_int_or_none(data: Mapping[str, object], key: str) -> int | None:
@@ -3769,6 +4042,35 @@ def _load_sector_contexts(
         return {}
 
 
+def _load_volatility_context(
+    *,
+    provider: DailyBarProvider,
+    as_of_date: date,
+    vix_caution_threshold: float | None,
+    vix_entry_block_threshold: float | None,
+    refresh_cache: bool,
+    log_label: str,
+) -> dict[str, float | str | bool | None]:
+    try:
+        return build_volatility_regime_context(
+            provider=provider,
+            as_of_date=as_of_date,
+            history_start=volatility_context_history_start(as_of_date),
+            caution_threshold=vix_caution_threshold,
+            entry_block_threshold=vix_entry_block_threshold,
+            refresh_cache=refresh_cache,
+        )
+    except ValueError as exc:
+        LOGGER.warning("Volatility context unavailable for %s: %s", log_label, exc)
+        return {
+            "vix_close": None,
+            "vix_sma_short": None,
+            "vix_sma_long": None,
+            "volatility_regime_state": None,
+            "volatility_regime_risk_off": None,
+        }
+
+
 def _warn_missing_sector_context_for_entry(
     symbol: str,
     *,
@@ -3783,6 +4085,30 @@ def _warn_missing_sector_context_for_entry(
     )
 
 
+def _compute_entry_market_breadth(
+    symbol_frames: Mapping[str, pd.DataFrame],
+    *,
+    as_of_date: date,
+    market_breadth_entry_floor_200ma: float | None,
+    log_label: str,
+) -> dict[str, float | str | None]:
+    breadth_metrics = compute_market_breadth_from_frames(
+        symbol_frames,
+        as_of_date=as_of_date,
+        entry_floor_200ma=market_breadth_entry_floor_200ma,
+    )
+    if (
+        market_breadth_entry_floor_200ma is not None
+        and breadth_metrics["market_breadth_pct_above_200ma"] is None
+        and symbol_frames
+    ):
+        LOGGER.warning(
+            "Market breadth gate is configured for %s but breadth could not be computed from the available universe bars; proceeding without breadth gate.",
+            log_label,
+        )
+    return breadth_metrics
+
+
 def _strategy_warmup_start(
     as_of_date: date,
     settings: BreakoutMomentumSettings,
@@ -3794,6 +4120,7 @@ def _strategy_warmup_start(
         settings.stale_high_watch_days + 1,
         settings.relative_strength_window + 1,
         settings.sector_relative_strength_window + 1,
+        200 if settings.market_breadth_entry_floor_200ma is not None else 1,
         settings.benchmark_sma_slow if settings.enable_regime_filter else 1,
     )
     return as_of_date - timedelta(days=max(largest_window * 3, 30))
@@ -3807,6 +4134,7 @@ def _comparison_warmup_start(
     presets: Sequence[BreakoutStrategyPreset],
     max_relative_volume_window: int,
     max_sector_relative_strength_window: int,
+    market_breadth_long_window: int,
     enable_regime_filter: bool,
 ) -> date:
     max_breakout_lookback = max((preset.breakout_lookback for preset in presets), default=1)
@@ -3815,6 +4143,7 @@ def _comparison_warmup_start(
         atr_window,
         max_relative_volume_window + 1,
         max_sector_relative_strength_window + 1,
+        market_breadth_long_window,
         benchmark_sma_slow if enable_regime_filter else 1,
     )
     return start_date - timedelta(days=max(largest_window * 3, 30))

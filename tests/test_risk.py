@@ -6,6 +6,13 @@ from pathlib import Path
 
 import pytest
 
+from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
+from bot.features import (
+    apply_intraday_trajectory_features,
+    build_candidate_features,
+    build_intraday_position_features,
+    build_market_context,
+)
 from bot.risk.portfolio_rules import (
     ExistingPosition,
     PortfolioConstraints,
@@ -275,6 +282,261 @@ def test_assess_signal_candidate_does_not_block_unknown_sector_regime() -> None:
         sector_etf_symbol="XLK",
         sector_regime_passed=None,
         require_sector_regime_for_entries=True,
+    )
+
+    assert candidate.approved is True
+    assert candidate.rejection_reasons == ()
+
+
+def test_assess_signal_candidate_blocks_weak_market_breadth() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        market_context=build_market_context(
+            as_of_date=signal.date,
+            market_breadth_pct_above_200ma=0.37,
+            market_breadth_pct_above_50ma=0.48,
+            market_breadth_state="weak",
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+        market_breadth_entry_floor_200ma=0.40,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Market breadth is weak: 37% of the universe is above its 200-day moving average; new entries require at least 40%.",
+    )
+
+
+def test_assess_signal_candidate_fallback_preserves_market_breadth_context() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    market_context = build_market_context(
+        as_of_date=signal.date,
+        market_breadth_pct_above_200ma=0.37,
+        market_breadth_pct_above_50ma=0.48,
+        market_breadth_state="weak",
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        market_context=market_context,
+        market_breadth_entry_floor_200ma=0.40,
+    )
+
+    assert candidate.approved is False
+    assert candidate.features is not None
+    assert candidate.features.market_context == market_context
+    assert candidate.rejection_reasons == (
+        "Market breadth is weak: 37% of the universe is above its 200-day moving average; new entries require at least 40%.",
+    )
+
+
+def test_assess_signal_candidate_rejects_separate_market_context_when_features_are_provided() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        market_context=build_market_context(
+            as_of_date=signal.date,
+            market_breadth_pct_above_200ma=0.58,
+            market_breadth_pct_above_50ma=0.67,
+            market_breadth_state="neutral",
+        ),
+    )
+    market_context = build_market_context(
+        as_of_date=signal.date,
+        market_breadth_pct_above_200ma=0.37,
+        market_breadth_pct_above_50ma=0.48,
+        market_breadth_state="weak",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Pass market_context via candidate_features, not as a separate argument\\.",
+    ):
+        assess_signal_candidate(
+            signal,
+            current_equity=100_000.0,
+            base_risk_per_trade=0.01,
+            constraints=constraints,
+            candidate_features=candidate_features,
+            market_context=market_context,
+            market_breadth_entry_floor_200ma=0.40,
+        )
+
+
+def test_assess_signal_candidate_allows_acceptable_market_breadth() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        market_context=build_market_context(
+            as_of_date=signal.date,
+            market_breadth_pct_above_200ma=0.58,
+            market_breadth_pct_above_50ma=0.67,
+            market_breadth_state="neutral",
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+        market_breadth_entry_floor_200ma=0.40,
+    )
+
+    assert candidate.approved is True
+    assert candidate.rejection_reasons == ()
+
+
+def test_assess_signal_candidate_blocks_stressed_volatility_regime() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        market_context=build_market_context(
+            as_of_date=signal.date,
+            vix_close=33.4,
+            vix_sma_short=31.0,
+            vix_sma_long=26.2,
+            volatility_regime_state="stressed",
+            volatility_regime_risk_off=True,
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+        vix_entry_block_threshold=30.0,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Volatility regime is stressed: VIX is 33.4, above the 30.0 entry block threshold.",
+    )
+
+
+def test_assess_signal_candidate_reports_missing_vix_for_stressed_regime_block() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        market_context=build_market_context(
+            as_of_date=signal.date,
+            vix_sma_short=31.0,
+            vix_sma_long=26.2,
+            volatility_regime_state="stressed",
+            volatility_regime_risk_off=True,
+        ),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+        vix_entry_block_threshold=30.0,
+    )
+
+    assert candidate.approved is False
+    assert candidate.rejection_reasons == (
+        "Volatility regime is stressed; VIX data is unavailable but derived regime state indicates stressed conditions.",
+    )
+
+
+def test_assess_signal_candidate_does_not_block_missing_volatility_context() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        market_context=build_market_context(as_of_date=signal.date),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+        vix_entry_block_threshold=30.0,
+    )
+
+    assert candidate.approved is True
+    assert candidate.rejection_reasons == ()
+
+
+def test_assess_signal_candidate_does_not_block_missing_market_breadth() -> None:
+    signal = _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0)
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+    candidate_features = build_candidate_features(
+        signal,
+        as_of_date=signal.date,
+        market_context=build_market_context(as_of_date=signal.date),
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        candidate_features=candidate_features,
+        market_breadth_entry_floor_200ma=0.40,
     )
 
     assert candidate.approved is True
@@ -1176,6 +1438,313 @@ def test_review_existing_long_position_intraday_exits_failed_strength_at_watch_t
     assert decision.metadata["session_high_giveback_pct"] < 0.10
     assert decision.metadata["session_high_giveback_pct"] >= decision.metadata["session_high_giveback_watch_threshold"]
     assert "failed to hold" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_intraday_escalates_persistent_weakness_after_repeated_watchs() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=90.0,
+    )
+    features = apply_intraday_trajectory_features(
+        build_intraday_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            current_stop=90.0,
+            session_open=100.0,
+            session_high=104.0,
+            session_low=98.8,
+            latest_close=99.0,
+            latest_low=98.9,
+            session_vwap=101.0,
+            intraday_return_vs_benchmark=-0.031,
+            early_strength_threshold=0.03,
+            meaningful_profit_pct=0.05,
+            session_high_giveback_watch_threshold=0.04,
+            intraday_relative_strength_watch_threshold=-0.02,
+            sector_relative_strength_watch_threshold=-0.05,
+        ),
+        IntradayTrajectoryFeatures(
+            observation_count=4,
+            consecutive_polls_below_vwap=3,
+            consecutive_polls_weak_relative_strength=3,
+            intraday_pressure_persistence_count=3,
+            max_session_high_giveback_seen=(104.0 - 99.0) / 104.0,
+            worsening_session_high_giveback=True,
+            giveback_worsening_polls=3,
+            giveback_worsening_from_pct=0.021,
+            repeated_watch_closely_count=2,
+            weakening_all_session=True,
+            recovered_after_weakness=False,
+        ),
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        position_features=features,
+        session_open=100.0,
+        session_high=104.0,
+        session_low=98.8,
+        latest_close=99.0,
+        latest_low=98.9,
+        session_vwap=101.0,
+        intraday_persistent_weakness_poll_threshold=3,
+        intraday_repeated_watch_exit_threshold=2,
+    )
+
+    assert decision.suggested_action == "EXIT CANDIDATE"
+    assert decision.metadata["repeated_watch_closely_count"] == 2
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert "watch closely on 2 consecutive prior polls" in joined_rationale
+    assert "below session vwap for 3 consecutive polls" in joined_rationale
+    assert "giveback from session high has worsened" in joined_rationale
+
+
+def test_review_existing_long_position_intraday_recovery_after_weakness_does_not_over_punish() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+    features = apply_intraday_trajectory_features(
+        build_intraday_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            current_stop=95.0,
+            session_open=100.0,
+            session_high=104.0,
+            session_low=98.0,
+            latest_close=103.2,
+            latest_low=102.8,
+            session_vwap=102.1,
+            intraday_return_vs_benchmark=0.004,
+            early_strength_threshold=0.03,
+            meaningful_profit_pct=0.05,
+            session_high_giveback_watch_threshold=0.04,
+            intraday_relative_strength_watch_threshold=-0.02,
+            sector_relative_strength_watch_threshold=-0.05,
+        ),
+        IntradayTrajectoryFeatures(
+            observation_count=4,
+            consecutive_polls_below_vwap=0,
+            consecutive_polls_weak_relative_strength=0,
+            intraday_pressure_persistence_count=0,
+            max_session_high_giveback_seen=0.041,
+            worsening_session_high_giveback=False,
+            giveback_worsening_polls=0,
+            giveback_worsening_from_pct=None,
+            repeated_watch_closely_count=1,
+            weakening_all_session=False,
+            recovered_after_weakness=True,
+        ),
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        position_features=features,
+        session_open=100.0,
+        session_high=104.0,
+        session_low=98.0,
+        latest_close=103.2,
+        latest_low=102.8,
+        session_vwap=102.1,
+    )
+
+    assert decision.suggested_action == "HOLD"
+    assert decision.metadata["recovered_after_weakness"] is True
+    assert "recovered after earlier intraday weakness" in " ".join(decision.rationale).lower()
+
+
+def test_review_existing_long_position_intraday_suppresses_recovery_note_when_earnings_promote_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+    features = apply_intraday_trajectory_features(
+        build_intraday_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            current_stop=95.0,
+            session_open=100.0,
+            session_high=104.0,
+            session_low=98.0,
+            latest_close=103.2,
+            latest_low=102.8,
+            session_vwap=102.1,
+            intraday_return_vs_benchmark=0.004,
+            earnings_date=date(2024, 1, 10),
+            earnings_days_away=3,
+            earnings_watch_days=7,
+            early_strength_threshold=0.03,
+            meaningful_profit_pct=0.05,
+            session_high_giveback_watch_threshold=0.04,
+            intraday_relative_strength_watch_threshold=-0.02,
+            sector_relative_strength_watch_threshold=-0.05,
+        ),
+        IntradayTrajectoryFeatures(
+            observation_count=4,
+            consecutive_polls_below_vwap=0,
+            consecutive_polls_weak_relative_strength=0,
+            intraday_pressure_persistence_count=0,
+            max_session_high_giveback_seen=0.041,
+            worsening_session_high_giveback=False,
+            giveback_worsening_polls=0,
+            giveback_worsening_from_pct=None,
+            repeated_watch_closely_count=1,
+            weakening_all_session=False,
+            recovered_after_weakness=True,
+        ),
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        position_features=features,
+        session_open=100.0,
+        session_high=104.0,
+        session_low=98.0,
+        latest_close=103.2,
+        latest_low=102.8,
+        session_vwap=102.1,
+        earnings_date=date(2024, 1, 10),
+        earnings_days_away=3,
+        earnings_watch_days=7,
+    )
+
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert "recovered after earlier intraday weakness" not in joined_rationale
+    assert "upcoming earnings" in joined_rationale
+
+
+def test_review_existing_long_position_intraday_suppresses_recovery_note_when_sector_promotes_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+    features = apply_intraday_trajectory_features(
+        build_intraday_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            current_stop=95.0,
+            session_open=100.0,
+            session_high=104.0,
+            session_low=98.0,
+            latest_close=103.2,
+            latest_low=102.8,
+            session_vwap=102.1,
+            intraday_return_vs_benchmark=0.004,
+            sector_name="Technology",
+            sector_etf_symbol="XLK",
+            sector_regime_passed=False,
+            early_strength_threshold=0.03,
+            meaningful_profit_pct=0.05,
+            session_high_giveback_watch_threshold=0.04,
+            intraday_relative_strength_watch_threshold=-0.02,
+            sector_relative_strength_watch_threshold=-0.05,
+        ),
+        IntradayTrajectoryFeatures(
+            observation_count=4,
+            consecutive_polls_below_vwap=0,
+            consecutive_polls_weak_relative_strength=0,
+            intraday_pressure_persistence_count=0,
+            max_session_high_giveback_seen=0.041,
+            worsening_session_high_giveback=False,
+            giveback_worsening_polls=0,
+            giveback_worsening_from_pct=None,
+            repeated_watch_closely_count=1,
+            weakening_all_session=False,
+            recovered_after_weakness=True,
+        ),
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        position_features=features,
+        session_open=100.0,
+        session_high=104.0,
+        session_low=98.0,
+        latest_close=103.2,
+        latest_low=102.8,
+        session_vwap=102.1,
+        sector_name="Technology",
+        sector_etf_symbol="XLK",
+        sector_regime_passed=False,
+    )
+
+    joined_rationale = " ".join(decision.rationale).lower()
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert "recovered after earlier intraday weakness" not in joined_rationale
+    assert "sector etf xlk is below its trend filter" in joined_rationale
+
+
+def test_review_existing_long_position_intraday_weakening_all_session_alone_triggers_watch() -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+    )
+    features = apply_intraday_trajectory_features(
+        build_intraday_position_features(
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            average_entry_price=100.0,
+            current_stop=95.0,
+            session_open=100.0,
+            session_high=101.2,
+            session_low=99.6,
+            latest_close=100.8,
+            latest_low=100.5,
+            session_vwap=100.7,
+            intraday_return_vs_benchmark=0.004,
+            early_strength_threshold=0.03,
+            meaningful_profit_pct=0.05,
+            session_high_giveback_watch_threshold=0.04,
+            intraday_relative_strength_watch_threshold=-0.02,
+            sector_relative_strength_watch_threshold=-0.05,
+        ),
+        IntradayTrajectoryFeatures(
+            observation_count=3,
+            consecutive_polls_below_vwap=0,
+            consecutive_polls_weak_relative_strength=0,
+            intraday_pressure_persistence_count=0,
+            max_session_high_giveback_seen=0.018,
+            worsening_session_high_giveback=False,
+            giveback_worsening_polls=0,
+            giveback_worsening_from_pct=None,
+            repeated_watch_closely_count=0,
+            weakening_all_session=True,
+            recovered_after_weakness=False,
+        ),
+    )
+
+    decision = review_existing_long_position_intraday(
+        position,
+        position_features=features,
+        session_open=100.0,
+        session_high=101.2,
+        session_low=99.6,
+        latest_close=100.8,
+        latest_low=100.5,
+        session_vwap=100.7,
+    )
+
+    assert decision.suggested_action == "WATCH CLOSELY"
+    assert decision.metadata["weakening_all_session"] is True
+    assert (
+        "intraday pressure has persisted throughout all observed polls this session."
+        in " ".join(decision.rationale).lower()
+    )
 
 
 def test_review_existing_long_position_clears_stop_for_weak_regime_exit_candidate() -> None:

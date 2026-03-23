@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any, Mapping
 
+import pandas as pd
+
 from bot.data.earnings import EarningsRiskContext
+from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
 from bot.data.sector_context import SectorFeatureContext
 from bot.strategy.signal_models import StrategySignal
+
+MAX_MARKET_BREADTH_BAR_AGE_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -21,6 +26,34 @@ class MarketContext:
     regime_passed: bool | None = None
     benchmark_return: float | None = None
     benchmark_intraday_return_vs_open: float | None = None
+    market_breadth_pct_above_200ma: float | None = None
+    market_breadth_pct_above_50ma: float | None = None
+    market_breadth_state: str | None = None
+    vix_close: float | None = None
+    vix_sma_short: float | None = None
+    vix_sma_long: float | None = None
+    volatility_regime_state: str | None = None
+    volatility_regime_risk_off: bool | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly representation of the market context."""
+
+        return {
+            "as_of_date": self.as_of_date.isoformat(),
+            "benchmark_symbol": self.benchmark_symbol,
+            "regime_filter_mode": self.regime_filter_mode,
+            "regime_passed": self.regime_passed,
+            "benchmark_return": self.benchmark_return,
+            "benchmark_intraday_return_vs_open": self.benchmark_intraday_return_vs_open,
+            "market_breadth_pct_above_200ma": self.market_breadth_pct_above_200ma,
+            "market_breadth_pct_above_50ma": self.market_breadth_pct_above_50ma,
+            "market_breadth_state": self.market_breadth_state,
+            "vix_close": self.vix_close,
+            "vix_sma_short": self.vix_sma_short,
+            "vix_sma_long": self.vix_sma_long,
+            "volatility_regime_state": self.volatility_regime_state,
+            "volatility_regime_risk_off": self.volatility_regime_risk_off,
+        }
 
 
 @dataclass(frozen=True)
@@ -104,6 +137,17 @@ class PositionFeatures:
     intraday_momentum_fade: bool = False
     weak_intraday_relative_strength: bool = False
     stacked_intraday_weakness: bool = False
+    intraday_observation_count: int = 0
+    consecutive_polls_below_vwap: int = 0
+    consecutive_polls_weak_relative_strength: int = 0
+    intraday_pressure_persistence_count: int = 0
+    max_session_high_giveback_seen: float | None = None
+    worsening_session_high_giveback: bool = False
+    giveback_worsening_polls: int = 0
+    giveback_worsening_from_pct: float | None = None
+    repeated_watch_closely_count: int = 0
+    weakening_all_session: bool = False
+    recovered_after_weakness: bool = False
     market_context: MarketContext | None = None
 
 
@@ -115,6 +159,14 @@ def build_market_context(
     regime_passed: bool | None = None,
     benchmark_return: float | None = None,
     benchmark_intraday_return_vs_open: float | None = None,
+    market_breadth_pct_above_200ma: float | None = None,
+    market_breadth_pct_above_50ma: float | None = None,
+    market_breadth_state: str | None = None,
+    vix_close: float | None = None,
+    vix_sma_short: float | None = None,
+    vix_sma_long: float | None = None,
+    volatility_regime_state: str | None = None,
+    volatility_regime_risk_off: bool | None = None,
 ) -> MarketContext:
     """Build a small typed market context for downstream decision logic."""
 
@@ -125,7 +177,91 @@ def build_market_context(
         regime_passed=regime_passed,
         benchmark_return=benchmark_return,
         benchmark_intraday_return_vs_open=benchmark_intraday_return_vs_open,
+        market_breadth_pct_above_200ma=market_breadth_pct_above_200ma,
+        market_breadth_pct_above_50ma=market_breadth_pct_above_50ma,
+        market_breadth_state=market_breadth_state,
+        vix_close=vix_close,
+        vix_sma_short=vix_sma_short,
+        vix_sma_long=vix_sma_long,
+        volatility_regime_state=volatility_regime_state,
+        volatility_regime_risk_off=volatility_regime_risk_off,
     )
+
+
+def compute_market_breadth_from_frames(
+    symbol_frames: Mapping[str, pd.DataFrame],
+    *,
+    as_of_date: date,
+    long_window: int = 200,
+    short_window: int = 50,
+    entry_floor_200ma: float | None = None,
+) -> dict[str, float | str | None]:
+    """Compute deterministic breadth metrics from the concrete workflow universe."""
+
+    pct_above_200ma = _pct_above_moving_average(
+        symbol_frames,
+        as_of_date=as_of_date,
+        window=long_window,
+    )
+    pct_above_50ma = _pct_above_moving_average(
+        symbol_frames,
+        as_of_date=as_of_date,
+        window=short_window,
+    )
+    return {
+        "market_breadth_pct_above_200ma": pct_above_200ma,
+        "market_breadth_pct_above_50ma": pct_above_50ma,
+        "market_breadth_state": _market_breadth_state(
+            pct_above_200ma,
+            entry_floor_200ma=entry_floor_200ma,
+        ),
+    }
+
+
+def market_context_metadata(
+    market_context: MarketContext | None,
+    *,
+    market_breadth_entry_floor_200ma: float | None = None,
+    vix_caution_threshold: float | None = None,
+    vix_entry_block_threshold: float | None = None,
+) -> dict[str, Any]:
+    """Serialize market-context fields into signal/report metadata."""
+
+    if market_context is None:
+        return {}
+
+    metadata: dict[str, Any] = {}
+    if market_context.market_breadth_pct_above_200ma is not None:
+        metadata["market_breadth_pct_above_200ma"] = (
+            market_context.market_breadth_pct_above_200ma
+        )
+    if market_context.market_breadth_pct_above_50ma is not None:
+        metadata["market_breadth_pct_above_50ma"] = (
+            market_context.market_breadth_pct_above_50ma
+        )
+    if market_context.market_breadth_state is not None:
+        metadata["market_breadth_state"] = market_context.market_breadth_state
+    if market_context.vix_close is not None:
+        metadata["vix_close"] = market_context.vix_close
+    if market_context.vix_sma_short is not None:
+        metadata["vix_sma_short"] = market_context.vix_sma_short
+    if market_context.vix_sma_long is not None:
+        metadata["vix_sma_long"] = market_context.vix_sma_long
+    if market_context.volatility_regime_state is not None:
+        metadata["volatility_regime_state"] = (
+            market_context.volatility_regime_state
+        )
+    if market_context.volatility_regime_risk_off is not None:
+        metadata["volatility_regime_risk_off"] = (
+            market_context.volatility_regime_risk_off
+        )
+    if market_breadth_entry_floor_200ma is not None:
+        metadata["market_breadth_entry_floor_200ma"] = market_breadth_entry_floor_200ma
+    if vix_caution_threshold is not None:
+        metadata["vix_caution_threshold"] = vix_caution_threshold
+    if vix_entry_block_threshold is not None:
+        metadata["vix_entry_block_threshold"] = vix_entry_block_threshold
+    return metadata
 
 
 def build_candidate_features(
@@ -572,6 +708,35 @@ def build_intraday_position_features(
     )
 
 
+def apply_intraday_trajectory_features(
+    features: PositionFeatures,
+    trajectory_features: IntradayTrajectoryFeatures | None,
+) -> PositionFeatures:
+    """Return a copy of intraday features enriched with journal-derived trajectory state."""
+
+    if trajectory_features is None:
+        return features
+
+    return replace(
+        features,
+        intraday_observation_count=trajectory_features.observation_count,
+        consecutive_polls_below_vwap=trajectory_features.consecutive_polls_below_vwap,
+        consecutive_polls_weak_relative_strength=(
+            trajectory_features.consecutive_polls_weak_relative_strength
+        ),
+        intraday_pressure_persistence_count=(
+            trajectory_features.intraday_pressure_persistence_count
+        ),
+        max_session_high_giveback_seen=trajectory_features.max_session_high_giveback_seen,
+        worsening_session_high_giveback=trajectory_features.worsening_session_high_giveback,
+        giveback_worsening_polls=trajectory_features.giveback_worsening_polls,
+        giveback_worsening_from_pct=trajectory_features.giveback_worsening_from_pct,
+        repeated_watch_closely_count=trajectory_features.repeated_watch_closely_count,
+        weakening_all_session=trajectory_features.weakening_all_session,
+        recovered_after_weakness=trajectory_features.recovered_after_weakness,
+    )
+
+
 def _optional_float(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -610,3 +775,60 @@ def _optional_date(value: Any) -> date | None:
         return date.fromisoformat(value.strip())
     except ValueError:
         return None
+
+
+def _pct_above_moving_average(
+    symbol_frames: Mapping[str, pd.DataFrame],
+    *,
+    as_of_date: date,
+    window: int,
+) -> float | None:
+    eligible_count = 0
+    above_count = 0
+    for frame in symbol_frames.values():
+        if frame.empty or "date" not in frame.columns or "close" not in frame.columns:
+            continue
+
+        prepared = frame.sort_values("date", kind="stable").copy()
+        prepared["date"] = pd.to_datetime(prepared["date"], errors="coerce")
+        prepared["close"] = pd.to_numeric(prepared["close"], errors="coerce")
+        prepared = prepared.loc[
+            prepared["date"].notna()
+            & prepared["close"].notna()
+            & (prepared["date"].dt.date <= as_of_date)
+        ]
+        if len(prepared) < window:
+            continue
+        latest_bar_date = prepared["date"].iloc[-1]
+        if (as_of_date - latest_bar_date.date()).days > MAX_MARKET_BREADTH_BAR_AGE_DAYS:
+            continue
+
+        moving_average = prepared["close"].rolling(window).mean().iloc[-1]
+        latest_close = float(prepared["close"].iloc[-1])
+        if pd.isna(moving_average):
+            continue
+
+        eligible_count += 1
+        if latest_close > float(moving_average):
+            above_count += 1
+
+    if eligible_count == 0:
+        return None
+    return above_count / eligible_count
+
+
+def _market_breadth_state(
+    pct_above_200ma: float | None,
+    *,
+    entry_floor_200ma: float | None,
+) -> str | None:
+    if pct_above_200ma is None or entry_floor_200ma is None:
+        return None
+
+    weak_floor = entry_floor_200ma
+    strong_floor = max(0.60, weak_floor + 0.20)
+    if pct_above_200ma < weak_floor:
+        return "weak"
+    if pct_above_200ma >= strong_floor:
+        return "strong"
+    return "neutral"

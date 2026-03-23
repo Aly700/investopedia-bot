@@ -13,6 +13,7 @@ from typing import Any, Mapping, Sequence
 from bot.config import RiskConfig, RulesConfig
 from bot.features import (
     CandidateFeatures,
+    MarketContext,
     PositionFeatures,
     build_candidate_features,
     build_intraday_position_features,
@@ -655,6 +656,8 @@ def review_existing_long_position_intraday(
     early_strength_threshold: float = 0.03,
     intraday_relative_strength_diff: float | None = None,
     intraday_relative_strength_watch_threshold: float = -0.02,
+    intraday_persistent_weakness_poll_threshold: int = 3,
+    intraday_repeated_watch_exit_threshold: int = 2,
     intraday_high_profit_unrealized_pct: float = 0.15,
     intraday_high_profit_giveback_threshold: float = 0.07,
     earnings_date: date | None = None,
@@ -694,6 +697,12 @@ def review_existing_long_position_intraday(
         raise ValueError("meaningful_profit_pct must be greater than zero.")
     if early_strength_threshold <= 0:
         raise ValueError("early_strength_threshold must be greater than zero.")
+    if intraday_persistent_weakness_poll_threshold <= 0:
+        raise ValueError(
+            "intraday_persistent_weakness_poll_threshold must be greater than zero."
+        )
+    if intraday_repeated_watch_exit_threshold <= 0:
+        raise ValueError("intraday_repeated_watch_exit_threshold must be greater than zero.")
     if intraday_high_profit_unrealized_pct <= 0:
         raise ValueError("intraday_high_profit_unrealized_pct must be greater than zero.")
     if intraday_high_profit_giveback_threshold <= 0 or intraday_high_profit_giveback_threshold >= 1:
@@ -743,6 +752,10 @@ def review_existing_long_position_intraday(
         session_high_giveback_watch_threshold=session_high_giveback_watch_threshold,
         meaningful_profit_pct=meaningful_profit_pct,
         intraday_relative_strength_watch_threshold=intraday_relative_strength_watch_threshold,
+        intraday_persistent_weakness_poll_threshold=(
+            intraday_persistent_weakness_poll_threshold
+        ),
+        intraday_repeated_watch_exit_threshold=intraday_repeated_watch_exit_threshold,
         intraday_high_profit_unrealized_pct=intraday_high_profit_unrealized_pct,
         intraday_high_profit_giveback_threshold=intraday_high_profit_giveback_threshold,
         earnings_watch_days=earnings_watch_days,
@@ -757,12 +770,32 @@ def _review_existing_long_position_intraday_from_features(
     session_high_giveback_watch_threshold: float,
     meaningful_profit_pct: float,
     intraday_relative_strength_watch_threshold: float,
+    intraday_persistent_weakness_poll_threshold: int,
+    intraday_repeated_watch_exit_threshold: int,
     intraday_high_profit_unrealized_pct: float,
     intraday_high_profit_giveback_threshold: float,
     earnings_watch_days: int,
     sector_relative_strength_watch_threshold: float,
 ) -> PortfolioReviewDecision:
     weak_sector_regime = features.sector_regime_passed is False
+    persistent_below_vwap = (
+        features.consecutive_polls_below_vwap >= intraday_persistent_weakness_poll_threshold
+    )
+    persistent_relative_weakness = (
+        features.consecutive_polls_weak_relative_strength
+        >= intraday_persistent_weakness_poll_threshold
+    )
+    persistent_intraday_pressure = (
+        features.intraday_pressure_persistence_count
+        >= intraday_persistent_weakness_poll_threshold
+    )
+    repeated_watch_pressure = (
+        features.repeated_watch_closely_count >= intraday_repeated_watch_exit_threshold
+    )
+    worsening_giveback = (
+        features.worsening_session_high_giveback
+        and features.giveback_worsening_polls >= 2
+    )
 
     rationale: list[str] = []
     metadata = {
@@ -785,6 +818,28 @@ def _review_existing_long_position_intraday_from_features(
         "intraday_relative_strength_watch_threshold": intraday_relative_strength_watch_threshold,
         "weak_intraday_relative_strength": features.weak_intraday_relative_strength,
         "stacked_intraday_weakness": features.stacked_intraday_weakness,
+        "intraday_observation_count": features.intraday_observation_count,
+        "consecutive_polls_below_vwap": features.consecutive_polls_below_vwap,
+        "consecutive_polls_weak_relative_strength": (
+            features.consecutive_polls_weak_relative_strength
+        ),
+        "intraday_pressure_persistence_count": (
+            features.intraday_pressure_persistence_count
+        ),
+        "max_session_high_giveback_seen": features.max_session_high_giveback_seen,
+        "worsening_session_high_giveback": features.worsening_session_high_giveback,
+        "giveback_worsening_polls": features.giveback_worsening_polls,
+        "giveback_worsening_from_pct": features.giveback_worsening_from_pct,
+        "repeated_watch_closely_count": features.repeated_watch_closely_count,
+        "weakening_all_session": features.weakening_all_session,
+        "recovered_after_weakness": features.recovered_after_weakness,
+        "intraday_persistent_weakness_poll_threshold": (
+            intraday_persistent_weakness_poll_threshold
+        ),
+        "intraday_repeated_watch_exit_threshold": intraday_repeated_watch_exit_threshold,
+        "persistent_below_vwap": persistent_below_vwap,
+        "persistent_weak_intraday_relative_strength": persistent_relative_weakness,
+        "persistent_intraday_pressure": persistent_intraday_pressure,
         "intraday_high_profit_unrealized_pct": intraday_high_profit_unrealized_pct,
         "intraday_high_profit_giveback_threshold": intraday_high_profit_giveback_threshold,
         "earnings_date": (
@@ -827,6 +882,28 @@ def _review_existing_long_position_intraday_from_features(
         )
         action = "EXIT CANDIDATE"
     elif (
+        repeated_watch_pressure
+        and persistent_intraday_pressure
+        and (
+            (features.session_high_giveback_pct is not None and features.session_high_giveback_pct >= session_high_giveback_watch_threshold)
+            or features.failed_intraday_strength
+            or features.intraday_momentum_fade
+        )
+    ):
+        rationale.append(
+            f"Intraday pressure has persisted for {features.intraday_pressure_persistence_count} consecutive polls."
+        )
+        rationale.append(
+            "Position has already triggered WATCH CLOSELY on "
+            f"{features.repeated_watch_closely_count} consecutive prior polls."
+        )
+        _append_intraday_trajectory_rationale(
+            rationale,
+            features=features,
+            persistent_weakness_poll_threshold=intraday_persistent_weakness_poll_threshold,
+        )
+        action = "EXIT CANDIDATE"
+    elif (
         features.peak_unrealized_pct is not None
         and features.session_high_giveback_pct is not None
         and features.session_high is not None
@@ -854,6 +931,10 @@ def _review_existing_long_position_intraday_from_features(
         features.intraday_momentum_fade
         or features.weak_intraday_relative_strength
         or features.failed_intraday_strength
+        or persistent_below_vwap
+        or persistent_relative_weakness
+        or worsening_giveback
+        or features.weakening_all_session
     ):
         if features.intraday_momentum_fade:
             rationale.append(
@@ -873,6 +954,11 @@ def _review_existing_long_position_intraday_from_features(
                 "Intraday return vs benchmark is "
                 f"{features.intraday_return_vs_benchmark:.1%}."
             )
+        _append_intraday_trajectory_rationale(
+            rationale,
+            features=features,
+            persistent_weakness_poll_threshold=intraday_persistent_weakness_poll_threshold,
+        )
         action = "WATCH CLOSELY"
     else:
         rationale.append("Intraday structure remains healthy and no stop or fade signal is active.")
@@ -903,6 +989,9 @@ def _review_existing_long_position_intraday_from_features(
         if action == "HOLD":
             action = "WATCH CLOSELY"
 
+    if action == "HOLD" and features.recovered_after_weakness:
+        rationale.append(_intraday_recovery_note(features))
+
     return PortfolioReviewDecision(
         latest_close=features.latest_close,
         unrealized_pl_pct=features.unrealized_pl_pct,
@@ -915,6 +1004,53 @@ def _review_existing_long_position_intraday_from_features(
         rationale=tuple(rationale),
         metadata=metadata,
     )
+
+
+def _append_intraday_trajectory_rationale(
+    rationale: list[str],
+    *,
+    features: PositionFeatures,
+    persistent_weakness_poll_threshold: int,
+) -> None:
+    if (
+        features.consecutive_polls_below_vwap >= persistent_weakness_poll_threshold
+        and features.session_vwap is not None
+    ):
+        rationale.append(
+            "Position has remained below session VWAP for "
+            f"{features.consecutive_polls_below_vwap} consecutive polls."
+        )
+    if features.worsening_session_high_giveback and (
+        features.giveback_worsening_from_pct is not None
+        and features.session_high_giveback_pct is not None
+        and features.giveback_worsening_polls >= 2
+    ):
+        rationale.append(
+            "Giveback from session high has worsened from "
+            f"{features.giveback_worsening_from_pct:.1%} to "
+            f"{features.session_high_giveback_pct:.1%} over the last "
+            f"{features.giveback_worsening_polls} polls."
+        )
+    if (
+        features.consecutive_polls_weak_relative_strength >= persistent_weakness_poll_threshold
+        and features.intraday_return_vs_benchmark is not None
+    ):
+        rationale.append(
+            "Intraday weakness versus the benchmark has persisted for "
+            f"{features.consecutive_polls_weak_relative_strength} consecutive polls."
+        )
+    if features.weakening_all_session:
+        rationale.append("Intraday pressure has persisted throughout all observed polls this session.")
+
+
+def _intraday_recovery_note(features: PositionFeatures) -> str:
+    if (
+        features.session_vwap is not None
+        and features.close_vs_vwap_pct is not None
+        and features.close_vs_vwap_pct >= 0
+    ):
+        return "Position recovered after earlier intraday weakness and is back above session VWAP."
+    return "Position recovered after earlier intraday weakness."
 
 
 def apply_drawdown_risk_adjustment(
@@ -990,10 +1126,18 @@ def assess_signal_candidate(
     sector_regime_passed: bool | None = None,
     relative_strength_vs_sector: float | None = None,
     sector_relative_strength_window: int | None = None,
+    market_context: MarketContext | None = None,
+    market_breadth_entry_floor_200ma: float | None = None,
+    vix_entry_block_threshold: float | None = None,
     require_sector_regime_for_entries: bool = False,
     sector_relative_strength_entry_reject_threshold: float | None = None,
 ) -> RiskAssessedCandidate:
     """Combine sizing and portfolio rules into one risk-assessed entry candidate."""
+
+    if candidate_features is not None and market_context is not None:
+        raise ValueError(
+            "Pass market_context via candidate_features, not as a separate argument."
+        )
 
     existing_position = _find_existing_position(current_positions, signal.symbol)
     resolved_stop_price = signal.stop_hint if stop_price is None else stop_price
@@ -1020,6 +1164,7 @@ def assess_signal_candidate(
         sector_regime_passed=sector_regime_passed,
         relative_strength_vs_sector=relative_strength_vs_sector,
         sector_relative_strength_window=sector_relative_strength_window,
+        market_context=market_context,
     )
 
     if resolved_stop_price is None:
@@ -1055,6 +1200,8 @@ def assess_signal_candidate(
         existing_position=existing_position,
         stop_price=resolved_stop_price,
         earnings_entry_block_days=earnings_entry_block_days,
+        market_breadth_entry_floor_200ma=market_breadth_entry_floor_200ma,
+        vix_entry_block_threshold=vix_entry_block_threshold,
         require_sector_regime_for_entries=require_sector_regime_for_entries,
         sector_relative_strength_entry_reject_threshold=(
             sector_relative_strength_entry_reject_threshold
@@ -1073,6 +1220,8 @@ def _assess_signal_candidate_from_features(
     existing_position: ExistingPosition | None,
     stop_price: float,
     earnings_entry_block_days: int | None,
+    market_breadth_entry_floor_200ma: float | None,
+    vix_entry_block_threshold: float | None,
     require_sector_regime_for_entries: bool,
     sector_relative_strength_entry_reject_threshold: float | None,
 ) -> RiskAssessedCandidate:
@@ -1080,6 +1229,15 @@ def _assess_signal_candidate_from_features(
         raise ValueError("earnings_days_away cannot be negative.")
     if earnings_entry_block_days is not None and earnings_entry_block_days <= 0:
         raise ValueError("earnings_entry_block_days must be greater than zero when provided.")
+    if market_breadth_entry_floor_200ma is not None and (
+        market_breadth_entry_floor_200ma <= 0
+        or market_breadth_entry_floor_200ma >= 1
+    ):
+        raise ValueError(
+            "market_breadth_entry_floor_200ma must be between zero and one when provided."
+        )
+    if vix_entry_block_threshold is not None and vix_entry_block_threshold <= 0:
+        raise ValueError("vix_entry_block_threshold must be greater than zero when provided.")
     if (
         features.sector_relative_strength_window is not None
         and features.sector_relative_strength_window <= 0
@@ -1125,6 +1283,50 @@ def _assess_signal_candidate_from_features(
                 earnings_date=features.earnings_date,
                 earnings_days_away=features.earnings_days_away,
                 earnings_entry_block_days=earnings_entry_block_days,
+            )
+        )
+
+    market_breadth_pct_above_200ma = (
+        features.market_context.market_breadth_pct_above_200ma
+        if features.market_context is not None
+        else None
+    )
+    if (
+        market_breadth_entry_floor_200ma is not None
+        and market_breadth_pct_above_200ma is not None
+        and market_breadth_pct_above_200ma < market_breadth_entry_floor_200ma
+    ):
+        rejection_reasons.append(
+            _market_breadth_entry_reject_reason(
+                market_breadth_pct_above_200ma=market_breadth_pct_above_200ma,
+                market_breadth_entry_floor_200ma=market_breadth_entry_floor_200ma,
+            )
+        )
+
+    vix_close = (
+        features.market_context.vix_close
+        if features.market_context is not None
+        else None
+    )
+    volatility_regime_state = (
+        features.market_context.volatility_regime_state
+        if features.market_context is not None
+        else None
+    )
+    volatility_regime_risk_off = (
+        features.market_context.volatility_regime_risk_off
+        if features.market_context is not None
+        else None
+    )
+    if vix_entry_block_threshold is not None and (
+        volatility_regime_risk_off is True
+        or (vix_close is not None and vix_close >= vix_entry_block_threshold)
+    ):
+        rejection_reasons.append(
+            _volatility_entry_reject_reason(
+                vix_close=vix_close,
+                vix_entry_block_threshold=vix_entry_block_threshold,
+                volatility_regime_state=volatility_regime_state,
             )
         )
 
@@ -1205,6 +1407,36 @@ def _earnings_entry_block_reason(
     return (
         f"Upcoming earnings on {earnings_date.isoformat()} are {earnings_days_away} "
         f"trading days away; new entries are blocked within {earnings_entry_block_days} trading days."
+    )
+
+
+def _market_breadth_entry_reject_reason(
+    *,
+    market_breadth_pct_above_200ma: float,
+    market_breadth_entry_floor_200ma: float,
+) -> str:
+    return (
+        "Market breadth is weak: "
+        f"{market_breadth_pct_above_200ma:.0%} of the universe is above its 200-day moving average; "
+        f"new entries require at least {market_breadth_entry_floor_200ma:.0%}."
+    )
+
+
+def _volatility_entry_reject_reason(
+    *,
+    vix_close: float | None,
+    vix_entry_block_threshold: float,
+    volatility_regime_state: str | None,
+) -> str:
+    state = volatility_regime_state or "stressed"
+    if vix_close is None:
+        return (
+            f"Volatility regime is {state}; VIX data is unavailable but derived regime state "
+            f"indicates {state} conditions."
+        )
+    return (
+        f"Volatility regime is {state}: VIX is {vix_close:.1f}, above the "
+        f"{vix_entry_block_threshold:.1f} entry block threshold."
     )
 
 

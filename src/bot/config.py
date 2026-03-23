@@ -178,6 +178,9 @@ class SignalConfig:
     relative_volume_threshold: float
     earnings_entry_block_days: int = 3
     earnings_watch_days: int = 7
+    market_breadth_entry_floor_200ma: float | None = 0.40
+    vix_caution_threshold: float | None = 25.0
+    vix_entry_block_threshold: float | None = 30.0
     require_sector_regime_for_entries: bool = True
     sector_relative_strength_window: int = 20
     sector_relative_strength_entry_reject_threshold: float = -0.05
@@ -187,6 +190,15 @@ class SignalConfig:
     def from_mapping(cls, data: Mapping[str, Any]) -> "SignalConfig":
         earnings_entry_block_days = _as_optional_int(data, "earnings_entry_block_days")
         earnings_watch_days = _as_optional_int(data, "earnings_watch_days")
+        market_breadth_entry_floor_200ma = _as_optional_float(
+            data,
+            "market_breadth_entry_floor_200ma",
+        )
+        vix_caution_threshold = _as_optional_float(data, "vix_caution_threshold")
+        vix_entry_block_threshold = _as_optional_float(
+            data,
+            "vix_entry_block_threshold",
+        )
         sector_relative_strength_window = _as_optional_int(data, "sector_relative_strength_window")
         sector_relative_strength_entry_reject_threshold = _as_optional_float(
             data,
@@ -211,6 +223,17 @@ class SignalConfig:
                 earnings_watch_days
                 if earnings_watch_days is not None
                 else 7
+            ),
+            market_breadth_entry_floor_200ma=market_breadth_entry_floor_200ma,
+            vix_caution_threshold=(
+                vix_caution_threshold
+                if vix_caution_threshold is not None
+                else 25.0
+            ),
+            vix_entry_block_threshold=(
+                vix_entry_block_threshold
+                if vix_entry_block_threshold is not None
+                else 30.0
             ),
             require_sector_regime_for_entries=_as_bool(
                 data,
@@ -247,6 +270,29 @@ class SignalConfig:
             raise ConfigError("Expected 'earnings_entry_block_days' to be greater than zero.")
         if self.earnings_watch_days <= 0:
             raise ConfigError("Expected 'earnings_watch_days' to be greater than zero.")
+        if self.market_breadth_entry_floor_200ma is not None and (
+            self.market_breadth_entry_floor_200ma <= 0
+            or self.market_breadth_entry_floor_200ma >= 1
+        ):
+            raise ConfigError(
+                "Expected 'market_breadth_entry_floor_200ma' to be between zero and one when provided."
+            )
+        if self.vix_caution_threshold is not None and self.vix_caution_threshold <= 0:
+            raise ConfigError(
+                "Expected 'vix_caution_threshold' to be greater than zero when provided."
+            )
+        if self.vix_entry_block_threshold is not None and self.vix_entry_block_threshold <= 0:
+            raise ConfigError(
+                "Expected 'vix_entry_block_threshold' to be greater than zero when provided."
+            )
+        if (
+            self.vix_caution_threshold is not None
+            and self.vix_entry_block_threshold is not None
+            and self.vix_caution_threshold >= self.vix_entry_block_threshold
+        ):
+            raise ConfigError(
+                "Expected 'vix_caution_threshold' to be less than 'vix_entry_block_threshold'."
+            )
         if self.sector_relative_strength_window <= 0:
             raise ConfigError(
                 "Expected 'sector_relative_strength_window' to be greater than zero."

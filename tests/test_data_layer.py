@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 import json
 from pathlib import Path
 
@@ -23,9 +23,22 @@ from bot.data.earnings import (
     build_earnings_risk_contexts,
     trading_days_until,
 )
+from bot.data.intraday_state_journal import (
+    IntradayStateObservation,
+    build_intraday_trajectory_features,
+    default_intraday_state_journal_path,
+    load_intraday_state_journal,
+    preview_intraday_trajectory_features,
+    update_intraday_state_journal,
+    write_intraday_state_journal,
+)
 from bot.data.sector_context import (
     SymbolSectorClassification,
     build_sector_feature_contexts,
+)
+from bot.data.volatility_context import (
+    MAX_VOLATILITY_CONTEXT_BAR_AGE_DAYS,
+    build_volatility_regime_context,
 )
 from bot.data.normalize import (
     DAILY_BAR_COLUMNS,
@@ -252,6 +265,122 @@ def test_provider_intraday_fetch_bypasses_cache_by_default(tmp_path: Path) -> No
     assert provider.intraday_fetch_count == 2
     assert first["close"].tolist() == [10.5, 10.7]
     assert second["close"].tolist() == [11.5, 11.7]
+
+
+def test_build_volatility_regime_context_uses_vix_alias_fallback(tmp_path: Path) -> None:
+    dates = pd.date_range("2023-12-12", periods=25, freq="D")
+    vix_frame = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [24.0] * 25,
+            "high": [25.0] * 25,
+            "low": [23.0] * 25,
+            "close": [24.0] * 24 + [26.4],
+            "volume": [0] * 25,
+            "symbol": ["VIX"] * 25,
+        }
+    )
+    provider = FakeDailyBarProvider(frames_by_symbol={"VIX": vix_frame}, cache_dir=tmp_path)
+
+    context = build_volatility_regime_context(
+        provider=provider,
+        as_of_date=date(2024, 1, 5),
+        history_start=date(2023, 12, 1),
+        caution_threshold=25.0,
+        entry_block_threshold=30.0,
+    )
+
+    assert context["vix_close"] == pytest.approx(26.4)
+    assert context["volatility_regime_state"] == "elevated"
+    assert context["volatility_regime_risk_off"] is False
+    assert context["vix_sma_short"] is not None
+    assert context["vix_sma_long"] is not None
+
+
+def test_build_volatility_regime_context_marks_stressed_regime_when_vix_exceeds_block_threshold(
+    tmp_path: Path,
+) -> None:
+    dates = pd.date_range("2023-12-12", periods=25, freq="D")
+    vix_frame = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [28.0] * 25,
+            "high": [32.0] * 25,
+            "low": [27.0] * 25,
+            "close": [28.0] * 24 + [31.2],
+            "volume": [0] * 25,
+            "symbol": ["^VIX"] * 25,
+        }
+    )
+    provider = FakeDailyBarProvider(frames_by_symbol={"^VIX": vix_frame}, cache_dir=tmp_path)
+
+    context = build_volatility_regime_context(
+        provider=provider,
+        as_of_date=date(2024, 1, 5),
+        history_start=date(2023, 12, 1),
+        caution_threshold=25.0,
+        entry_block_threshold=30.0,
+    )
+
+    assert context["vix_close"] == pytest.approx(31.2)
+    assert context["volatility_regime_state"] == "stressed"
+    assert context["volatility_regime_risk_off"] is True
+
+
+def test_build_volatility_regime_context_degrades_gracefully_when_vix_is_missing(
+    tmp_path: Path,
+) -> None:
+    provider = FakeDailyBarProvider(frames_by_symbol={}, cache_dir=tmp_path)
+
+    context = build_volatility_regime_context(
+        provider=provider,
+        as_of_date=date(2024, 1, 5),
+        history_start=date(2023, 12, 1),
+        caution_threshold=25.0,
+        entry_block_threshold=30.0,
+    )
+
+    assert context == {
+        "vix_close": None,
+        "vix_sma_short": None,
+        "vix_sma_long": None,
+        "volatility_regime_state": None,
+        "volatility_regime_risk_off": None,
+    }
+
+
+def test_build_volatility_regime_context_degrades_gracefully_when_vix_bars_are_stale(
+    tmp_path: Path,
+) -> None:
+    dates = pd.date_range("2023-12-01", periods=25, freq="D")
+    vix_frame = pd.DataFrame(
+        {
+            "date": dates,
+            "open": [24.0] * 25,
+            "high": [25.0] * 25,
+            "low": [23.0] * 25,
+            "close": [24.0] * 25,
+            "volume": [0] * 25,
+            "symbol": ["^VIX"] * 25,
+        }
+    )
+    provider = FakeDailyBarProvider(frames_by_symbol={"^VIX": vix_frame}, cache_dir=tmp_path)
+
+    context = build_volatility_regime_context(
+        provider=provider,
+        as_of_date=(dates[-1] + timedelta(days=MAX_VOLATILITY_CONTEXT_BAR_AGE_DAYS + 1)).date(),
+        history_start=date(2023, 12, 1),
+        caution_threshold=25.0,
+        entry_block_threshold=30.0,
+    )
+
+    assert context == {
+        "vix_close": None,
+        "vix_sma_short": None,
+        "vix_sma_long": None,
+        "volatility_regime_state": None,
+        "volatility_regime_risk_off": None,
+    }
 
 
 def test_provider_intraday_fetch_excludes_premarket_and_after_hours(tmp_path: Path) -> None:
@@ -748,6 +877,319 @@ def test_candidate_score_journal_ignores_corrupt_files(
     assert "Ignoring candidate score journal" in caplog.text
 
 
+def test_intraday_state_journal_updates_and_persists_repeated_polls(
+    tmp_path: Path,
+) -> None:
+    session_date = date(2024, 1, 5)
+    journal_path = default_intraday_state_journal_path(tmp_path, session_date)
+    journal = load_intraday_state_journal(journal_path, session_date=session_date)
+
+    first_observation = _intraday_state_observation(
+        timestamp="2024-01-05T09:45:00",
+        latest_close=101.0,
+        close_vs_vwap_pct=-0.004,
+        session_high_giveback_pct=0.021,
+        intraday_return_vs_benchmark=-0.010,
+        weak_intraday_relative_strength=False,
+        suggested_action="WATCH CLOSELY",
+    )
+    second_observation = _intraday_state_observation(
+        timestamp="2024-01-05T10:00:00",
+        latest_close=99.8,
+        close_vs_vwap_pct=-0.012,
+        session_high_giveback_pct=0.038,
+        intraday_return_vs_benchmark=-0.024,
+        weak_intraday_relative_strength=True,
+        suggested_action="EXIT CANDIDATE",
+    )
+
+    journal = update_intraday_state_journal(
+        journal,
+        observations={"AAPL": first_observation},
+    )
+    write_intraday_state_journal(journal, journal_path)
+    reloaded = load_intraday_state_journal(journal_path, session_date=session_date)
+    updated = update_intraday_state_journal(
+        reloaded,
+        observations={"AAPL": second_observation},
+    )
+    reloaded = load_intraday_state_journal(
+        write_intraday_state_journal(updated, journal_path),
+        session_date=session_date,
+    )
+
+    assert journal_path.exists()
+    assert [observation.timestamp for observation in reloaded.entries["AAPL"]] == [
+        "2024-01-05T09:45:00",
+        "2024-01-05T10:00:00",
+    ]
+    assert reloaded.entries["AAPL"][-1].suggested_action == "EXIT CANDIDATE"
+
+
+def test_intraday_state_journal_same_timestamp_is_idempotent() -> None:
+    session_date = date(2024, 1, 5)
+    journal = update_intraday_state_journal(
+        load_intraday_state_journal(
+            Path("/tmp/does-not-exist-intraday-state.json"),
+            session_date=session_date,
+        ),
+        observations={
+            "AAPL": _intraday_state_observation(
+                timestamp="2024-01-05T10:00:00",
+                latest_close=101.0,
+                close_vs_vwap_pct=-0.006,
+                session_high_giveback_pct=0.024,
+                intraday_return_vs_benchmark=-0.011,
+                weak_intraday_relative_strength=False,
+                suggested_action="WATCH CLOSELY",
+            )
+        },
+    )
+
+    rerun = update_intraday_state_journal(
+        journal,
+        observations={
+            "AAPL": _intraday_state_observation(
+                timestamp="2024-01-05T10:00:00",
+                latest_close=99.5,
+                close_vs_vwap_pct=-0.015,
+                session_high_giveback_pct=0.041,
+                intraday_return_vs_benchmark=-0.028,
+                weak_intraday_relative_strength=True,
+                suggested_action="EXIT CANDIDATE",
+            )
+        },
+    )
+
+    assert len(rerun.entries["AAPL"]) == 1
+    assert rerun.entries["AAPL"][0].latest_close == pytest.approx(99.5)
+    assert rerun.entries["AAPL"][0].suggested_action == "EXIT CANDIDATE"
+
+
+def test_intraday_state_journal_ignores_corrupt_files(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session_date = date(2024, 1, 5)
+    journal_path = default_intraday_state_journal_path(tmp_path, session_date)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{not-json", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        journal = load_intraday_state_journal(journal_path, session_date=session_date)
+
+    assert journal.entries == {}
+    assert "Ignoring intraday state journal" in caplog.text
+
+
+def test_preview_intraday_trajectory_features_rejects_resolved_observation() -> None:
+    with pytest.raises(
+        ValueError,
+        match="expects an unresolved observation with suggested_action=None",
+    ):
+        preview_intraday_trajectory_features(
+            load_intraday_state_journal(
+                Path("/tmp/does-not-exist-intraday-state.json"),
+                session_date=date(2024, 1, 5),
+            ),
+            observation=_intraday_state_observation(
+                timestamp="2024-01-05T10:00:00",
+                latest_close=99.5,
+                close_vs_vwap_pct=-0.015,
+                session_high_giveback_pct=0.041,
+                suggested_action="WATCH CLOSELY",
+            ),
+        )
+
+
+def test_build_intraday_trajectory_features_counts_resolved_last_watch_observation() -> None:
+    trajectory = build_intraday_trajectory_features(
+        [
+            _intraday_state_observation(
+                timestamp="2024-01-05T09:45:00",
+                latest_close=100.8,
+                close_vs_vwap_pct=0.002,
+                session_high_giveback_pct=0.012,
+                suggested_action="HOLD",
+            ),
+            _intraday_state_observation(
+                timestamp="2024-01-05T10:00:00",
+                latest_close=99.7,
+                close_vs_vwap_pct=-0.009,
+                session_high_giveback_pct=0.031,
+                suggested_action="WATCH CLOSELY",
+            ),
+        ]
+    )
+
+    assert trajectory.repeated_watch_closely_count == 1
+
+
+def test_intraday_trajectory_features_count_consecutive_below_vwap_polls() -> None:
+    trajectory = build_intraday_trajectory_features(
+        [
+            _intraday_state_observation(
+                timestamp="2024-01-05T09:30:00",
+                latest_close=101.0,
+                close_vs_vwap_pct=0.002,
+                session_high_giveback_pct=0.010,
+                intraday_return_vs_benchmark=0.002,
+            ),
+            _intraday_state_observation(
+                timestamp="2024-01-05T09:45:00",
+                latest_close=100.5,
+                close_vs_vwap_pct=-0.003,
+                session_high_giveback_pct=0.019,
+                intraday_return_vs_benchmark=-0.005,
+            ),
+            _intraday_state_observation(
+                timestamp="2024-01-05T10:00:00",
+                latest_close=99.8,
+                close_vs_vwap_pct=-0.008,
+                session_high_giveback_pct=0.028,
+                intraday_return_vs_benchmark=-0.024,
+                weak_intraday_relative_strength=True,
+            ),
+            _intraday_state_observation(
+                timestamp="2024-01-05T10:15:00",
+                latest_close=99.2,
+                close_vs_vwap_pct=-0.015,
+                session_high_giveback_pct=0.041,
+                intraday_return_vs_benchmark=-0.031,
+                weak_intraday_relative_strength=True,
+            ),
+        ]
+    )
+
+    assert trajectory.observation_count == 4
+    assert trajectory.consecutive_polls_below_vwap == 3
+    assert trajectory.consecutive_polls_weak_relative_strength == 2
+    assert trajectory.intraday_pressure_persistence_count == 3
+    assert trajectory.weakening_all_session is False
+
+
+def test_intraday_trajectory_features_detect_worsening_giveback() -> None:
+    trajectory = build_intraday_trajectory_features(
+        [
+            _intraday_state_observation(
+                timestamp="2024-01-05T09:30:00",
+                latest_close=101.5,
+                close_vs_vwap_pct=0.003,
+                session_high_giveback_pct=0.021,
+            ),
+            _intraday_state_observation(
+                timestamp="2024-01-05T09:45:00",
+                latest_close=101.0,
+                close_vs_vwap_pct=-0.001,
+                session_high_giveback_pct=0.035,
+            ),
+            _intraday_state_observation(
+                timestamp="2024-01-05T10:00:00",
+                latest_close=100.4,
+                close_vs_vwap_pct=-0.006,
+                session_high_giveback_pct=0.048,
+            ),
+            _intraday_state_observation(
+                timestamp="2024-01-05T10:15:00",
+                latest_close=99.9,
+                close_vs_vwap_pct=-0.011,
+                session_high_giveback_pct=0.057,
+            ),
+        ]
+    )
+
+    assert trajectory.worsening_session_high_giveback is True
+    assert trajectory.giveback_worsening_polls == 4
+    assert trajectory.giveback_worsening_from_pct == pytest.approx(0.021)
+    assert trajectory.max_session_high_giveback_seen == pytest.approx(0.057)
+
+
+def test_intraday_state_journal_ignores_boolean_float_fields(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session_date = date(2024, 1, 5)
+    journal_path = default_intraday_state_journal_path(tmp_path, session_date)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+
+    journal_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_date": "2024-01-05",
+                "updated_at": None,
+                "symbols": {
+                    "AAPL": {
+                        "observations": [
+                            {
+                                "timestamp": "2024-01-05T10:00:00",
+                                "latest_close": True,
+                                "session_vwap": 100.0,
+                                "close_vs_vwap_pct": -0.01,
+                                "session_high": 103.0,
+                                "session_low": 98.0,
+                                "session_high_giveback_pct": 0.03,
+                                "intraday_return_vs_open": -0.01,
+                                "intraday_return_vs_benchmark": -0.02,
+                                "weak_intraday_relative_strength": False,
+                                "failed_intraday_strength": False,
+                                "intraday_momentum_fade": False,
+                                "stacked_intraday_weakness": False,
+                                "stop_breached_intraday": False,
+                                "suggested_action": "WATCH CLOSELY",
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        journal = load_intraday_state_journal(journal_path, session_date=session_date)
+    assert journal.entries == {}
+
+    journal_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "session_date": "2024-01-05",
+                "updated_at": None,
+                "symbols": {
+                    "AAPL": {
+                        "observations": [
+                            {
+                                "timestamp": "2024-01-05T10:00:00",
+                                "latest_close": 100.0,
+                                "session_vwap": True,
+                                "close_vs_vwap_pct": -0.01,
+                                "session_high": 103.0,
+                                "session_low": 98.0,
+                                "session_high_giveback_pct": 0.03,
+                                "intraday_return_vs_open": -0.01,
+                                "intraday_return_vs_benchmark": -0.02,
+                                "weak_intraday_relative_strength": False,
+                                "failed_intraday_strength": False,
+                                "intraday_momentum_fade": False,
+                                "stacked_intraday_weakness": False,
+                                "stop_breached_intraday": False,
+                                "suggested_action": "WATCH CLOSELY",
+                            }
+                        ]
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        journal = load_intraday_state_journal(journal_path, session_date=session_date)
+    assert journal.entries == {}
+    assert "Ignoring intraday state journal" in caplog.text
+
+
 def test_load_candidate_symbols_supports_text_and_csv(tmp_path: Path) -> None:
     text_path = tmp_path / "candidates.txt"
     text_path.write_text("aapl\nmsft, nvda\nbrk.b\n# comment\nAAPL\n", encoding="utf-8")
@@ -756,6 +1198,36 @@ def test_load_candidate_symbols_supports_text_and_csv(tmp_path: Path) -> None:
 
     assert load_candidate_symbols(text_path) == ["AAPL", "MSFT", "NVDA", "BRK.B"]
     assert load_candidate_symbols(csv_path) == ["SPY", "QQQ"]
+
+
+def _intraday_state_observation(
+    *,
+    timestamp: str,
+    latest_close: float,
+    close_vs_vwap_pct: float,
+    session_high_giveback_pct: float,
+    intraday_return_vs_benchmark: float | None = None,
+    weak_intraday_relative_strength: bool = False,
+    suggested_action: str | None = None,
+) -> IntradayStateObservation:
+    return IntradayStateObservation(
+        symbol="AAPL",
+        timestamp=timestamp,
+        latest_close=latest_close,
+        session_vwap=100.0,
+        close_vs_vwap_pct=close_vs_vwap_pct,
+        session_high=103.0,
+        session_low=98.0,
+        session_high_giveback_pct=session_high_giveback_pct,
+        intraday_return_vs_open=-0.01,
+        intraday_return_vs_benchmark=intraday_return_vs_benchmark,
+        weak_intraday_relative_strength=weak_intraday_relative_strength,
+        failed_intraday_strength=False,
+        intraday_momentum_fade=False,
+        stacked_intraday_weakness=False,
+        stop_breached_intraday=False,
+        suggested_action=suggested_action,
+    )
 
 
 def test_universe_builder_filters_and_ranks_symbols(tmp_path: Path) -> None:

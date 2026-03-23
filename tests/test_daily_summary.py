@@ -13,9 +13,11 @@ import pytest
 import bot.main as main_module
 from bot.config import load_app_config
 from bot.data.earnings import EarningsRiskContext
+from bot.data.intraday_state_journal import default_intraday_state_journal_path
 from bot.data.sector_context import SectorFeatureContext
 from bot.data.providers import DataProviderError
 from bot.execution.manual_executor import ManualExecutor
+from bot.features import build_market_context
 from bot.main import _load_top_preset_name_from_results, _parse_text_list, build_parser
 from bot.reporting.daily_report import (
     MARKET_MONITOR_CATEGORIES,
@@ -1342,7 +1344,7 @@ def test_intraday_session_vwap_aggregates_explicit_bar_vwap() -> None:
 
 
 def test_build_portfolio_review_intraday_row_uses_provider_and_metrics() -> None:
-    config = load_app_config()
+    config = replace(load_app_config(), project_root=Path("/tmp/intraday-row-project-root"))
     preset = _selected_presets("standard_breakout")[0]
     settings = main_module.BreakoutMomentumSettings.from_configs(
         config.strategy.signals,
@@ -1399,7 +1401,7 @@ def test_build_portfolio_review_intraday_row_uses_provider_and_metrics() -> None
             )
 
     provider = FakeProvider()
-    row = main_module._build_portfolio_review_intraday_row(
+    row, observation = main_module._build_portfolio_review_intraday_row(
         plan,
         provider=provider,
         as_of_date=date(2024, 1, 5),
@@ -1426,6 +1428,8 @@ def test_build_portfolio_review_intraday_row_uses_provider_and_metrics() -> None
     assert row.metadata["session_high"] == 116.0
     assert row.metadata["session_vwap"] == pytest.approx((111.0 * 500_000 + 111.5 * 600_000 + 111.0 * 550_000) / 1_650_000)
     assert row.metadata["intraday_relative_strength_diff"] is not None
+    assert observation.timestamp == "2024-01-05T15:00:00"
+    assert observation.suggested_action == "EXIT CANDIDATE"
 
 
 def test_handle_review_portfolio_intraday_writes_outputs(
@@ -1433,7 +1437,7 @@ def test_handle_review_portfolio_intraday_writes_outputs(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    config = load_app_config()
+    config = replace(load_app_config(), project_root=tmp_path)
     preset = _selected_presets("standard_breakout")[0]
     portfolio_path = tmp_path / "portfolio.csv"
     portfolio_path.write_text(
@@ -1521,7 +1525,238 @@ def test_handle_review_portfolio_intraday_writes_outputs(
     assert Path(payload["outputs"]["portfolio_review_intraday_json"]).exists()
     assert Path(payload["outputs"]["portfolio_review_intraday_csv"]).exists()
     assert Path(payload["outputs"]["portfolio_review_intraday_brief"]).exists()
+    assert Path(payload["outputs"]["intraday_state_journal"]).exists()
     assert provider.refresh_values == [True, True]
+
+
+def test_handle_review_portfolio_intraday_same_timestamp_state_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    preset = _selected_presets("standard_breakout")[0]
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n"
+        "AAPL,10,100,90,standard_breakout,manual,{}\n",
+        encoding="utf-8",
+    )
+
+    class FakeProvider:
+        def fetch_intraday_bars(
+            self,
+            symbol: str,
+            session_date: date,
+            *,
+            interval_minutes: int = 15,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            if symbol == "SPY":
+                return pd.DataFrame(
+                    {
+                        "datetime": pd.to_datetime(
+                            ["2024-01-05 09:30:00", "2024-01-05 09:45:00", "2024-01-05 10:00:00"]
+                        ),
+                        "open": [100.0, 100.5, 100.8],
+                        "high": [100.8, 101.0, 101.2],
+                        "low": [99.9, 100.4, 100.7],
+                        "close": [100.5, 100.8, 101.0],
+                        "volume": [1_000_000, 1_100_000, 1_200_000],
+                        "vwap": [100.4, 100.6, 100.8],
+                        "symbol": [symbol] * 3,
+                    }
+                )
+            return pd.DataFrame(
+                {
+                    "datetime": pd.to_datetime(
+                        ["2024-01-05 09:30:00", "2024-01-05 09:45:00", "2024-01-05 10:00:00"]
+                    ),
+                    "open": [110.0, 113.0, 109.0],
+                    "high": [113.0, 116.0, 110.0],
+                    "low": [109.0, 108.0, 107.0],
+                    "close": [113.0, 109.0, 107.0],
+                    "volume": [500_000, 600_000, 550_000],
+                    "vwap": [111.0, 111.5, 111.0],
+                    "symbol": [symbol] * 3,
+                }
+            )
+
+    provider = FakeProvider()
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: provider)
+    monkeypatch.setattr(
+        main_module,
+        "_portfolio_review_preset_catalog",
+        lambda args, config: {preset.name: preset},
+    )
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio-intraday",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-05",
+            "--interval-minutes",
+            "15",
+            "--output-dir",
+            str(tmp_path / "intraday"),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_review_portfolio_intraday(args) == 0
+    capsys.readouterr()
+    assert main_module._handle_review_portfolio_intraday(args) == 0
+    capsys.readouterr()
+
+    journal_path = default_intraday_state_journal_path(tmp_path, date(2024, 1, 5))
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+
+    assert len(payload["symbols"]["AAPL"]["observations"]) == 1
+    assert payload["symbols"]["AAPL"]["observations"][0]["timestamp"] == "2024-01-05T10:00:00"
+
+
+def test_handle_review_portfolio_intraday_ignores_corrupt_state_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    preset = _selected_presets("standard_breakout")[0]
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n"
+        "AAPL,10,100,90,standard_breakout,manual,{}\n",
+        encoding="utf-8",
+    )
+    journal_path = default_intraday_state_journal_path(tmp_path, date(2024, 1, 5))
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{bad-json", encoding="utf-8")
+
+    class FakeProvider:
+        def fetch_intraday_bars(
+            self,
+            symbol: str,
+            session_date: date,
+            *,
+            interval_minutes: int = 15,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            if symbol == "SPY":
+                return pd.DataFrame(
+                    {
+                        "datetime": pd.to_datetime(
+                            ["2024-01-05 09:30:00", "2024-01-05 09:45:00", "2024-01-05 10:00:00"]
+                        ),
+                        "open": [100.0, 100.5, 100.8],
+                        "high": [100.8, 101.0, 101.2],
+                        "low": [99.9, 100.4, 100.7],
+                        "close": [100.5, 100.8, 101.0],
+                        "volume": [1_000_000, 1_100_000, 1_200_000],
+                        "vwap": [100.4, 100.6, 100.8],
+                        "symbol": [symbol] * 3,
+                    }
+                )
+            return pd.DataFrame(
+                {
+                    "datetime": pd.to_datetime(
+                        ["2024-01-05 09:30:00", "2024-01-05 09:45:00", "2024-01-05 10:00:00"]
+                    ),
+                    "open": [110.0, 113.0, 109.0],
+                    "high": [113.0, 116.0, 110.0],
+                    "low": [109.0, 108.0, 107.0],
+                    "close": [113.0, 109.0, 107.0],
+                    "volume": [500_000, 600_000, 550_000],
+                    "vwap": [111.0, 111.5, 111.0],
+                    "symbol": [symbol] * 3,
+                }
+            )
+
+    provider = FakeProvider()
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: provider)
+    monkeypatch.setattr(
+        main_module,
+        "_portfolio_review_preset_catalog",
+        lambda args, config: {preset.name: preset},
+    )
+
+    args = build_parser().parse_args(
+        [
+            "review-portfolio-intraday",
+            "--portfolio-file",
+            str(portfolio_path),
+            "--as-of",
+            "2024-01-05",
+            "--interval-minutes",
+            "15",
+            "--output-dir",
+            str(tmp_path / "intraday"),
+            "--format",
+            "json",
+        ]
+    )
+
+    with caplog.at_level("WARNING"):
+        assert main_module._handle_review_portfolio_intraday(args) == 0
+    capsys.readouterr()
+
+    rewritten_payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert rewritten_payload["symbols"]["AAPL"]["observations"]
+    assert "Ignoring intraday state journal" in caplog.text
+
+
+def test_intraday_portfolio_review_brief_includes_trajectory_note(tmp_path: Path) -> None:
+    report = build_intraday_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        interval_minutes=15,
+        portfolio_path="/tmp/portfolio.csv",
+        current_positions=[
+            ExistingPosition(
+                symbol="AAPL",
+                shares=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                preset_name="standard_breakout",
+            )
+        ],
+        benchmark_symbol="SPY",
+        rows=[
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=None,
+                latest_close=101.0,
+                unrealized_pl_pct=0.01,
+                distance_to_stop_pct=(101.0 - 95.0) / 101.0,
+                regime_passed=None,
+                above_entry=True,
+                suggested_action="WATCH CLOSELY",
+                preset_name="standard_breakout",
+                rationale="Position has remained below session VWAP for 3 consecutive polls.",
+                metadata={
+                    "session_vwap": 102.5,
+                    "session_high": 104.0,
+                    "session_high_giveback_pct": 0.03,
+                },
+            )
+        ],
+    )
+
+    brief_path = write_intraday_portfolio_review_brief(
+        report,
+        tmp_path / "portfolio_review_intraday_brief.txt",
+    )
+    text = brief_path.read_text(encoding="utf-8")
+
+    assert "below session VWAP for 3 consecutive polls" in text
 
 
 def test_handle_review_portfolio_intraday_returns_skipped_when_no_data(
@@ -2193,6 +2428,7 @@ def test_comparison_warmup_start_accounts_for_relative_volume_window() -> None:
         presets=presets,
         max_relative_volume_window=80,
         max_sector_relative_strength_window=20,
+        market_breadth_long_window=1,
         enable_regime_filter=False,
     )
 
@@ -2256,6 +2492,181 @@ def test_handle_generate_orders_uses_full_candidate_file_without_strategy_cap(
     assert result == 0
     assert payload["universe_count"] == 105
     assert payload["signal_count"] == 0
+
+
+def test_handle_generate_orders_blocks_candidate_on_weak_market_breadth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate_path = tmp_path / "candidates.txt"
+    candidate_path.write_text("AAPL\n", encoding="utf-8")
+    output_dir = tmp_path / "orders"
+    args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(output_dir),
+            "--format",
+            "json",
+        ]
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [99.0],
+                    "high": [101.0],
+                    "low": [98.0],
+                    "close": [100.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "compute_market_breadth_from_frames",
+        lambda *args, **kwargs: {
+            "market_breadth_pct_above_200ma": 0.37,
+            "market_breadth_pct_above_50ma": 0.48,
+            "market_breadth_state": "weak",
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda *args, **kwargs: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol="AAPL",
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=100.0,
+            stop_hint=95.0,
+            metadata={"prior_high": 99.0, "relative_volume": 1.8},
+        ),
+    )
+
+    result = main_module._handle_generate_orders(args)
+    payload = json.loads(capsys.readouterr().out)
+    report_payload = json.loads(
+        (output_dir / "daily_signal_report.json").read_text(encoding="utf-8")
+    )
+
+    assert result == 0
+    assert payload["market_breadth_state"] == "weak"
+    assert payload["approved_order_count"] == 0
+    assert payload["rejected_signal_count"] == 1
+    assert report_payload["rows"][0]["rejection_reasons"] == [
+        "Market breadth is weak: 37% of the universe is above its 200-day moving average; new entries require at least 40%."
+    ]
+
+
+def test_handle_generate_orders_blocks_candidate_on_stressed_volatility_regime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate_path = tmp_path / "candidates.txt"
+    candidate_path.write_text("AAPL\n", encoding="utf-8")
+    output_dir = tmp_path / "orders"
+    args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(output_dir),
+            "--format",
+            "json",
+        ]
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [99.0],
+                    "high": [101.0],
+                    "low": [98.0],
+                    "close": [100.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context",
+        lambda **kwargs: {
+            "vix_close": 33.4,
+            "vix_sma_short": 31.0,
+            "vix_sma_long": 26.2,
+            "volatility_regime_state": "stressed",
+            "volatility_regime_risk_off": True,
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda *args, **kwargs: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol="AAPL",
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=100.0,
+            stop_hint=95.0,
+            metadata={"prior_high": 99.0, "relative_volume": 1.8},
+        ),
+    )
+
+    result = main_module._handle_generate_orders(args)
+    payload = json.loads(capsys.readouterr().out)
+    report_payload = json.loads(
+        (output_dir / "daily_signal_report.json").read_text(encoding="utf-8")
+    )
+
+    assert result == 0
+    assert payload["vix_close"] == pytest.approx(33.4)
+    assert payload["volatility_regime_state"] == "stressed"
+    assert payload["approved_order_count"] == 0
+    assert payload["rejected_signal_count"] == 1
+    assert report_payload["rows"][0]["rejection_reasons"] == [
+        "Volatility regime is stressed: VIX is 33.4, above the 30.0 entry block threshold."
+    ]
 
 
 def test_handle_generate_orders_blocks_candidate_near_earnings(
@@ -2847,6 +3258,206 @@ def test_daily_research_summary_includes_current_holdings_context_for_rejections
     assert payload["current_position_count"] == 1
     assert payload["current_positions"][0]["symbol"] == "AAA"
     assert payload["rejected_candidates"][0]["metadata"]["existing_position"]["current_stop"] == 100.0
+
+
+def test_daily_research_and_monitor_briefs_include_market_breadth_context() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved = _evaluation(preset, symbol="AAA", approved=True, shares=25)
+    execution_batch = ManualExecutor().build_execution_batch(
+        [approved.candidate],
+        as_of_date=date(2024, 1, 5),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[approved],
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB", "CCC"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        market_context=build_market_context(
+            as_of_date=date(2024, 1, 5),
+            benchmark_symbol="SPY",
+            market_breadth_pct_above_200ma=0.37,
+            market_breadth_pct_above_50ma=0.51,
+            market_breadth_state="weak",
+        ),
+        preset_selection_source="named_presets",
+    )
+
+    summary_brief = summary.to_brief()
+    monitor_brief = build_market_monitor_report(
+        as_of_date=date(2024, 1, 5),
+        daily_summary=summary,
+    ).to_brief()
+
+    assert "Market breadth: weak | 37% above 200d | 51% above 50d" in summary_brief
+    assert "Breadth: weak | 37% above 200d | 51% above 50d" in monitor_brief
+
+
+def test_daily_research_and_monitor_briefs_include_volatility_context() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved = _evaluation(preset, symbol="AAA", approved=True, shares=25)
+    execution_batch = ManualExecutor().build_execution_batch(
+        [approved.candidate],
+        as_of_date=date(2024, 1, 5),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[approved],
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB", "CCC"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        market_context=build_market_context(
+            as_of_date=date(2024, 1, 5),
+            benchmark_symbol="SPY",
+            vix_close=26.4,
+            vix_sma_short=25.1,
+            vix_sma_long=21.7,
+            volatility_regime_state="elevated",
+            volatility_regime_risk_off=False,
+        ),
+        preset_selection_source="named_presets",
+    )
+
+    summary_brief = summary.to_brief()
+    monitor_brief = build_market_monitor_report(
+        as_of_date=date(2024, 1, 5),
+        daily_summary=summary,
+    ).to_brief()
+
+    assert "Volatility regime: elevated | VIX 26.4 | 5d 25.1 | 20d 21.7" in summary_brief
+    assert "Volatility: elevated | VIX 26.4 | 5d 25.1 | 20d 21.7" in monitor_brief
+
+
+def test_daily_research_and_monitor_briefs_handle_unknown_market_breadth_state() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    approved = _evaluation(preset, symbol="AAA", approved=True, shares=25)
+    execution_batch = ManualExecutor().build_execution_batch(
+        [approved.candidate],
+        as_of_date=date(2024, 1, 5),
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=execution_batch,
+        evaluations=[approved],
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB", "CCC"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        market_context=build_market_context(
+            as_of_date=date(2024, 1, 5),
+            benchmark_symbol="SPY",
+            market_breadth_pct_above_200ma=0.37,
+            market_breadth_pct_above_50ma=0.51,
+            market_breadth_state=None,
+        ),
+        preset_selection_source="named_presets",
+    )
+
+    summary_brief = summary.to_brief()
+    monitor_brief = build_market_monitor_report(
+        as_of_date=date(2024, 1, 5),
+        daily_summary=summary,
+    ).to_brief()
+
+    assert "Market breadth: 37% above 200d | 51% above 50d" in summary_brief
+    assert "Market breadth: n/a" not in summary_brief
+    assert "Breadth: 37% above 200d | 51% above 50d" in monitor_brief
+    assert "Breadth: n/a" not in monitor_brief
+
+
+def test_run_daily_summary_workflow_includes_elevated_volatility_in_rationale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_app_config()
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+        ]
+    )
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context",
+        lambda **kwargs: {
+            "vix_close": 26.4,
+            "vix_sma_short": 25.1,
+            "vix_sma_long": 21.7,
+            "volatility_regime_state": "elevated",
+            "volatility_regime_risk_off": False,
+        },
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda bars, *, settings, benchmark_frame, has_open_position, symbol: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=101.0,
+            stop_hint=96.0,
+            metadata={"prior_high": 100.0, "relative_volume": 1.8},
+        ),
+    )
+
+    workflow = main_module._run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=FakeProvider(),
+        current_positions=[],
+    )
+    payload = workflow["summary"].to_dict()
+
+    assert payload["approved_count"] == 1
+    assert payload["market_context"]["vix_close"] == pytest.approx(26.4)
+    assert payload["market_context"]["volatility_regime_state"] == "elevated"
+    assert (
+        "volatility=elevated (VIX 26.4 above 25.0 caution)"
+        in payload["approved_candidates"][0]["rationale"]
+    )
 
 
 def test_daily_research_summary_labels_relative_volume_policy_in_rationale() -> None:

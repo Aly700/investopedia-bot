@@ -13,6 +13,9 @@ signals:
   relative_volume_threshold: 1.5
   earnings_entry_block_days: 3
   earnings_watch_days: 7
+  market_breadth_entry_floor_200ma: 0.40
+  vix_caution_threshold: 25.0
+  vix_entry_block_threshold: 30.0
   require_sector_regime_for_entries: true
   sector_relative_strength_window: 20
   sector_relative_strength_entry_reject_threshold: -0.05
