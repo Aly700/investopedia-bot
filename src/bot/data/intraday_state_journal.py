@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from bot.logging_utils import get_logger
+from bot.data.state_persistence import (
+    StateArtifactPath,
+    coerce_iso8601_datetime_text,
+    coerce_positive_int,
+    load_json_mapping_file,
+    write_json_file,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -16,6 +22,18 @@ LOGGER = get_logger(__name__)
 INTRADAY_STATE_JOURNAL_SCHEMA_VERSION = 1
 DEFAULT_INTRADAY_GIVEBACK_WORSENING_THRESHOLD = 0.005
 DEFAULT_INTRADAY_ALL_SESSION_MIN_OBSERVATIONS = 3
+_INTRADAY_STATE_JOURNAL_PATH = StateArtifactPath(
+    preferred_relative_path=(
+        "data",
+        "processed",
+        "state",
+        "journals",
+        "intraday",
+    ),
+    legacy_relative_paths=(
+        ("data", "processed", "state", "intraday_journal"),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -42,8 +60,11 @@ class IntradayStateObservation:
     def __post_init__(self) -> None:
         if not self.symbol.strip():
             raise ValueError("symbol cannot be empty.")
-        if not self.timestamp.strip():
-            raise ValueError("timestamp cannot be empty.")
+        object.__setattr__(
+            self,
+            "timestamp",
+            coerce_iso8601_datetime_text(self.timestamp, "timestamp"),
+        )
         if self.suggested_action is not None and not self.suggested_action.strip():
             raise ValueError("suggested_action cannot be blank when provided.")
 
@@ -150,17 +171,36 @@ class IntradayStateJournal:
         }
 
 
+@dataclass(frozen=True)
+class IntradayStateJournalStore:
+    """Project-scoped loader/saver for one intraday session journal."""
+
+    project_root: Path
+    session_date: date
+
+    @property
+    def path(self) -> Path:
+        return default_intraday_state_journal_path(self.project_root, self.session_date)
+
+    def load(self) -> IntradayStateJournal:
+        return load_intraday_state_journal(self.path, session_date=self.session_date)
+
+    def save(self, journal: IntradayStateJournal) -> Path:
+        return write_intraday_state_journal(journal, self.path)
+
+
 def default_intraday_state_journal_path(project_root: Path, session_date: date) -> Path:
     """Return the repo-relative per-session intraday journal path."""
 
-    return (
-        project_root
-        / "data"
-        / "processed"
-        / "state"
-        / "intraday_journal"
-        / f"{session_date.isoformat()}.json"
-    )
+    filename = f"{session_date.isoformat()}.json"
+    preferred_path = _INTRADAY_STATE_JOURNAL_PATH.preferred_path(project_root) / filename
+    if preferred_path.exists():
+        return preferred_path
+    for legacy_dir in _INTRADAY_STATE_JOURNAL_PATH.legacy_paths(project_root):
+        legacy_path = legacy_dir / filename
+        if legacy_path.exists():
+            return legacy_path
+    return preferred_path
 
 
 def load_intraday_state_journal(
@@ -170,62 +210,16 @@ def load_intraday_state_journal(
 ) -> IntradayStateJournal:
     """Load the intraday journal, falling back to empty state when unavailable."""
 
-    resolved_path = journal_path.resolve()
-    if not resolved_path.exists():
-        return IntradayStateJournal(session_date=session_date, entries={})
-
-    try:
-        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("Journal payload must be a mapping.")
-        raw_symbols = payload.get("symbols", {})
-        if not isinstance(raw_symbols, dict):
-            raise ValueError("Journal payload 'symbols' must be a mapping.")
-
-        stored_session_date = _mapping_date(payload, "session_date")
-        if stored_session_date != session_date:
-            raise ValueError(
-                f"Journal session_date {stored_session_date.isoformat()} does not match "
-                f"requested session_date {session_date.isoformat()}."
-            )
-
-        entries: dict[str, tuple[IntradayStateObservation, ...]] = {}
-        for symbol, raw_entry in raw_symbols.items():
-            if not isinstance(symbol, str) or not symbol.strip():
-                raise ValueError("Journal symbol keys must be non-empty strings.")
-            if not isinstance(raw_entry, dict):
-                raise ValueError(f"Journal entry for {symbol!r} must be a mapping.")
-            raw_observations = raw_entry.get("observations", [])
-            if not isinstance(raw_observations, list):
-                raise ValueError(f"Journal observations for {symbol!r} must be a list.")
-            normalized_symbol = symbol.strip().upper()
-            observations = tuple(
-                sorted(
-                    (
-                        IntradayStateObservation.from_mapping(normalized_symbol, raw_observation)
-                        for raw_observation in raw_observations
-                    ),
-                    key=lambda observation: observation.timestamp,
-                )
-            )
-            entries[normalized_symbol] = observations
-
-        return IntradayStateJournal(
+    return load_json_mapping_file(
+        journal_path,
+        artifact_label="intraday state journal",
+        logger=LOGGER,
+        empty_value=lambda: IntradayStateJournal(session_date=session_date, entries={}),
+        build=lambda payload, _resolved_path: _build_intraday_state_journal(
+            payload,
             session_date=session_date,
-            entries=dict(sorted(entries.items())),
-            updated_at=_mapping_optional_text(payload, "updated_at"),
-            schema_version=_coerce_positive_int(
-                payload.get("schema_version", INTRADAY_STATE_JOURNAL_SCHEMA_VERSION),
-                "schema_version",
-            ),
-        )
-    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-        LOGGER.warning(
-            "Ignoring intraday state journal at %s because it could not be loaded: %s",
-            resolved_path,
-            exc,
-        )
-        return IntradayStateJournal(session_date=session_date, entries={})
+        ),
+    )
 
 
 def write_intraday_state_journal(
@@ -234,15 +228,7 @@ def write_intraday_state_journal(
 ) -> Path:
     """Persist the journal as JSON with an atomic replace in the target directory."""
 
-    resolved_path = journal_path.resolve()
-    resolved_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = resolved_path.with_suffix(resolved_path.suffix + ".tmp")
-    temp_path.write_text(
-        json.dumps(journal.to_dict(), indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    temp_path.replace(resolved_path)
-    return resolved_path
+    return write_json_file(journal_path, journal.to_dict())
 
 
 def update_intraday_state_journal(
@@ -278,6 +264,54 @@ def update_intraday_state_journal(
         },
         updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         schema_version=journal.schema_version,
+    )
+
+
+def _build_intraday_state_journal(
+    payload: Mapping[str, Any],
+    *,
+    session_date: date,
+) -> IntradayStateJournal:
+    raw_symbols = payload.get("symbols", {})
+    if not isinstance(raw_symbols, Mapping):
+        raise ValueError("Journal payload 'symbols' must be a mapping.")
+
+    stored_session_date = _mapping_date(payload, "session_date")
+    if stored_session_date != session_date:
+        raise ValueError(
+            f"Journal session_date {stored_session_date.isoformat()} does not match "
+            f"requested session_date {session_date.isoformat()}."
+        )
+
+    entries: dict[str, tuple[IntradayStateObservation, ...]] = {}
+    for symbol, raw_entry in raw_symbols.items():
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("Journal symbol keys must be non-empty strings.")
+        if not isinstance(raw_entry, Mapping):
+            raise ValueError(f"Journal entry for {symbol!r} must be a mapping.")
+        raw_observations = raw_entry.get("observations", [])
+        if not isinstance(raw_observations, list):
+            raise ValueError(f"Journal observations for {symbol!r} must be a list.")
+        normalized_symbol = symbol.strip().upper()
+        observations = tuple(
+            sorted(
+                (
+                    IntradayStateObservation.from_mapping(normalized_symbol, raw_observation)
+                    for raw_observation in raw_observations
+                ),
+                key=lambda observation: observation.timestamp,
+            )
+        )
+        entries[normalized_symbol] = observations
+
+    return IntradayStateJournal(
+        session_date=session_date,
+        entries=dict(sorted(entries.items())),
+        updated_at=_mapping_optional_text(payload, "updated_at"),
+        schema_version=_coerce_positive_int(
+            payload.get("schema_version", INTRADAY_STATE_JOURNAL_SCHEMA_VERSION),
+            "schema_version",
+        ),
     )
 
 
@@ -428,6 +462,8 @@ def _giveback_worsening_streak(
         streak += 1
         baseline = previous
         current = previous
+    if streak < 2:
+        return streak, None
     return streak, baseline
 
 
@@ -497,10 +533,4 @@ def _mapping_date(data: Mapping[str, Any], key: str) -> date:
 
 
 def _coerce_positive_int(value: Any, field_name: str) -> int:
-    try:
-        coerced = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Expected '{field_name}' to be an integer.") from exc
-    if coerced <= 0:
-        raise ValueError(f"Expected '{field_name}' to be greater than zero.")
-    return coerced
+    return coerce_positive_int(value, field_name)

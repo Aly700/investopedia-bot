@@ -77,6 +77,7 @@ from bot.data.providers import (
     load_provider_environment,
 )
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
+from bot.reporting.trade_review import build_trade_review_analytics_summary
 
 
 class FakeDailyBarProvider(DailyBarProvider):
@@ -899,6 +900,93 @@ def test_candidate_score_journal_ignores_corrupt_files(
     assert "Ignoring candidate score journal" in caplog.text
 
 
+def test_state_paths_use_preferred_journal_and_log_layout_for_new_projects(
+    tmp_path: Path,
+) -> None:
+    session_date = date(2024, 1, 5)
+
+    assert default_candidate_score_journal_path(tmp_path) == (
+        tmp_path / "data" / "processed" / "state" / "journals" / "candidate_scores.json"
+    )
+    assert default_intraday_state_journal_path(tmp_path, session_date) == (
+        tmp_path
+        / "data"
+        / "processed"
+        / "state"
+        / "journals"
+        / "intraday"
+        / "2024-01-05.json"
+    )
+    assert default_position_trajectory_journal_path(tmp_path) == (
+        tmp_path / "data" / "processed" / "state" / "journals" / "position_trajectory.json"
+    )
+    assert default_trade_feedback_log_path(tmp_path) == (
+        tmp_path / "data" / "processed" / "state" / "logs" / "trade_feedback.jsonl"
+    )
+
+
+def test_state_paths_fall_back_to_legacy_layout_when_existing_artifacts_are_present(
+    tmp_path: Path,
+) -> None:
+    session_date = date(2024, 1, 5)
+    candidate_legacy = tmp_path / "data" / "processed" / "state" / "candidate_scores.json"
+    intraday_legacy_dir = tmp_path / "data" / "processed" / "state" / "intraday_journal"
+    position_legacy = tmp_path / "data" / "processed" / "state" / "position_trajectory.json"
+    trade_feedback_legacy = (
+        tmp_path / "data" / "processed" / "state" / "trade_decision_log.jsonl"
+    )
+
+    candidate_legacy.parent.mkdir(parents=True, exist_ok=True)
+    candidate_legacy.write_text("{}", encoding="utf-8")
+    intraday_legacy_dir.mkdir(parents=True, exist_ok=True)
+    (intraday_legacy_dir / "2024-01-05.json").write_text("{}", encoding="utf-8")
+    position_legacy.write_text("{}", encoding="utf-8")
+    trade_feedback_legacy.write_text("", encoding="utf-8")
+
+    assert default_candidate_score_journal_path(tmp_path) == candidate_legacy
+    assert default_intraday_state_journal_path(tmp_path, session_date) == (
+        intraday_legacy_dir / "2024-01-05.json"
+    )
+    assert default_position_trajectory_journal_path(tmp_path) == position_legacy
+    assert default_trade_feedback_log_path(tmp_path) == trade_feedback_legacy
+
+
+def test_candidate_score_journal_normalizes_symbol_update_keys() -> None:
+    journal = update_candidate_score_journal(
+        load_candidate_score_journal(Path("/tmp/does-not-exist.json"), stale_after_days=30),
+        observations={
+            "aapl": CandidateJournalObservation(
+                symbol="AAPL",
+                approved_today=True,
+                breakout_strength=0.02,
+                relative_volume=1.8,
+            )
+        },
+        as_of_date=date(2024, 1, 5),
+    )
+
+    assert list(journal.entries) == ["AAPL"]
+
+
+def test_intraday_state_observation_rejects_non_iso_timestamp() -> None:
+    with pytest.raises(ValueError, match="ISO 8601 datetime string"):
+        IntradayStateObservation(
+            symbol="AAPL",
+            timestamp="01/05/2024 10:00 AM",
+            latest_close=100.0,
+        )
+
+
+def test_intraday_state_observation_accepts_iso_timestamp() -> None:
+    observation = IntradayStateObservation(
+        symbol="AAPL",
+        timestamp="2024-01-05T10:00:00",
+        latest_close=100.0,
+    )
+
+    assert observation.timestamp == "2024-01-05T10:00:00"
+
+
 def test_intraday_state_journal_updates_and_persists_repeated_polls(
     tmp_path: Path,
 ) -> None:
@@ -1126,6 +1214,23 @@ def test_intraday_trajectory_features_detect_worsening_giveback() -> None:
     assert trajectory.max_session_high_giveback_seen == pytest.approx(0.057)
 
 
+def test_intraday_trajectory_single_observation_does_not_report_worsening_baseline() -> None:
+    trajectory = build_intraday_trajectory_features(
+        [
+            _intraday_state_observation(
+                timestamp="2024-01-05T09:30:00",
+                latest_close=101.5,
+                close_vs_vwap_pct=0.003,
+                session_high_giveback_pct=0.021,
+            ),
+        ]
+    )
+
+    assert trajectory.worsening_session_high_giveback is False
+    assert trajectory.giveback_worsening_polls == 1
+    assert trajectory.giveback_worsening_from_pct is None
+
+
 def test_intraday_state_journal_ignores_boolean_float_fields(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -1208,6 +1313,32 @@ def test_intraday_state_journal_ignores_boolean_float_fields(
 
     with caplog.at_level("WARNING"):
         journal = load_intraday_state_journal(journal_path, session_date=session_date)
+    assert journal.entries == {}
+    assert "Ignoring intraday state journal" in caplog.text
+
+
+def test_intraday_state_journal_rejects_boolean_schema_version(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session_date = date(2024, 1, 5)
+    journal_path = default_intraday_state_journal_path(tmp_path, session_date)
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text(
+        json.dumps(
+            {
+                "schema_version": True,
+                "session_date": "2024-01-05",
+                "updated_at": None,
+                "symbols": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING"):
+        journal = load_intraday_state_journal(journal_path, session_date=session_date)
+
     assert journal.entries == {}
     assert "Ignoring intraday state journal" in caplog.text
 
@@ -1748,6 +1879,451 @@ def test_compute_trade_outcome_snapshot_returns_expected_forward_metrics() -> No
     assert outcome.above_entry_after_1d is True
     assert outcome.above_entry_after_5d is True
     assert outcome.above_entry_after_10d is None
+
+
+def test_build_trade_review_analytics_summary_handles_empty_log(
+    tmp_path: Path,
+) -> None:
+    summary = build_trade_review_analytics_summary(
+        (),
+        as_of_date=date(2024, 1, 10),
+        feedback_log_path=tmp_path / "trade_decision_log.jsonl",
+        window_days=30,
+    )
+    payload = summary.to_dict()
+
+    assert payload["event_count"] == 0
+    assert payload["decision_summary"]["decision_count"] == 0
+    assert payload["outcome_summary"]["trade_count"] == 0
+    assert payload["filter_effectiveness"]["blocked_by_reason_category"]["earnings"] == 0
+    assert "No trade feedback events were available in the selected window." in payload["notes"]
+
+
+def test_build_trade_review_analytics_summary_aggregates_feedback_deterministically(
+    tmp_path: Path,
+) -> None:
+    events = (
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="daily-summary",
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_aapl",
+            preset_name="standard_breakout",
+            suggested_action="BUY",
+            approved=True,
+            priority_bucket="top_priority",
+            actionable_now=True,
+        ),
+        TradeFeedbackEvent(
+            event_type="executed",
+            workflow="upsert-position",
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_aapl",
+            trade_id="trade_aapl",
+            linked_decision_id="decision_aapl",
+            suggested_action="BUY",
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="review-portfolio",
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 8),
+            decision_id="review_aapl_watch",
+            trade_id="trade_aapl",
+            linked_decision_id="decision_aapl",
+            suggested_action="WATCH CLOSELY",
+            feature_snapshot={"unrealized_pl_pct": 0.06},
+        ),
+        TradeFeedbackEvent(
+            event_type="outcome",
+            workflow="review-portfolio",
+            symbol="AAPL",
+            as_of_date=date(2024, 1, 10),
+            decision_id="decision_aapl",
+            trade_id="trade_aapl",
+            linked_decision_id="decision_aapl",
+            outcome_snapshot=TradeOutcomeSnapshot(
+                as_of_date=date(2024, 1, 10),
+                entry_date=date(2024, 1, 5),
+                sessions_since_entry=5,
+                current_return_pct=0.04,
+                max_favorable_excursion_pct=0.08,
+                max_adverse_excursion_pct=-0.02,
+                stop_hit=False,
+                forward_return_1d=0.02,
+                forward_return_5d=0.05,
+                forward_return_10d=None,
+                above_entry_after_1d=True,
+                above_entry_after_5d=True,
+                above_entry_after_10d=None,
+            ),
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="daily-summary",
+            symbol="MSFT",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_msft",
+            preset_name="standard_breakout",
+            suggested_action="BUY",
+            approved=True,
+            priority_bucket="lower_priority",
+            actionable_now=True,
+        ),
+        TradeFeedbackEvent(
+            event_type="executed",
+            workflow="upsert-position",
+            symbol="MSFT",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_msft",
+            trade_id="trade_msft",
+            linked_decision_id="decision_msft",
+            suggested_action="BUY",
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="review-portfolio",
+            symbol="MSFT",
+            as_of_date=date(2024, 1, 8),
+            decision_id="review_msft_stop",
+            trade_id="trade_msft",
+            linked_decision_id="decision_msft",
+            suggested_action="RAISE STOP",
+            feature_snapshot={"unrealized_pl_pct": 0.02},
+        ),
+        TradeFeedbackEvent(
+            event_type="outcome",
+            workflow="review-portfolio",
+            symbol="MSFT",
+            as_of_date=date(2024, 1, 10),
+            decision_id="decision_msft",
+            trade_id="trade_msft",
+            linked_decision_id="decision_msft",
+            outcome_snapshot=TradeOutcomeSnapshot(
+                as_of_date=date(2024, 1, 10),
+                entry_date=date(2024, 1, 5),
+                sessions_since_entry=5,
+                current_return_pct=-0.03,
+                max_favorable_excursion_pct=0.03,
+                max_adverse_excursion_pct=-0.06,
+                stop_hit=True,
+                forward_return_1d=-0.01,
+                forward_return_5d=-0.02,
+                forward_return_10d=None,
+                above_entry_after_1d=False,
+                above_entry_after_5d=False,
+                above_entry_after_10d=None,
+            ),
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="review-portfolio",
+            symbol="TSLA",
+            as_of_date=date(2024, 1, 8),
+            decision_id="review_tsla_exit",
+            trade_id="trade_tsla",
+            linked_decision_id="decision_tsla",
+            suggested_action="EXIT CANDIDATE",
+            feature_snapshot={"unrealized_pl_pct": -0.04},
+        ),
+        TradeFeedbackEvent(
+            event_type="closed",
+            workflow="remove-position",
+            symbol="TSLA",
+            as_of_date=date(2024, 1, 10),
+            decision_id="decision_tsla",
+            trade_id="trade_tsla",
+            linked_decision_id="decision_tsla",
+            suggested_action="SELL",
+            metadata={"realized_return_pct": -0.07},
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="daily-summary",
+            symbol="NVDA",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_nvda",
+            preset_name="standard_breakout",
+            suggested_action="BUY",
+            approved=False,
+            rejection_reasons=(
+                "Upcoming earnings on 2024-01-08 are 2 trading days away; new entries are blocked within 3 trading days.",
+            ),
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="daily-summary",
+            symbol="QQQ",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_qqq",
+            preset_name="standard_breakout",
+            suggested_action="BUY",
+            approved=False,
+            rejection_reasons=(
+                "Market breadth is weak: 37% of the universe is above its 200-day moving average; new entries require at least 40%.",
+            ),
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="daily-summary",
+            symbol="XOM",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_xom",
+            preset_name="standard_breakout",
+            suggested_action="BUY",
+            approved=False,
+            rejection_reasons=(
+                "Volatility regime is stressed: VIX is 33.4, above the 30.0 entry block threshold.",
+            ),
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="daily-summary",
+            symbol="AMD",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_amd",
+            preset_name="standard_breakout",
+            suggested_action="BUY",
+            approved=False,
+            rejection_reasons=(
+                "Sector context for Technology is weak; new entries require sector support.",
+            ),
+        ),
+        TradeFeedbackEvent(
+            event_type="decision",
+            workflow="daily-summary",
+            symbol="ORCL",
+            as_of_date=date(2024, 1, 5),
+            decision_id="decision_orcl",
+            preset_name="standard_breakout",
+            suggested_action="BUY",
+            approved=False,
+            rejection_reasons=(
+                "Portfolio already has 3 Technology positions; adding another would exceed the per-sector limit of 3.",
+            ),
+        ),
+    )
+
+    summary = build_trade_review_analytics_summary(
+        events,
+        as_of_date=date(2024, 1, 10),
+        feedback_log_path=tmp_path / "trade_decision_log.jsonl",
+        window_days=30,
+    )
+    payload = summary.to_dict()
+
+    assert payload["event_count"] == 15
+    assert payload["decision_summary"]["decision_count"] == 10
+    assert payload["decision_summary"]["approved_count"] == 2
+    assert payload["decision_summary"]["rejected_count"] == 5
+    assert payload["outcome_summary"]["trade_count"] == 2
+    assert payload["outcome_summary"]["average_forward_return_5d"] == pytest.approx(0.015)
+    assert payload["outcome_summary"]["positive_forward_return_5d_rate"] == pytest.approx(0.5)
+    assert payload["filter_effectiveness"]["blocked_by_reason_category"] == {
+        "earnings": 1,
+        "breadth": 1,
+        "volatility": 1,
+        "sector": 1,
+        "portfolio_heat": 1,
+        "other": 0,
+    }
+    top_priority = payload["execution_priority_summary"]["by_priority_bucket"]["top_priority"]
+    lower_priority = payload["execution_priority_summary"]["by_priority_bucket"]["lower_priority"]
+    assert top_priority["approved_count"] == 1
+    assert top_priority["executed_count"] == 1
+    assert top_priority["average_latest_return_pct"] == pytest.approx(0.04)
+    assert lower_priority["approved_count"] == 1
+    assert lower_priority["executed_count"] == 1
+    assert lower_priority["average_latest_return_pct"] == pytest.approx(-0.03)
+    watch_summary = payload["action_quality_summary"]["WATCH CLOSELY"]
+    assert watch_summary["comparable_trade_count"] == 1
+    assert watch_summary["further_weakness_count"] == 1
+    assert watch_summary["further_weakness_rate"] == pytest.approx(1.0)
+    assert "stop_hit_rate" not in watch_summary
+    assert payload["action_quality_summary"]["EXIT CANDIDATE"]["further_weakness_count"] == 1
+    raise_stop_summary = payload["action_quality_summary"]["RAISE STOP"]
+    assert raise_stop_summary["stop_hit_count"] == 1
+    assert raise_stop_summary["protected_gain_count"] == 0
+    assert "further_weakness_rate" not in raise_stop_summary
+    assert payload["execution_priority_summary"]["executed_trade_count"] == 2
+
+
+def test_trade_review_analytics_uses_comparable_trades_for_weakness_rate(
+    tmp_path: Path,
+) -> None:
+    summary = build_trade_review_analytics_summary(
+        (
+            TradeFeedbackEvent(
+                event_type="decision",
+                workflow="review-portfolio",
+                symbol="AAPL",
+                as_of_date=date(2024, 1, 8),
+                decision_id="watch_aapl",
+                trade_id="trade_aapl",
+                suggested_action="WATCH CLOSELY",
+                feature_snapshot={"unrealized_pl_pct": 0.04},
+            ),
+            TradeFeedbackEvent(
+                event_type="outcome",
+                workflow="review-portfolio",
+                symbol="AAPL",
+                as_of_date=date(2024, 1, 10),
+                decision_id="decision_aapl",
+                trade_id="trade_aapl",
+                linked_decision_id="decision_aapl",
+                outcome_snapshot=TradeOutcomeSnapshot(
+                    as_of_date=date(2024, 1, 10),
+                    entry_date=date(2024, 1, 5),
+                    sessions_since_entry=5,
+                    current_return_pct=0.01,
+                    stop_hit=False,
+                ),
+            ),
+            TradeFeedbackEvent(
+                event_type="decision",
+                workflow="review-portfolio",
+                symbol="MSFT",
+                as_of_date=date(2024, 1, 8),
+                decision_id="watch_msft",
+                trade_id="trade_msft",
+                suggested_action="WATCH CLOSELY",
+            ),
+            TradeFeedbackEvent(
+                event_type="outcome",
+                workflow="review-portfolio",
+                symbol="MSFT",
+                as_of_date=date(2024, 1, 10),
+                decision_id="decision_msft",
+                trade_id="trade_msft",
+                linked_decision_id="decision_msft",
+                outcome_snapshot=TradeOutcomeSnapshot(
+                    as_of_date=date(2024, 1, 10),
+                    entry_date=date(2024, 1, 5),
+                    sessions_since_entry=5,
+                    current_return_pct=0.03,
+                    stop_hit=False,
+                ),
+            ),
+        ),
+        as_of_date=date(2024, 1, 10),
+        feedback_log_path=tmp_path / "trade_decision_log.jsonl",
+        window_days=30,
+    )
+    watch_summary = summary.to_dict()["action_quality_summary"]["WATCH CLOSELY"]
+
+    assert watch_summary["linked_trade_count"] == 2
+    assert watch_summary["comparable_trade_count"] == 1
+    assert watch_summary["further_weakness_count"] == 1
+    assert watch_summary["further_weakness_rate"] == pytest.approx(1.0)
+    assert "stop_hit_rate" not in watch_summary
+
+
+def test_trade_review_analytics_raise_stop_protected_gain_requires_closed_result(
+    tmp_path: Path,
+) -> None:
+    summary = build_trade_review_analytics_summary(
+        (
+            TradeFeedbackEvent(
+                event_type="decision",
+                workflow="review-portfolio",
+                symbol="AAPL",
+                as_of_date=date(2024, 1, 8),
+                decision_id="raise_aapl",
+                trade_id="trade_aapl",
+                suggested_action="RAISE STOP",
+            ),
+            TradeFeedbackEvent(
+                event_type="outcome",
+                workflow="review-portfolio",
+                symbol="AAPL",
+                as_of_date=date(2024, 1, 10),
+                decision_id="decision_aapl",
+                trade_id="trade_aapl",
+                linked_decision_id="decision_aapl",
+                outcome_snapshot=TradeOutcomeSnapshot(
+                    as_of_date=date(2024, 1, 10),
+                    entry_date=date(2024, 1, 5),
+                    sessions_since_entry=5,
+                    current_return_pct=0.04,
+                    stop_hit=False,
+                ),
+            ),
+            TradeFeedbackEvent(
+                event_type="decision",
+                workflow="review-portfolio",
+                symbol="MSFT",
+                as_of_date=date(2024, 1, 8),
+                decision_id="raise_msft",
+                trade_id="trade_msft",
+                suggested_action="RAISE STOP",
+            ),
+            TradeFeedbackEvent(
+                event_type="closed",
+                workflow="remove-position",
+                symbol="MSFT",
+                as_of_date=date(2024, 1, 10),
+                decision_id="decision_msft",
+                trade_id="trade_msft",
+                linked_decision_id="decision_msft",
+                metadata={"realized_return_pct": 0.06},
+            ),
+        ),
+        as_of_date=date(2024, 1, 10),
+        feedback_log_path=tmp_path / "trade_decision_log.jsonl",
+        window_days=30,
+    )
+    payload = summary.to_dict()
+    raise_stop_summary = payload["action_quality_summary"]["RAISE STOP"]
+
+    assert raise_stop_summary["linked_trade_count"] == 2
+    assert raise_stop_summary["protected_gain_evaluable_count"] == 1
+    assert raise_stop_summary["protected_gain_count"] == 1
+    assert raise_stop_summary["protected_gain_rate"] == pytest.approx(1.0)
+    assert "further_weakness_rate" not in raise_stop_summary
+    assert (
+        "Protected-gain rates only count closed trades with positive realized returns after a RAISE STOP call."
+        in payload["notes"]
+    )
+
+
+def test_trade_review_analytics_documents_multi_category_blocked_decisions(
+    tmp_path: Path,
+) -> None:
+    summary = build_trade_review_analytics_summary(
+        (
+            TradeFeedbackEvent(
+                event_type="decision",
+                workflow="daily-summary",
+                symbol="AAPL",
+                as_of_date=date(2024, 1, 5),
+                decision_id="decision_aapl",
+                preset_name="standard_breakout",
+                suggested_action="BUY",
+                approved=False,
+                rejection_reasons=(
+                    "Upcoming earnings on 2024-01-08 are 2 trading days away; new entries are blocked within 3 trading days.",
+                    "Market breadth is weak: 37% of the universe is above its 200-day moving average; new entries require at least 40%.",
+                ),
+            ),
+        ),
+        as_of_date=date(2024, 1, 10),
+        feedback_log_path=tmp_path / "trade_decision_log.jsonl",
+        window_days=30,
+    )
+    payload = summary.to_dict()
+    filter_summary = payload["filter_effectiveness"]
+
+    assert filter_summary["blocked_decision_count"] == 1
+    assert filter_summary["blocked_by_reason_category"]["earnings"] == 1
+    assert filter_summary["blocked_by_reason_category"]["breadth"] == 1
+    assert sum(filter_summary["blocked_by_reason_category"].values()) == 2
+    assert filter_summary["multi_reason_block_count"] == 1
+    assert (
+        "Some rejected decisions matched multiple filter categories, so category counts can exceed blocked_decision_count."
+        in payload["notes"]
+    )
 
 
 def test_build_portfolio_heat_context_tracks_sector_counts_and_notional_share() -> None:

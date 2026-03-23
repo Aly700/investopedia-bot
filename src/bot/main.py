@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date
 from datetime import datetime, timezone
 from datetime import timedelta
@@ -43,11 +43,9 @@ from bot.config import (
 from bot.data.candidate_journal import (
     CandidateScoreJournal,
     CandidateJournalObservation,
+    CandidateScoreJournalStore,
     build_candidate_memory_features,
-    default_candidate_score_journal_path,
-    load_candidate_score_journal,
     update_candidate_score_journal,
-    write_candidate_score_journal,
 )
 from bot.data.earnings import (
     EarningsRiskContext,
@@ -58,11 +56,10 @@ from bot.data.earnings import (
 from bot.data.intraday_state_journal import (
     IntradayStateJournal,
     IntradayStateObservation,
+    IntradayStateJournalStore,
     default_intraday_state_journal_path,
-    load_intraday_state_journal,
     preview_intraday_trajectory_features,
     update_intraday_state_journal,
-    write_intraday_state_journal,
 )
 from bot.data.portfolio_heat import (
     PortfolioHoldingExposure,
@@ -71,11 +68,10 @@ from bot.data.portfolio_heat import (
 from bot.data.position_trajectory import (
     PositionTrajectoryJournal,
     PositionTrajectoryObservation,
+    PositionTrajectoryJournalStore,
     default_position_trajectory_journal_path,
-    load_position_trajectory_journal,
     preview_position_trajectory_features,
     update_position_trajectory_journal,
-    write_position_trajectory_journal,
 )
 from bot.data.sector_context import (
     SectorFeatureContext,
@@ -87,12 +83,12 @@ from bot.data.sector_context import (
 )
 from bot.data.trade_feedback import (
     TradeFeedbackEvent,
+    TradeFeedbackLogStore,
     TradeOutcomeSnapshot,
-    append_trade_feedback_events,
     build_trade_decision_id,
     build_trade_id,
     compute_trade_outcome_snapshot,
-    default_trade_feedback_log_path,
+    load_trade_feedback_events,
 )
 from bot.data.providers import (
     DailyBarProvider,
@@ -161,6 +157,12 @@ from bot.reporting.daily_report import (
     write_daily_signal_report,
 )
 from bot.reporting.equity_curve import write_equity_curve_report
+from bot.reporting.trade_review import (
+    build_trade_review_analytics_summary,
+    default_trade_review_output_dir,
+    write_trade_review_brief,
+    write_trade_review_summary,
+)
 from bot.reporting.trade_log import write_trade_log_report
 from bot.risk.portfolio_rules import (
     ExistingPosition,
@@ -195,6 +197,23 @@ _TRADE_OUTCOME_SNAPSHOT_METADATA_KEY = "_trade_outcome_snapshot"
 
 class NoIntradayDataError(ValueError):
     """Raised when an intraday review session has no usable regular-session bars."""
+
+
+@dataclass(frozen=True)
+class PortfolioReviewRowState:
+    """A portfolio review row plus persistence-side artifacts derived from it."""
+
+    row: PortfolioReviewRow
+    position_trajectory_observation: PositionTrajectoryObservation | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.row, name)
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.row.to_dict()
+
+    def to_record(self) -> dict[str, str]:
+        return self.row.to_record()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1133,6 +1152,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     daily_summary_parser.set_defaults(handler=_handle_daily_summary)
 
+    trade_review_parser = subparsers.add_parser(
+        "review-trade-analytics",
+        help="Summarize persisted trade feedback decisions, executions, and outcomes.",
+    )
+    trade_review_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Right edge of the analytics window.",
+    )
+    trade_review_parser.add_argument(
+        "--days",
+        type=int,
+        default=30,
+        help="Trailing window in calendar days. Ignored when --all-history is set.",
+    )
+    trade_review_parser.add_argument(
+        "--all-history",
+        action="store_true",
+        help="Summarize all available feedback records instead of a trailing window.",
+    )
+    trade_review_parser.add_argument(
+        "--feedback-log",
+        type=Path,
+        default=None,
+        help="Optional trade feedback JSONL path override.",
+    )
+    trade_review_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for analytics JSON and brief outputs.",
+    )
+    trade_review_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    trade_review_parser.set_defaults(handler=_handle_review_trade_analytics)
+
     return parser
 
 
@@ -1499,6 +1559,7 @@ def _handle_upsert_position(args: argparse.Namespace) -> int:
     }
     if trade_feedback_log_path is not None:
         payload["trade_decision_log"] = str(trade_feedback_log_path)
+        payload["trade_feedback_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -1577,6 +1638,7 @@ def _handle_update_stop(args: argparse.Namespace) -> int:
     )
     if trade_feedback_log_path is not None:
         payload["trade_decision_log"] = str(trade_feedback_log_path)
+        payload["trade_feedback_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -1658,6 +1720,7 @@ def _handle_remove_position(args: argparse.Namespace) -> int:
     )
     if trade_feedback_log_path is not None:
         payload["trade_decision_log"] = str(trade_feedback_log_path)
+        payload["trade_feedback_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -1753,6 +1816,7 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         )
     if trade_feedback_log_path is not None:
         payload["outputs"]["trade_decision_log"] = str(trade_feedback_log_path)
+        payload["outputs"]["trade_feedback_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -1856,6 +1920,7 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         payload["outputs"]["intraday_state_journal"] = str(intraday_state_journal_path)
     if trade_feedback_log_path is not None:
         payload["outputs"]["trade_decision_log"] = str(trade_feedback_log_path)
+        payload["outputs"]["trade_feedback_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -2328,6 +2393,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
     }
     if trade_feedback_log_path is not None:
         payload["outputs"]["trade_decision_log"] = str(trade_feedback_log_path)
+        payload["outputs"]["trade_feedback_log"] = str(trade_feedback_log_path)
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -2760,6 +2826,8 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     }
     if candidate_score_journal_path is not None:
         brief_output_paths["candidate_score_journal"] = str(candidate_score_journal_path)
+    if trade_feedback_log_path is not None:
+        brief_output_paths["trade_feedback_log"] = str(trade_feedback_log_path)
     brief_text_path = write_daily_research_brief(
         summary,
         output_dir / "daily_summary_brief.txt",
@@ -2779,6 +2847,7 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         outputs["candidate_score_journal"] = str(candidate_score_journal_path)
     if trade_feedback_log_path is not None:
         outputs["trade_decision_log"] = str(trade_feedback_log_path)
+        outputs["trade_feedback_log"] = str(trade_feedback_log_path)
 
     payload = {
         "provider": config.data_sources.provider,
@@ -2836,6 +2905,56 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_review_trade_analytics(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    window_days = None if args.all_history else args.days
+    if window_days is not None and window_days <= 0:
+        raise ValueError("--days must be greater than zero unless --all-history is set.")
+
+    trade_feedback_store = TradeFeedbackLogStore(config.project_root)
+    feedback_log_path = (args.feedback_log or trade_feedback_store.path).resolve()
+    summary = build_trade_review_analytics_summary(
+        load_trade_feedback_events(feedback_log_path),
+        as_of_date=args.as_of,
+        feedback_log_path=feedback_log_path,
+        window_days=window_days,
+    )
+
+    output_dir = (
+        args.output_dir
+        or default_trade_review_output_dir(
+            config.project_root,
+            as_of_date=args.as_of,
+            window_days=window_days,
+        )
+    ).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_json_path = write_trade_review_summary(
+        summary,
+        output_dir / "trade_review_analytics.json",
+    )
+    brief_output_paths = {
+        "trade_review_analytics_json": str(summary_json_path),
+        "trade_feedback_log": str(feedback_log_path),
+    }
+    brief_text_path = write_trade_review_brief(
+        summary,
+        output_dir / "trade_review_analytics_brief.txt",
+        output_paths=brief_output_paths,
+    )
+
+    payload = {
+        **summary.to_dict(),
+        "outputs": {
+            "trade_review_analytics_json": str(summary_json_path),
+            "trade_review_analytics_brief": str(brief_text_path),
+        },
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
 def _default_order_output_path(project_root: Path, as_of_date: date) -> Path:
     output_dir = project_root / "data" / "processed" / "orders"
     return output_dir / f"{as_of_date.isoformat()}_manual_orders.csv"
@@ -2860,9 +2979,10 @@ def _append_trade_feedback_events_safe(
 ) -> Path | None:
     if not events:
         return None
-    log_path = default_trade_feedback_log_path(project_root).resolve()
+    store = TradeFeedbackLogStore(project_root)
+    log_path = store.path.resolve()
     try:
-        return append_trade_feedback_events(events, log_path)
+        return store.append(events)
     except (OSError, TypeError, ValueError) as exc:
         LOGGER.warning("Skipping trade feedback log update at %s: %s", log_path, exc)
         return None
@@ -3114,6 +3234,45 @@ def _trade_outcome_snapshot_from_row(row: PortfolioReviewRow) -> TradeOutcomeSna
     return TradeOutcomeSnapshot.from_mapping(raw_snapshot)
 
 
+def _portfolio_review_position_metadata(row: PortfolioReviewRow) -> Mapping[str, Any]:
+    raw_metadata = row.metadata.get("position_metadata", {})
+    if not isinstance(raw_metadata, Mapping):
+        return {}
+    return raw_metadata
+
+
+def _strip_position_trajectory_observation_from_row(
+    row: PortfolioReviewRow,
+) -> PortfolioReviewRow:
+    return replace(
+        row,
+        metadata={
+            key: value
+            for key, value in row.metadata.items()
+            if key != _POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY
+        },
+    )
+
+
+def _coerce_portfolio_review_row_state(
+    value: PortfolioReviewRow | PortfolioReviewRowState,
+) -> PortfolioReviewRowState:
+    if isinstance(value, PortfolioReviewRowState):
+        return PortfolioReviewRowState(
+            row=_strip_position_trajectory_observation_from_row(value.row),
+            position_trajectory_observation=value.position_trajectory_observation,
+        )
+    if isinstance(value, PortfolioReviewRow):
+        return PortfolioReviewRowState(
+            row=_strip_position_trajectory_observation_from_row(value),
+            position_trajectory_observation=_position_trajectory_observation_from_row(value),
+        )
+    raise TypeError(
+        "portfolio review row builder must return PortfolioReviewRow or "
+        "PortfolioReviewRowState."
+    )
+
+
 def _strip_internal_portfolio_review_row(row: PortfolioReviewRow) -> PortfolioReviewRow:
     return replace(
         row,
@@ -3143,6 +3302,12 @@ def _portfolio_review_decision_event(
     workflow: str,
     timestamp_utc: str,
 ) -> TradeFeedbackEvent:
+    position_metadata = _portfolio_review_position_metadata(row)
+    trade_id = _clean_optional_text(position_metadata.get("trade_id"))
+    linked_decision_id = (
+        _clean_optional_text(position_metadata.get("linked_decision_id"))
+        or _extract_linked_decision_id(position_metadata)
+    )
     return TradeFeedbackEvent(
         event_type="decision",
         workflow=workflow,
@@ -3150,6 +3315,8 @@ def _portfolio_review_decision_event(
         as_of_date=row.date,
         timestamp_utc=timestamp_utc,
         decision_id=_portfolio_review_decision_id(row, workflow=workflow),
+        trade_id=trade_id,
+        linked_decision_id=linked_decision_id,
         preset_name=row.preset_name,
         suggested_action=row.suggested_action,
         quantity=row.quantity,
@@ -3169,9 +3336,7 @@ def _portfolio_review_outcome_event(
     outcome_snapshot = _trade_outcome_snapshot_from_row(row)
     if outcome_snapshot is None:
         return None
-    position_metadata = row.metadata.get("position_metadata", {})
-    if not isinstance(position_metadata, Mapping):
-        position_metadata = {}
+    position_metadata = _portfolio_review_position_metadata(row)
     trade_id = _clean_optional_text(position_metadata.get("trade_id"))
     if trade_id is None:
         LOGGER.debug(
@@ -3474,8 +3639,8 @@ def _run_daily_summary_workflow(
             log_label="daily-summary",
         ),
     )
-    journal_path = default_candidate_score_journal_path(config.project_root)
-    candidate_score_journal = load_candidate_score_journal(journal_path)
+    candidate_score_journal_store = CandidateScoreJournalStore(config.project_root)
+    candidate_score_journal = candidate_score_journal_store.load()
 
     for preset in presets:
         strategy_settings = BreakoutMomentumSettings.from_configs(
@@ -3689,7 +3854,7 @@ def _run_daily_summary_workflow(
         observations=ranked_symbol_observations,
         as_of_date=args.as_of,
     )
-    journal_path = write_candidate_score_journal(candidate_score_journal, journal_path)
+    journal_path = candidate_score_journal_store.save(candidate_score_journal)
     execution_batch = ManualExecutor().build_execution_batch(
         [evaluation.candidate for evaluation in ranked_evaluations],
         as_of_date=args.as_of,
@@ -3878,14 +4043,9 @@ def _run_portfolio_review_intraday_workflow(
         )
     if provider is None:
         raise ValueError("A data provider is required when reviewing non-empty portfolios.")
-    intraday_state_journal_path = default_intraday_state_journal_path(
-        config.project_root,
-        args.as_of,
-    )
-    intraday_state_journal = load_intraday_state_journal(
-        intraday_state_journal_path,
-        session_date=args.as_of,
-    )
+    intraday_state_store = IntradayStateJournalStore(config.project_root, args.as_of)
+    intraday_state_journal_path = intraday_state_store.path
+    intraday_state_journal = intraday_state_store.load()
 
     preset_catalog = _portfolio_review_preset_catalog(args, config)
     base_settings = BreakoutMomentumSettings.from_configs(
@@ -3998,7 +4158,7 @@ def _run_portfolio_review_intraday_workflow(
         intraday_state_journal,
         observations=intraday_observations,
     )
-    write_intraday_state_journal(updated_intraday_state_journal, intraday_state_journal_path)
+    intraday_state_store.save(updated_intraday_state_journal)
 
     return build_intraday_portfolio_review_report(
         as_of_date=args.as_of,
@@ -4456,14 +4616,12 @@ def _run_portfolio_review_workflow(
     if provider is None:
         raise ValueError("A data provider is required when reviewing non-empty portfolios.")
     position_trajectory_journal: PositionTrajectoryJournal | None = None
-    position_trajectory_journal_path: Path | None = None
+    position_trajectory_store: PositionTrajectoryJournalStore | None = None
     if getattr(args, "portfolio_file", None) is not None:
-        position_trajectory_journal_path = default_position_trajectory_journal_path(
+        position_trajectory_store = PositionTrajectoryJournalStore(
             config.project_root,
         )
-        position_trajectory_journal = load_position_trajectory_journal(
-            position_trajectory_journal_path,
-        )
+        position_trajectory_journal = position_trajectory_store.load()
 
     preset_catalog = _portfolio_review_preset_catalog(args, config)
     base_settings = BreakoutMomentumSettings.from_configs(
@@ -4556,42 +4714,34 @@ def _run_portfolio_review_workflow(
         position = plan.get("position")
         symbol = position.symbol if isinstance(position, ExistingPosition) else "<unknown>"
         try:
-            row = _build_portfolio_review_row(
-                plan,
-                provider=provider,
-                as_of_date=args.as_of,
-                benchmark_frame=benchmark_frame,
-                refresh_cache=args.refresh_cache,
-                earnings_context=earnings_contexts.get(symbol),
-                sector_context=sector_contexts.get(symbol),
-                position_trajectory_journal=position_trajectory_journal,
+            review_row_state = _coerce_portfolio_review_row_state(
+                _build_portfolio_review_row(
+                    plan,
+                    provider=provider,
+                    as_of_date=args.as_of,
+                    benchmark_frame=benchmark_frame,
+                    refresh_cache=args.refresh_cache,
+                    earnings_context=earnings_contexts.get(symbol),
+                    sector_context=sector_contexts.get(symbol),
+                    position_trajectory_journal=position_trajectory_journal,
+                )
             )
-            position_trajectory_observation = _position_trajectory_observation_from_row(row)
+            row = review_row_state.row
+            position_trajectory_observation = review_row_state.position_trajectory_observation
             if position_trajectory_observation is not None:
                 position_trajectory_observations[position_trajectory_observation.symbol] = (
                     position_trajectory_observation
                 )
-                row = replace(
-                    row,
-                    metadata={
-                        key: value
-                        for key, value in row.metadata.items()
-                        if key != _POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY
-                    },
-                )
             rows.append(row)
         except (DataProviderError, ValueError) as exc:
             LOGGER.warning("Skipping held symbol %s due to review error: %s", symbol, exc)
-    if position_trajectory_journal is not None and position_trajectory_journal_path is not None:
+    if position_trajectory_store is not None and position_trajectory_journal is not None:
         updated_position_trajectory_journal = update_position_trajectory_journal(
             position_trajectory_journal,
             observations=position_trajectory_observations,
             active_symbols=[position.symbol for position in resolved_current_positions],
         )
-        write_position_trajectory_journal(
-            updated_position_trajectory_journal,
-            position_trajectory_journal_path,
-        )
+        position_trajectory_store.save(updated_position_trajectory_journal)
     return build_portfolio_review_report(
         as_of_date=args.as_of,
         rows=rows,
@@ -4632,7 +4782,7 @@ def _build_portfolio_review_row(
     earnings_context: EarningsRiskContext | None = None,
     sector_context: SectorFeatureContext | None = None,
     position_trajectory_journal: PositionTrajectoryJournal | None = None,
-) -> PortfolioReviewRow:
+) -> PortfolioReviewRowState:
     position = plan["position"]
     preset = plan["preset"]
     preset_resolution = plan["preset_resolution"]
@@ -4822,28 +4972,27 @@ def _build_portfolio_review_row(
         "relative_strength_return_diff": relative_strength_metrics.get("relative_strength_return_diff"),
         **decision.metadata,
     }
-    if finalized_position_trajectory_observation is not None:
-        metadata[_POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY] = (
-            finalized_position_trajectory_observation.to_dict()
-        )
     if trade_outcome_snapshot is not None:
         metadata[_TRADE_OUTCOME_SNAPSHOT_METADATA_KEY] = trade_outcome_snapshot.to_dict()
-    return PortfolioReviewRow(
-        date=as_of_date,
-        symbol=position.symbol,
-        quantity=position.shares,
-        average_entry_price=position.average_entry_price,
-        current_stop=position.current_stop,
-        suggested_stop=decision.suggested_stop,
-        latest_close=decision.latest_close,
-        unrealized_pl_pct=decision.unrealized_pl_pct,
-        distance_to_stop_pct=decision.distance_to_stop_pct,
-        regime_passed=decision.regime_passed,
-        above_entry=decision.above_entry,
-        suggested_action=decision.suggested_action,
-        preset_name=preset.name,
-        rationale=" | ".join(decision.rationale),
-        metadata=metadata,
+    return PortfolioReviewRowState(
+        row=PortfolioReviewRow(
+            date=as_of_date,
+            symbol=position.symbol,
+            quantity=position.shares,
+            average_entry_price=position.average_entry_price,
+            current_stop=position.current_stop,
+            suggested_stop=decision.suggested_stop,
+            latest_close=decision.latest_close,
+            unrealized_pl_pct=decision.unrealized_pl_pct,
+            distance_to_stop_pct=decision.distance_to_stop_pct,
+            regime_passed=decision.regime_passed,
+            above_entry=decision.above_entry,
+            suggested_action=decision.suggested_action,
+            preset_name=preset.name,
+            rationale=" | ".join(decision.rationale),
+            metadata=metadata,
+        ),
+        position_trajectory_observation=finalized_position_trajectory_observation,
     )
 
 

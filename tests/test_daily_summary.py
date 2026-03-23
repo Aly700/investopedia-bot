@@ -12,6 +12,7 @@ import pytest
 
 import bot.main as main_module
 from bot.config import load_app_config
+from bot.data.candidate_journal import default_candidate_score_journal_path
 from bot.data.earnings import EarningsRiskContext
 from bot.data.intraday_state_journal import default_intraday_state_journal_path
 from bot.data.portfolio_heat import (
@@ -25,7 +26,10 @@ from bot.data.position_trajectory import (
     default_position_trajectory_journal_path,
 )
 from bot.data.trade_feedback import (
+    TradeFeedbackEvent,
     TradeOutcomeSnapshot,
+    append_trade_feedback_events,
+    build_trade_id,
     default_trade_feedback_log_path,
     load_trade_feedback_events,
 )
@@ -3407,7 +3411,7 @@ def test_run_daily_summary_workflow_ignores_corrupt_candidate_score_journal(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     config = replace(load_app_config(), project_root=tmp_path)
-    journal_path = tmp_path / "data" / "processed" / "state" / "candidate_scores.json"
+    journal_path = default_candidate_score_journal_path(tmp_path)
     journal_path.parent.mkdir(parents=True, exist_ok=True)
     journal_path.write_text("{bad-json", encoding="utf-8")
     args = build_parser().parse_args(
@@ -4234,6 +4238,7 @@ def test_handle_review_portfolio_writes_trade_decision_and_outcome_log(
     assert [event.event_type for event in events] == ["decision", "outcome"]
     assert events[0].workflow == "review-portfolio"
     assert events[0].decision_id is not None
+    assert events[0].trade_id == "trade_aapl"
     assert events[1].trade_id == "trade_aapl"
     assert events[1].linked_decision_id == "decision_aapl"
     assert events[1].outcome_snapshot is not None
@@ -4450,6 +4455,182 @@ def test_position_snapshot_commands_log_linked_execution_events(
     assert events[-1].metadata["realized_return_pct"] == pytest.approx(0.10)
 
 
+def test_upsert_position_without_trade_id_persists_generated_trade_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+
+    upsert_args = build_parser().parse_args(
+        [
+            "upsert-position",
+            str(portfolio_path),
+            "AAPL",
+            "--quantity",
+            "10",
+            "--average-entry-price",
+            "100",
+            "--current-stop",
+            "95",
+            "--preset-name",
+            "standard_breakout",
+            "--decision-id",
+            "decision_aapl",
+            "--as-of",
+            "2024-01-05",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_upsert_position(upsert_args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    stored_position = main_module.load_existing_positions(portfolio_path)[0]
+    expected_trade_id = build_trade_id(
+        symbol="AAPL",
+        entry_date=date(2024, 1, 5),
+        average_entry_price=100.0,
+        decision_id="decision_aapl",
+    )
+    events = load_trade_feedback_events(Path(payload["trade_feedback_log"]))
+
+    assert stored_position.metadata["trade_id"] == expected_trade_id
+    assert stored_position.metadata["entry_date"] == "2024-01-05"
+    assert len(events) == 1
+    assert events[0].event_type == "executed"
+    assert events[0].trade_id == expected_trade_id
+    assert events[0].linked_decision_id == "decision_aapl"
+
+
+def test_portfolio_review_outcome_event_uses_trade_id_stored_by_upsert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    portfolio_path = tmp_path / "portfolio.csv"
+    portfolio_path.write_text(
+        "symbol,quantity,average_entry_price,current_stop,preset_name,source,metadata_json\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+
+    upsert_args = build_parser().parse_args(
+        [
+            "upsert-position",
+            str(portfolio_path),
+            "AAPL",
+            "--quantity",
+            "10",
+            "--average-entry-price",
+            "100",
+            "--current-stop",
+            "95",
+            "--preset-name",
+            "standard_breakout",
+            "--decision-id",
+            "decision_aapl",
+            "--as-of",
+            "2024-01-05",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_upsert_position(upsert_args) == 0
+    stored_position = main_module.load_existing_positions(portfolio_path)[0]
+    row = PortfolioReviewRow(
+        date=date(2024, 1, 10),
+        symbol="AAPL",
+        quantity=stored_position.shares,
+        average_entry_price=stored_position.average_entry_price,
+        current_stop=stored_position.current_stop,
+        suggested_stop=101.0,
+        latest_close=105.0,
+        unrealized_pl_pct=0.05,
+        distance_to_stop_pct=0.095,
+        regime_passed=True,
+        above_entry=True,
+        suggested_action="HOLD",
+        preset_name="standard_breakout",
+        rationale="Still constructive.",
+        metadata={
+            "position_metadata": dict(stored_position.metadata),
+            main_module._TRADE_OUTCOME_SNAPSHOT_METADATA_KEY: TradeOutcomeSnapshot(
+                as_of_date=date(2024, 1, 10),
+                entry_date=date(2024, 1, 5),
+                sessions_since_entry=5,
+                current_return_pct=0.05,
+                max_favorable_excursion_pct=0.08,
+                max_adverse_excursion_pct=-0.02,
+                stop_hit=False,
+                forward_return_1d=0.01,
+                forward_return_5d=0.04,
+                forward_return_10d=None,
+                above_entry_after_1d=True,
+                above_entry_after_5d=True,
+                above_entry_after_10d=None,
+            ).to_dict(),
+        },
+    )
+
+    event = main_module._portfolio_review_outcome_event(
+        row,
+        workflow="review-portfolio",
+        timestamp_utc="2024-01-10T21:00:00Z",
+    )
+
+    assert event is not None
+    assert event.trade_id == stored_position.metadata["trade_id"]
+    assert event.linked_decision_id == "decision_aapl"
+
+
+def test_build_trade_outcome_snapshot_logs_when_entry_date_is_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    position = ExistingPosition(
+        symbol="AAPL",
+        shares=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        preset_name="standard_breakout",
+        metadata={"trade_id": "trade_aapl"},
+    )
+    price_frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-05", "2024-01-08"]),
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume": [1_000_000.0, 1_100_000.0],
+            "symbol": ["AAPL", "AAPL"],
+        }
+    )
+
+    with caplog.at_level("WARNING"):
+        snapshot = main_module._build_trade_outcome_snapshot(
+            position,
+            price_frame=price_frame,
+            as_of_date=date(2024, 1, 8),
+        )
+
+    assert snapshot is None
+    assert (
+        "Skipping trade outcome tracking for AAPL on 2024-01-08 because trade_id "
+        "trade_aapl has no entry_date."
+        in caplog.text
+    )
+
+
 def test_handle_generate_orders_writes_trade_decision_log(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4543,6 +4724,94 @@ def test_handle_generate_orders_writes_trade_decision_log(
     assert events[0].workflow == "generate-orders"
     assert events[0].approved is True
     assert events[0].decision_id is not None
+
+
+def test_handle_review_trade_analytics_writes_summary_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    append_trade_feedback_events(
+        [
+            TradeFeedbackEvent(
+                event_type="decision",
+                workflow="daily-summary",
+                symbol="AAPL",
+                as_of_date=date(2024, 1, 5),
+                decision_id="decision_aapl",
+                preset_name="standard_breakout",
+                suggested_action="BUY",
+                approved=True,
+                priority_bucket="top_priority",
+                actionable_now=True,
+            ),
+            TradeFeedbackEvent(
+                event_type="executed",
+                workflow="upsert-position",
+                symbol="AAPL",
+                as_of_date=date(2024, 1, 5),
+                decision_id="decision_aapl",
+                trade_id="trade_aapl",
+                linked_decision_id="decision_aapl",
+                suggested_action="BUY",
+            ),
+            TradeFeedbackEvent(
+                event_type="outcome",
+                workflow="review-portfolio",
+                symbol="AAPL",
+                as_of_date=date(2024, 1, 10),
+                decision_id="decision_aapl",
+                trade_id="trade_aapl",
+                linked_decision_id="decision_aapl",
+                outcome_snapshot=TradeOutcomeSnapshot(
+                    as_of_date=date(2024, 1, 10),
+                    entry_date=date(2024, 1, 5),
+                    sessions_since_entry=5,
+                    current_return_pct=0.04,
+                    max_favorable_excursion_pct=0.07,
+                    max_adverse_excursion_pct=-0.02,
+                    stop_hit=False,
+                    forward_return_1d=0.02,
+                    forward_return_5d=0.05,
+                    forward_return_10d=None,
+                    above_entry_after_1d=True,
+                    above_entry_after_5d=True,
+                    above_entry_after_10d=None,
+                ),
+            ),
+        ],
+        default_trade_feedback_log_path(tmp_path),
+    )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+
+    args = build_parser().parse_args(
+        [
+            "review-trade-analytics",
+            "--as-of",
+            "2024-01-10",
+            "--days",
+            "30",
+            "--output-dir",
+            str(tmp_path / "analytics"),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_review_trade_analytics(args) == 0
+    payload = json.loads(capsys.readouterr().out)
+    summary_path = Path(payload["outputs"]["trade_review_analytics_json"])
+    brief_path = Path(payload["outputs"]["trade_review_analytics_brief"])
+
+    assert payload["decision_summary"]["approved_count"] == 1
+    assert payload["outcome_summary"]["trade_count"] == 1
+    assert summary_path.exists()
+    assert brief_path.exists()
+    assert "Trade review analytics for 2024-01-10 (last 30 days)" in brief_path.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_position_entry_date_returns_date_object() -> None:
