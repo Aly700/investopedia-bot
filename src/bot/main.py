@@ -132,10 +132,13 @@ from bot.features import (
     market_context_metadata,
 )
 from bot.ingestion.market_data import PollingIngestionAdapter
+from bot.ingestion.streaming import LiveUpdateBufferSnapshot, WebsocketIngestionAdapter
+from bot.ingestion.websocket_transport import JsonWebsocketTransport
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
 from bot.orchestration.live_runner import (
     LiveMarketCycleRequest,
+    LiveMarketCycleResult,
     LiveMarketRunner,
     PersistedMarketStateArtifacts,
 )
@@ -199,6 +202,10 @@ from bot.state.market_state import (
     MarketStateStore,
     write_market_state_change_set,
     write_market_state_change_summary,
+)
+from bot.service.live_market_service import (
+    LiveMarketSupervisor,
+    ReconnectBackoffPolicy,
 )
 
 
@@ -781,6 +788,172 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bypass local cache and force provider fetches.",
     )
     monitor_market_parser.set_defaults(handler=_handle_monitor_market)
+
+    run_live_market_service_parser = subparsers.add_parser(
+        "run-live-market-service",
+        help="Run the long-lived websocket-driven live market supervisor.",
+    )
+    run_live_market_service_parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--websocket-url",
+        required=True,
+        help="Websocket endpoint used for live market updates.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--subscription-message",
+        action="append",
+        default=None,
+        type=_parse_json_message,
+        help="Optional JSON websocket subscription message. Repeat to send multiple subscriptions.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--transport-name",
+        default="json-websocket",
+        help="Label for the live websocket transport.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--portfolio-file",
+        type=Path,
+        default=None,
+        help="Optional CSV or JSON portfolio snapshot to include in the live cycle.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--include-intraday-review",
+        action="store_true",
+        help="Include intraday portfolio review cycles when a portfolio file is provided.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Trading session date used for the live cycle.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--preset-names",
+        default=None,
+        help="Comma-separated preset names to evaluate for buy candidates.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--comparison-results",
+        type=Path,
+        default=None,
+        help="Optional ranked preset output from compare-strategies.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--equity",
+        type=float,
+        default=None,
+        help="Current account equity used for position sizing. Defaults to config starting_cash.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--current-drawdown",
+        type=float,
+        default=0.0,
+        help="Current portfolio drawdown as a decimal fraction for drawdown-aware risk reduction.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=20,
+        help="Lookback window used for universe liquidity screening.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--require-relative-volume",
+        action="store_true",
+        help="Require relative-volume confirmation for breakout entries.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--disable-regime-filter",
+        action="store_true",
+        help="Disable the benchmark-based regime filter.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=15,
+        help="Intraday aggregate interval in minutes when intraday review is enabled.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for live report and state outputs.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=1.0,
+        help="Base supervisor sleep interval between live loop iterations.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--flush-interval-seconds",
+        type=int,
+        default=5,
+        help="Streaming buffer flush interval in seconds.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--stale-after-seconds",
+        type=float,
+        default=30.0,
+        help="Mark the service stale when no messages arrive within this many seconds.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--receive-timeout-seconds",
+        type=float,
+        default=0.25,
+        help="Per-read websocket timeout for the concrete transport.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--max-messages-per-poll",
+        type=int,
+        default=100,
+        help="Maximum websocket messages to process in one supervisor iteration.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--initial-reconnect-delay-seconds",
+        type=float,
+        default=1.0,
+        help="Initial reconnect backoff in seconds.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--max-reconnect-delay-seconds",
+        type=float,
+        default=30.0,
+        help="Maximum reconnect backoff in seconds.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--reconnect-backoff-multiplier",
+        type=float,
+        default=2.0,
+        help="Reconnect backoff multiplier.",
+    )
+    run_live_market_service_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="Optional maximum supervisor iterations before exiting.",
+    )
+    run_live_market_service_parser.set_defaults(handler=_handle_run_live_market_service)
 
     generate_orders_parser = subparsers.add_parser(
         "generate-orders",
@@ -2195,6 +2368,217 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_run_live_market_service(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    if args.include_intraday_review and args.portfolio_file is None:
+        raise ValueError("--include-intraday-review requires --portfolio-file.")
+
+    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    output_dir = (
+        args.output_dir
+        or _default_live_market_output_dir(config.project_root, args.as_of)
+    ).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=args.as_of,
+        portfolio_path=(
+            str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
+        ),
+        include_daily_summary=True,
+        include_portfolio_review=args.portfolio_file is not None,
+        include_intraday_review=(
+            bool(args.include_intraday_review) and args.portfolio_file is not None
+        ),
+        daily_summary_required=True,
+        portfolio_review_required=False,
+        intraday_review_required=False,
+    )
+    transport = JsonWebsocketTransport(
+        url=args.websocket_url,
+        subscription_messages=tuple(args.subscription_message or ()),
+        receive_timeout_seconds=args.receive_timeout_seconds,
+        max_messages_per_read=args.max_messages_per_poll,
+        transport_name=args.transport_name,
+    )
+    adapter = WebsocketIngestionAdapter(
+        transport_name=transport.transport_name,
+        transport=transport,
+        portfolio_path=request.portfolio_path,
+        load_current_positions=lambda: _load_current_positions(args.portfolio_file),
+        run_daily_summary=lambda snapshot, current_positions: _run_streaming_daily_summary_workflow(
+            args,
+            config=config,
+            current_positions=current_positions,
+            snapshot=snapshot,
+            provider=provider,
+        ),
+        run_portfolio_review=(
+            lambda snapshot, current_positions: _run_streaming_portfolio_review_workflow(
+                args,
+                config=config,
+                current_positions=current_positions,
+                snapshot=snapshot,
+                provider=provider,
+            )
+            if args.portfolio_file is not None
+            else None
+        ),
+        run_intraday_review=(
+            lambda snapshot, current_positions: _run_streaming_intraday_review_workflow(
+                args,
+                config=config,
+                current_positions=current_positions,
+                snapshot=snapshot,
+                provider=provider,
+            )
+            if args.portfolio_file is not None and args.include_intraday_review
+            else None
+        ),
+        provider_name=_configured_provider_name(config),
+        flush_interval_seconds=args.flush_interval_seconds,
+    )
+    latest_outputs: dict[str, str] = {}
+
+    def handle_cycle_result(cycle_result: LiveMarketCycleResult) -> None:
+        latest_outputs.update(
+            _write_live_market_cycle_outputs(
+                cycle_result,
+                output_dir=output_dir,
+            )
+        )
+
+    supervisor = LiveMarketSupervisor(
+        runner=LiveMarketRunner(
+            build_monitor_report=lambda as_of_date, daily_summary, portfolio_review, intraday_review, portfolio_path: build_market_monitor_report(
+                as_of_date=as_of_date,
+                daily_summary=daily_summary,
+                portfolio_review=(
+                    _strip_internal_portfolio_review_report(portfolio_review)
+                    if portfolio_review is not None
+                    else None
+                ),
+                portfolio_path=portfolio_path,
+            ),
+            persist_market_state=lambda as_of_date, workflow, daily_summary, portfolio_review, intraday_review, portfolio_path: _persist_market_state(
+                project_root=config.project_root,
+                output_dir=output_dir,
+                as_of_date=as_of_date,
+                workflow=workflow,
+                portfolio_path=portfolio_path,
+                daily_summary=daily_summary,
+                portfolio_review=(
+                    _strip_internal_portfolio_review_report(portfolio_review)
+                    if portfolio_review is not None
+                    else None
+                ),
+                intraday_review=intraday_review,
+            ),
+        ),
+        adapter=adapter,
+        request=request,
+        poll_interval_seconds=args.poll_interval_seconds,
+        stale_after_seconds=args.stale_after_seconds,
+        max_messages_per_poll=args.max_messages_per_poll,
+        reconnect_backoff=ReconnectBackoffPolicy(
+            initial_delay_seconds=args.initial_reconnect_delay_seconds,
+            multiplier=args.reconnect_backoff_multiplier,
+            max_delay_seconds=args.max_reconnect_delay_seconds,
+        ),
+        handle_cycle_result=handle_cycle_result,
+    )
+    status = supervisor.run(max_iterations=args.max_iterations)
+    payload = {
+        "command": "run-live-market-service",
+        "as_of_date": args.as_of.isoformat(),
+        "websocket_url": args.websocket_url,
+        "transport_name": args.transport_name,
+        "portfolio_file": (
+            str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
+        ),
+        "include_intraday_review": bool(args.include_intraday_review),
+        "status": status.to_dict(),
+        "outputs": dict(sorted(latest_outputs.items())),
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _write_live_market_cycle_outputs(
+    cycle_result: LiveMarketCycleResult,
+    *,
+    output_dir: Path,
+) -> dict[str, str]:
+    outputs = dict(cycle_result.paths_written)
+    if cycle_result.monitor_report is not None:
+        outputs["market_monitor_json"] = str(
+            write_market_monitor_report(
+                cycle_result.monitor_report,
+                output_dir / "market_monitor.json",
+            )
+        )
+        outputs["market_monitor_csv"] = str(
+            write_market_monitor_report(
+                cycle_result.monitor_report,
+                output_dir / "market_monitor.csv",
+            )
+        )
+        outputs["market_monitor_text"] = str(
+            write_market_monitor_text_summary(
+                cycle_result.monitor_report,
+                output_dir / "market_monitor.txt",
+            )
+        )
+        outputs["market_monitor_brief"] = str(
+            write_market_monitor_brief(
+                cycle_result.monitor_report,
+                output_dir / "market_monitor_brief.txt",
+            )
+        )
+    if cycle_result.portfolio_review is not None:
+        sanitized_review = _strip_internal_portfolio_review_report(
+            cycle_result.portfolio_review,
+        )
+        outputs["portfolio_review_json"] = str(
+            write_portfolio_review_report(
+                sanitized_review,
+                output_dir / "portfolio_review.json",
+            )
+        )
+        outputs["portfolio_review_csv"] = str(
+            write_portfolio_review_report(
+                sanitized_review,
+                output_dir / "portfolio_review.csv",
+            )
+        )
+    if cycle_result.intraday_review is not None:
+        outputs["portfolio_review_intraday_json"] = str(
+            write_intraday_portfolio_review_report(
+                cycle_result.intraday_review,
+                output_dir / "portfolio_review_intraday.json",
+            )
+        )
+        outputs["portfolio_review_intraday_csv"] = str(
+            write_intraday_portfolio_review_report(
+                cycle_result.intraday_review,
+                output_dir / "portfolio_review_intraday.csv",
+            )
+        )
+        outputs["portfolio_review_intraday_brief"] = str(
+            write_intraday_portfolio_review_brief(
+                cycle_result.intraday_review,
+                output_dir / "portfolio_review_intraday_brief.txt",
+            )
+        )
+    if cycle_result.daily_summary_result is not None:
+        candidate_score_journal_path = cycle_result.daily_summary_result.get(
+            "candidate_score_journal_path"
+        )
+        if candidate_score_journal_path is not None:
+            outputs["candidate_score_journal"] = str(candidate_score_journal_path)
+    return outputs
+
+
 def _handle_generate_orders(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     provider = create_daily_bar_provider(config, env_file=args.env_file)
@@ -3129,6 +3513,10 @@ def _default_daily_output_dir(project_root: Path, as_of_date: date) -> Path:
 
 def _default_intraday_portfolio_output_dir(project_root: Path, as_of_date: date) -> Path:
     return project_root / "data" / "processed" / "portfolio_review_intraday" / as_of_date.isoformat()
+
+
+def _default_live_market_output_dir(project_root: Path, as_of_date: date) -> Path:
+    return project_root / "data" / "processed" / "live_market" / as_of_date.isoformat()
 
 
 def _trade_feedback_timestamp_utc() -> str:
@@ -5804,6 +6192,57 @@ def _resolve_daily_summary_presets(
     return presets, selection_source
 
 
+def _run_streaming_daily_summary_workflow(
+    args: argparse.Namespace,
+    *,
+    config: AppConfig,
+    current_positions: list[ExistingPosition],
+    snapshot: LiveUpdateBufferSnapshot,
+    provider: DailyBarProvider,
+) -> dict[str, object]:
+    _ = snapshot
+    return _run_daily_summary_workflow(
+        args,
+        config=config,
+        provider=provider,
+        current_positions=current_positions,
+    )
+
+
+def _run_streaming_portfolio_review_workflow(
+    args: argparse.Namespace,
+    *,
+    config: AppConfig,
+    current_positions: list[ExistingPosition],
+    snapshot: LiveUpdateBufferSnapshot,
+    provider: DailyBarProvider,
+) -> PortfolioReviewReport:
+    _ = snapshot
+    return _run_portfolio_review_workflow(
+        args,
+        config=config,
+        provider=provider,
+        current_positions=current_positions,
+    )
+
+
+def _run_streaming_intraday_review_workflow(
+    args: argparse.Namespace,
+    *,
+    config: AppConfig,
+    current_positions: list[ExistingPosition],
+    snapshot: LiveUpdateBufferSnapshot,
+    provider: DailyBarProvider,
+) -> IntradayPortfolioReviewReport:
+    _ = snapshot
+    return _run_portfolio_review_intraday_workflow(
+        args,
+        config=config,
+        provider=provider,
+        current_positions=current_positions,
+    )
+
+
 def _load_top_preset_name_from_results(results_path: Path) -> str:
     resolved_path = results_path.resolve()
     if not resolved_path.exists():
@@ -5890,6 +6329,22 @@ def _parse_iso_date(raw_value: str) -> date:
         raise argparse.ArgumentTypeError(
             f"Invalid date '{raw_value}'. Expected YYYY-MM-DD."
         ) from exc
+
+
+def _parse_json_message(raw_value: str) -> dict[str, object] | str:
+    try:
+        payload = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(
+            f"Invalid JSON message '{raw_value}': {exc.msg}."
+        ) from exc
+    if isinstance(payload, dict):
+        return dict(payload)
+    if isinstance(payload, str):
+        return payload
+    raise argparse.ArgumentTypeError(
+        "Subscription messages must decode to a JSON object or JSON string."
+    )
 
 
 def _parse_int_list(raw_value: str | None) -> tuple[int, ...] | None:

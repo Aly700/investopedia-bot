@@ -356,6 +356,17 @@ class WebsocketIngestionAdapter:
             raise ValueError("No buffered streaming updates are ready for cycle ingestion.")
         return envelope
 
+    def has_pending_updates(
+        self,
+        *,
+        as_of_date: date,
+    ) -> bool:
+        """Return whether the buffer is currently dirty for the requested session date."""
+
+        if self._buffer.dirty_since_utc is None:
+            return False
+        return bool(self._buffer.current_updates(as_of_date=as_of_date))
+
     def _build_cycle_ingestion(
         self,
         request: LiveMarketCycleRequest,
