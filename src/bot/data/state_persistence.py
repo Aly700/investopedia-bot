@@ -88,6 +88,17 @@ def write_json_file(
     return resolved_path
 
 
+def write_text_file(path: Path, content: str) -> Path:
+    """Write text atomically in the destination directory."""
+
+    resolved_path = path.resolve()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = resolved_path.with_suffix(resolved_path.suffix + ".tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    temp_path.replace(resolved_path)
+    return resolved_path
+
+
 def coerce_positive_int(value: Any, field_name: str) -> int:
     """Return a positive integer while rejecting booleans."""
 

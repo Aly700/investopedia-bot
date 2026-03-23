@@ -88,6 +88,7 @@ from bot.state.market_state import (
     MarketStateSnapshot,
     MarketStateStore,
     MarketStateVolatilityContext,
+    build_market_state_snapshot,
     diff_market_state_snapshots,
 )
 
@@ -2759,10 +2760,12 @@ def test_market_state_store_does_not_retrigger_unchanged_state(tmp_path: Path) -
     assert second.change_set.transition_count == 0
 
 
-def test_market_state_store_ignores_malformed_previous_snapshot(tmp_path: Path) -> None:
+def test_market_state_store_ignores_malformed_current_snapshot_and_self_heals(
+    tmp_path: Path,
+) -> None:
     store = MarketStateStore(tmp_path)
-    store.previous_path.parent.mkdir(parents=True, exist_ok=True)
-    store.previous_path.write_text("{bad json", encoding="utf-8")
+    store.current_path.parent.mkdir(parents=True, exist_ok=True)
+    store.current_path.write_text("{bad json", encoding="utf-8")
     report = build_portfolio_review_report(
         as_of_date=date(2024, 1, 5),
         current_positions=[],
@@ -2770,16 +2773,69 @@ def test_market_state_store_ignores_malformed_previous_snapshot(tmp_path: Path) 
         benchmark_symbol="SPY",
     )
 
-    loaded_previous = store.load_previous()
+    loaded_current = store.load_current()
     result = store.update(
         as_of_date=date(2024, 1, 5),
         workflow="review-portfolio",
         portfolio_review=report,
     )
+    healed_payload = json.loads(store.current_path.read_text(encoding="utf-8"))
 
-    assert loaded_previous is None
+    assert loaded_current is None
     assert result.current_path.exists()
     assert result.change_set.baseline_established is True
+    assert healed_payload["schema_version"] == 1
+    assert healed_payload["as_of_date"] == "2024-01-05"
+
+
+def test_market_state_snapshot_keeps_highest_severity_action_for_duplicate_symbols() -> None:
+    report = build_portfolio_review_report(
+        as_of_date=date(2024, 1, 5),
+        current_positions=[],
+        rows=[
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=None,
+                latest_close=101.0,
+                unrealized_pl_pct=0.01,
+                distance_to_stop_pct=0.05,
+                regime_passed=True,
+                above_entry=True,
+                suggested_action="HOLD",
+                preset_name="aggressive_breakout",
+                rationale="Hold state.",
+            ),
+            PortfolioReviewRow(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                quantity=10,
+                average_entry_price=100.0,
+                current_stop=95.0,
+                suggested_stop=96.0,
+                latest_close=94.0,
+                unrealized_pl_pct=-0.06,
+                distance_to_stop_pct=-0.01,
+                regime_passed=False,
+                above_entry=False,
+                suggested_action="EXIT CANDIDATE",
+                preset_name="standard_breakout",
+                rationale="Exit state.",
+            ),
+        ],
+        benchmark_symbol="SPY",
+    )
+
+    snapshot = build_market_state_snapshot(
+        as_of_date=date(2024, 1, 5),
+        workflow="review-portfolio",
+        portfolio_review=report,
+    )
+
+    assert snapshot.current_action_states_by_symbol["AAPL"].action == "EXIT CANDIDATE"
 
 
 def _market_state_snapshot(

@@ -134,6 +134,7 @@ from bot.features import (
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
 from bot.reporting.daily_report import (
+    DailyResearchSummary,
     IntradayPortfolioReviewReport,
     PresetCandidateEvaluation,
     PortfolioReviewReport,
@@ -228,7 +229,7 @@ def _persist_market_state(
     as_of_date: date,
     workflow: str,
     portfolio_path: str | None = None,
-    daily_summary: Any | None = None,
+    daily_summary: DailyResearchSummary | None = None,
     portfolio_review: PortfolioReviewReport | None = None,
     intraday_review: IntradayPortfolioReviewReport | None = None,
 ) -> tuple[dict[str, str], int, bool]:

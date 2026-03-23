@@ -16,6 +16,7 @@ from bot.data.state_persistence import (
     coerce_positive_int,
     load_json_mapping_file,
     write_json_file,
+    write_text_file,
 )
 from bot.features import MarketContext
 from bot.reporting.daily_report import (
@@ -1011,7 +1012,12 @@ def diff_market_state_snapshots(
     previous_snapshot: MarketStateSnapshot | None,
     current_snapshot: MarketStateSnapshot,
 ) -> MarketStateChangeSet:
-    """Return the meaningful transition set between two snapshots."""
+    """Return the meaningful transition set between two snapshots.
+
+    Position open/close lifecycle events are intentionally excluded here.
+    ``trade_feedback`` owns those execution/outcome events so the market-state
+    layer only emits current-state/regime transitions.
+    """
 
     if previous_snapshot is None:
         return MarketStateChangeSet(
@@ -1059,10 +1065,7 @@ def write_market_state_change_summary(
 ) -> Path:
     """Write a compact human-readable state-change summary."""
 
-    resolved_output_path = output_path.resolve()
-    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
-    resolved_output_path.write_text(change_set.to_text(), encoding="utf-8")
-    return resolved_output_path
+    return write_text_file(output_path, change_set.to_text())
 
 
 def _market_context_sections(
@@ -1253,8 +1256,9 @@ def _action_states_from_rows(
     *,
     source_workflow: str,
 ) -> dict[str, MarketStateActionState]:
-    action_states = {
-        row.symbol: MarketStateActionState(
+    action_states: dict[str, MarketStateActionState] = {}
+    for row in sorted(rows, key=lambda row: (row.symbol, row.preset_name or "")):
+        candidate_state = MarketStateActionState(
             symbol=row.symbol,
             action=row.suggested_action,
             source_workflow=source_workflow,
@@ -1264,8 +1268,14 @@ def _action_states_from_rows(
             suggested_stop=row.suggested_stop,
             rationale=row.rationale,
         )
-        for row in sorted(rows, key=lambda row: (row.symbol, row.preset_name or ""))
-    }
+        existing_state = action_states.get(row.symbol)
+        if existing_state is None:
+            action_states[row.symbol] = candidate_state
+            continue
+        existing_severity = _PORTFOLIO_ACTION_SEVERITY.get(existing_state.action, -1)
+        candidate_severity = _PORTFOLIO_ACTION_SEVERITY.get(candidate_state.action, -1)
+        if candidate_severity >= existing_severity:
+            action_states[row.symbol] = candidate_state
     return action_states
 
 
