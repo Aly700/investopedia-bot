@@ -4240,6 +4240,55 @@ def test_handle_review_portfolio_writes_trade_decision_and_outcome_log(
     assert events[1].outcome_snapshot.current_return_pct == pytest.approx(0.05)
 
 
+def test_portfolio_review_outcome_event_logs_missing_trade_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    row = PortfolioReviewRow(
+        date=date(2024, 1, 5),
+        symbol="AAPL",
+        quantity=10,
+        average_entry_price=100.0,
+        current_stop=95.0,
+        suggested_stop=None,
+        latest_close=105.0,
+        unrealized_pl_pct=0.05,
+        distance_to_stop_pct=0.095,
+        regime_passed=True,
+        above_entry=True,
+        suggested_action="HOLD",
+        preset_name="standard_breakout",
+        rationale="Still constructive.",
+        metadata={
+            "position_metadata": {"linked_decision_id": "decision_aapl"},
+            main_module._TRADE_OUTCOME_SNAPSHOT_METADATA_KEY: TradeOutcomeSnapshot(
+                as_of_date=date(2024, 1, 5),
+                entry_date=date(2024, 1, 2),
+                sessions_since_entry=3,
+                current_return_pct=0.05,
+                max_favorable_excursion_pct=0.08,
+                max_adverse_excursion_pct=-0.02,
+                stop_hit=False,
+                forward_return_1d=0.01,
+                forward_return_5d=None,
+                forward_return_10d=None,
+                above_entry_after_1d=True,
+                above_entry_after_5d=None,
+                above_entry_after_10d=None,
+            ).to_dict(),
+        },
+    )
+
+    with caplog.at_level("DEBUG"):
+        event = main_module._portfolio_review_outcome_event(
+            row,
+            workflow="review-portfolio",
+            timestamp_utc="2024-01-05T21:00:00Z",
+        )
+
+    assert event is None
+    assert "Skipping portfolio review outcome event for AAPL on 2024-01-05 because trade_id is absent." in caplog.text
+
+
 def test_handle_review_portfolio_intraday_writes_trade_decision_log(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

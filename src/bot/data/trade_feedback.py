@@ -291,19 +291,19 @@ def build_trade_id(
 def build_trade_feedback_event_id(event: TradeFeedbackEvent) -> str:
     """Return the stable append/dedup identifier for one event."""
 
-    return _stable_id(
-        "event",
-        {
-            "event_type": event.event_type,
-            "workflow": event.workflow,
-            "symbol": event.symbol,
-            "as_of_date": event.as_of_date.isoformat() if event.as_of_date is not None else None,
-            "decision_id": event.decision_id,
-            "trade_id": event.trade_id,
-            "linked_decision_id": event.linked_decision_id,
-            "approved": event.approved,
-        },
-    )
+    identity_payload = {
+        "event_type": event.event_type,
+        "workflow": event.workflow,
+        "symbol": event.symbol,
+        "as_of_date": event.as_of_date.isoformat() if event.as_of_date is not None else None,
+        "decision_id": event.decision_id,
+        "trade_id": event.trade_id,
+        "linked_decision_id": event.linked_decision_id,
+        "approved": event.approved,
+    }
+    if event.event_type in {"stop_updated", "stop_raised"}:
+        identity_payload["stop_price"] = event.stop_price
+    return _stable_id("event", identity_payload)
 
 
 def load_trade_feedback_events(log_path: Path) -> tuple[TradeFeedbackEvent, ...]:

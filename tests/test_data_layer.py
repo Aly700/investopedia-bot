@@ -1600,6 +1600,43 @@ def test_trade_feedback_event_deserialization_round_trips_zero_sessions_since_en
     assert reloaded_event.outcome_snapshot.entry_date == date(2024, 1, 5)
 
 
+def test_trade_feedback_log_round_trips_zero_sessions_since_entry(
+    tmp_path: Path,
+) -> None:
+    log_path = default_trade_feedback_log_path(tmp_path)
+    event = TradeFeedbackEvent(
+        event_type="outcome",
+        workflow="review-portfolio",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_aapl",
+        trade_id="trade_aapl",
+        linked_decision_id="decision_aapl",
+        outcome_snapshot=TradeOutcomeSnapshot(
+            as_of_date=date(2024, 1, 5),
+            entry_date=date(2024, 1, 5),
+            sessions_since_entry=0,
+            current_return_pct=0.0,
+            max_favorable_excursion_pct=0.01,
+            max_adverse_excursion_pct=-0.01,
+            stop_hit=False,
+            forward_return_1d=None,
+            forward_return_5d=None,
+            forward_return_10d=None,
+            above_entry_after_1d=None,
+            above_entry_after_5d=None,
+            above_entry_after_10d=None,
+        ),
+    )
+
+    append_trade_feedback_events([event], log_path)
+    loaded = load_trade_feedback_events(log_path)
+
+    assert len(loaded) == 1
+    assert loaded[0].outcome_snapshot is not None
+    assert loaded[0].outcome_snapshot.sessions_since_entry == 0
+
+
 def test_trade_feedback_log_deduplicates_logically_identical_events_with_different_feature_snapshots(
     tmp_path: Path,
 ) -> None:
@@ -1631,6 +1668,41 @@ def test_trade_feedback_log_deduplicates_logically_identical_events_with_differe
 
     assert len(loaded) == 1
     assert loaded[0].decision_id == "decision_abc123"
+
+
+def test_trade_feedback_log_persists_distinct_same_day_stop_events(
+    tmp_path: Path,
+) -> None:
+    log_path = default_trade_feedback_log_path(tmp_path)
+    first_stop = TradeFeedbackEvent(
+        event_type="stop_raised",
+        workflow="update-stop",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_aapl",
+        trade_id="trade_aapl",
+        linked_decision_id="decision_aapl",
+        suggested_action="RAISE STOP",
+        stop_price=97.0,
+    )
+    second_stop = TradeFeedbackEvent(
+        event_type="stop_raised",
+        workflow="update-stop",
+        symbol="AAPL",
+        as_of_date=date(2024, 1, 5),
+        decision_id="decision_aapl",
+        trade_id="trade_aapl",
+        linked_decision_id="decision_aapl",
+        suggested_action="RAISE STOP",
+        stop_price=98.5,
+    )
+
+    append_trade_feedback_events([first_stop, second_stop], log_path)
+    loaded = load_trade_feedback_events(log_path)
+
+    assert len(loaded) == 2
+    assert [event.event_type for event in loaded] == ["stop_raised", "stop_raised"]
+    assert {event.stop_price for event in loaded} == {97.0, 98.5}
 
 
 def test_compute_trade_outcome_snapshot_returns_expected_forward_metrics() -> None:

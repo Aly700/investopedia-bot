@@ -3174,6 +3174,11 @@ def _portfolio_review_outcome_event(
         position_metadata = {}
     trade_id = _clean_optional_text(position_metadata.get("trade_id"))
     if trade_id is None:
+        LOGGER.debug(
+            "Skipping portfolio review outcome event for %s on %s because trade_id is absent.",
+            row.symbol,
+            row.date.isoformat(),
+        )
         return None
     linked_decision_id = (
         _clean_optional_text(position_metadata.get("linked_decision_id"))
