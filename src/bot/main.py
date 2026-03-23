@@ -11,7 +11,7 @@ from datetime import timedelta
 import json
 from pathlib import Path
 import sys
-from typing import Any, Mapping, Sequence, cast
+from typing import Any, Mapping, Optional, Sequence, cast
 
 import pandas as pd
 import yaml
@@ -131,6 +131,7 @@ from bot.features import (
     compute_market_breadth_from_frames,
     market_context_metadata,
 )
+from bot.ingestion.market_data import PollingIngestionAdapter
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
 from bot.orchestration.live_runner import (
@@ -205,6 +206,12 @@ LOGGER = get_logger(__name__)
 
 _POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY = "_position_trajectory_observation"
 _TRADE_OUTCOME_SNAPSHOT_METADATA_KEY = "_trade_outcome_snapshot"
+
+
+def _configured_provider_name(config: object) -> str | None:
+    data_sources = getattr(config, "data_sources", None)
+    provider_name = getattr(data_sources, "provider", None)
+    return provider_name if isinstance(provider_name, str) and provider_name else None
 
 
 class NoIntradayDataError(ValueError):
@@ -1782,23 +1789,33 @@ def _handle_remove_position(args: argparse.Namespace) -> int:
 
 def _handle_review_portfolio(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
-    current_positions = _load_current_positions(args.portfolio_file)
-    provider = (
-        create_daily_bar_provider(config, env_file=args.env_file)
-        if current_positions
-        else None
+    request = LiveMarketCycleRequest(
+        workflow="review-portfolio",
+        as_of_date=args.as_of,
+        portfolio_path=str(args.portfolio_file.resolve()),
+        include_portfolio_review=True,
+        portfolio_review_required=True,
     )
+    ingestion = PollingIngestionAdapter(
+        provider_name=_configured_provider_name(config),
+        portfolio_path=str(args.portfolio_file.resolve()),
+        load_current_positions=lambda: _load_current_positions(args.portfolio_file),
+        create_provider=lambda: create_daily_bar_provider(config, env_file=args.env_file),
+        run_portfolio_review=lambda provider, current_positions: _run_portfolio_review_workflow(
+            args,
+            config=config,
+            provider=cast(Optional[DailyBarProvider], provider),
+            current_positions=current_positions,
+        ),
+        benchmark_symbol=args.benchmark_symbol,
+        refresh_cache=getattr(args, "refresh_cache", False),
+    ).build_cycle_ingestion(request)
+    current_positions = list(ingestion.current_positions)
     output_dir = (
         args.output_dir or _default_daily_output_dir(config.project_root, args.as_of)
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     cycle = LiveMarketRunner(
-        run_portfolio_review=lambda: _run_portfolio_review_workflow(
-            args,
-            config=config,
-            provider=provider,
-            current_positions=current_positions,
-        ),
         persist_market_state=lambda as_of_date, workflow, daily_summary, portfolio_review, intraday_review, portfolio_path: _persist_market_state(
             project_root=config.project_root,
             output_dir=output_dir,
@@ -1811,15 +1828,7 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
                 else None
             ),
         ),
-    ).run_cycle(
-        LiveMarketCycleRequest(
-            workflow="review-portfolio",
-            as_of_date=args.as_of,
-            portfolio_path=str(args.portfolio_file.resolve()),
-            include_portfolio_review=True,
-            portfolio_review_required=True,
-        )
-    )
+    ).run_cycle(request, ingestion=ingestion)
     report = cast(PortfolioReviewReport, cycle.portfolio_review)
     report = replace(
         report,
@@ -1907,12 +1916,29 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
 
 def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
-    current_positions = _load_current_positions(args.portfolio_file)
-    provider = (
-        create_daily_bar_provider(config, env_file=args.env_file)
-        if current_positions
-        else None
+    request = LiveMarketCycleRequest(
+        workflow="review-portfolio-intraday",
+        as_of_date=args.as_of,
+        portfolio_path=str(args.portfolio_file.resolve()),
+        include_intraday_review=True,
+        intraday_review_required=True,
     )
+    ingestion = PollingIngestionAdapter(
+        provider_name=_configured_provider_name(config),
+        portfolio_path=str(args.portfolio_file.resolve()),
+        load_current_positions=lambda: _load_current_positions(args.portfolio_file),
+        create_provider=lambda: create_daily_bar_provider(config, env_file=args.env_file),
+        run_intraday_review=lambda provider, current_positions: _run_portfolio_review_intraday_workflow(
+            args,
+            config=config,
+            provider=cast(Optional[DailyBarProvider], provider),
+            current_positions=current_positions,
+        ),
+        benchmark_symbol=args.benchmark_symbol,
+        refresh_cache=getattr(args, "refresh_cache", False),
+        interval_minutes=args.interval_minutes,
+    ).build_cycle_ingestion(request)
+    current_positions = list(ingestion.current_positions)
     output_dir = (
         args.output_dir
         or _default_intraday_portfolio_output_dir(config.project_root, args.as_of)
@@ -1920,12 +1946,6 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
         cycle = LiveMarketRunner(
-            run_intraday_review=lambda: _run_portfolio_review_intraday_workflow(
-                args,
-                config=config,
-                provider=provider,
-                current_positions=current_positions,
-            ),
             persist_market_state=lambda as_of_date, workflow, daily_summary, portfolio_review, intraday_review, portfolio_path: _persist_market_state(
                 project_root=config.project_root,
                 output_dir=output_dir,
@@ -1934,15 +1954,7 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
                 portfolio_path=portfolio_path,
                 intraday_review=intraday_review,
             ),
-        ).run_cycle(
-            LiveMarketCycleRequest(
-                workflow="review-portfolio-intraday",
-                as_of_date=args.as_of,
-                portfolio_path=str(args.portfolio_file.resolve()),
-                include_intraday_review=True,
-                intraday_review_required=True,
-            )
-        )
+        ).run_cycle(request, ingestion=ingestion)
     except NoIntradayDataError as exc:
         payload = {
             "status": "skipped",
@@ -2034,30 +2046,51 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
 
 def _handle_monitor_market(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
-    provider = create_daily_bar_provider(config, env_file=args.env_file)
-    current_positions = _load_current_positions(args.portfolio_file)
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=args.as_of,
+        portfolio_path=(
+            str(args.portfolio_file.resolve()) if args.portfolio_file else None
+        ),
+        include_daily_summary=True,
+        include_portfolio_review=args.portfolio_file is not None,
+        daily_summary_required=True,
+        portfolio_review_required=False,
+    )
+    ingestion = PollingIngestionAdapter(
+        provider_name=_configured_provider_name(config),
+        portfolio_path=(
+            str(args.portfolio_file.resolve()) if args.portfolio_file else None
+        ),
+        load_current_positions=lambda: _load_current_positions(args.portfolio_file),
+        create_provider=lambda: create_daily_bar_provider(config, env_file=args.env_file),
+        run_daily_summary=lambda provider, current_positions: _run_daily_summary_workflow(
+            args,
+            config=config,
+            provider=cast(DailyBarProvider, provider),
+            current_positions=current_positions,
+        ),
+        run_portfolio_review=(
+            lambda provider, current_positions: _run_portfolio_review_workflow(
+                args,
+                config=config,
+                provider=cast(Optional[DailyBarProvider], provider),
+                current_positions=current_positions,
+            )
+            if args.portfolio_file is not None
+            else None
+        ),
+        candidate_path=str(args.candidate_path),
+        benchmark_symbol=args.benchmark_symbol,
+        refresh_cache=args.refresh_cache,
+    ).build_cycle_ingestion(request)
+    current_positions = list(ingestion.current_positions)
     output_dir = (
         args.output_dir
         or (config.project_root / "data" / "processed" / "monitor_market" / args.as_of.isoformat())
     ).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     cycle = LiveMarketRunner(
-        run_daily_summary=lambda: _run_daily_summary_workflow(
-            args,
-            config=config,
-            provider=provider,
-            current_positions=current_positions,
-        ),
-        run_portfolio_review=(
-            lambda: _run_portfolio_review_workflow(
-                args,
-                config=config,
-                provider=provider,
-                current_positions=current_positions,
-            )
-            if args.portfolio_file is not None
-            else None
-        ),
         build_monitor_report=lambda as_of_date, daily_summary, portfolio_review, intraday_review, portfolio_path: build_market_monitor_report(
             as_of_date=as_of_date,
             daily_summary=daily_summary,
@@ -2081,19 +2114,7 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
                 else None
             ),
         ),
-    ).run_cycle(
-        LiveMarketCycleRequest(
-            workflow="monitor-market",
-            as_of_date=args.as_of,
-            portfolio_path=(
-                str(args.portfolio_file.resolve()) if args.portfolio_file else None
-            ),
-            include_daily_summary=True,
-            include_portfolio_review=args.portfolio_file is not None,
-            daily_summary_required=True,
-            portfolio_review_required=False,
-        )
-    )
+    ).run_cycle(request, ingestion=ingestion)
     summary_result = cast(Mapping[str, object], cycle.daily_summary_result)
     summary = cast(DailyResearchSummary, cycle.daily_summary)
     monitor_report = cast(MarketMonitorReport, cycle.monitor_report)

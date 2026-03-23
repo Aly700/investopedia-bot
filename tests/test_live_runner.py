@@ -10,6 +10,7 @@ from bot.orchestration.live_runner import (
     LiveMarketCycleRequest,
     LiveMarketRunner,
     PersistedMarketStateArtifacts,
+    run_market_cycle,
 )
 from bot.reporting.daily_report import (
     PortfolioReviewRow,
@@ -253,6 +254,9 @@ def test_live_market_cycle_result_shape_is_stable(tmp_path: Path) -> None:
         "intraday_review_summary": None,
         "has_monitor_report": False,
         "has_market_state_snapshot": True,
+        "ingestion_adapter_name": None,
+        "ingestion_mode": None,
+        "ingestion_update_count": 0,
         "state_change_count": 0,
         "alertable_state_count": 0,
         "warning_count": 0,
@@ -263,6 +267,27 @@ def test_live_market_cycle_result_shape_is_stable(tmp_path: Path) -> None:
             "market_state_changes_text": str(tmp_path / "market_state_changes.txt"),
         },
     }
+
+
+def test_run_market_cycle_wrapper_preserves_runner_behavior(tmp_path: Path) -> None:
+    state_artifacts = _state_artifacts(tmp_path)
+    runner = LiveMarketRunner(
+        run_daily_summary=lambda: {"summary": _daily_summary()},
+        persist_market_state=lambda as_of_date, workflow, summary, review, intraday, portfolio_path: state_artifacts,
+    )
+
+    result = run_market_cycle(
+        runner,
+        LiveMarketCycleRequest(
+            workflow="monitor-market",
+            as_of_date=date(2024, 1, 5),
+            include_daily_summary=True,
+            daily_summary_required=True,
+        ),
+    )
+
+    assert result.status == "ok"
+    assert result.market_state_snapshot == state_artifacts.update_result.current_snapshot
 
 
 def test_live_market_runner_rejects_required_daily_summary_when_not_included() -> None:

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Mapping
 
+from bot.ingestion.market_data import MarketCycleIngestionEnvelope, MarketDataIngestionUpdate
 from bot.reporting.daily_report import (
     DailyResearchSummary,
     IntradayPortfolioReviewReport,
@@ -80,6 +81,9 @@ class LiveMarketCycleResult:
     market_state_snapshot: MarketStateSnapshot | None = None
     state_transitions: tuple[MarketStateTransition, ...] = ()
     alertable_states: tuple[MarketStateAlertableState, ...] = ()
+    ingestion_adapter_name: str | None = None
+    ingestion_mode: str | None = None
+    ingestion_updates: tuple[MarketDataIngestionUpdate, ...] = ()
     warnings: tuple[LiveMarketCycleWarning, ...] = ()
     paths_written: dict[str, str] = field(default_factory=dict)
     state_artifacts: PersistedMarketStateArtifacts | None = None
@@ -102,6 +106,9 @@ class LiveMarketCycleResult:
             "intraday_review_summary": _intraday_review_summary(self.intraday_review),
             "has_monitor_report": self.monitor_report is not None,
             "has_market_state_snapshot": self.market_state_snapshot is not None,
+            "ingestion_adapter_name": self.ingestion_adapter_name,
+            "ingestion_mode": self.ingestion_mode,
+            "ingestion_update_count": len(self.ingestion_updates),
             "state_change_count": self.state_change_count,
             "alertable_state_count": len(self.alertable_states),
             "warning_count": self.warning_count,
@@ -142,10 +149,16 @@ class LiveMarketRunner:
         self._build_monitor_report = build_monitor_report
         self._persist_market_state = persist_market_state
 
-    def run_cycle(self, request: LiveMarketCycleRequest) -> LiveMarketCycleResult:
+    def run_cycle(
+        self,
+        request: LiveMarketCycleRequest,
+        *,
+        ingestion: MarketCycleIngestionEnvelope | None = None,
+    ) -> LiveMarketCycleResult:
         """Run the requested market-cycle stages in orchestration order."""
 
         _validate_request(request)
+        _validate_ingestion(request, ingestion)
         warnings: list[LiveMarketCycleWarning] = []
         daily_summary_result: Mapping[str, object] | None = None
         daily_summary: DailyResearchSummary | None = None
@@ -153,12 +166,32 @@ class LiveMarketRunner:
         intraday_review: IntradayPortfolioReviewReport | None = None
         monitor_report: MarketMonitorReport | None = None
         state_artifacts: PersistedMarketStateArtifacts | None = None
+        resolved_portfolio_path = (
+            request.portfolio_path
+            if request.portfolio_path is not None
+            else (ingestion.portfolio_path if ingestion is not None else None)
+        )
+        run_daily_summary = (
+            ingestion.run_daily_summary
+            if ingestion is not None and ingestion.run_daily_summary is not None
+            else self._run_daily_summary
+        )
+        run_portfolio_review = (
+            ingestion.run_portfolio_review
+            if ingestion is not None and ingestion.run_portfolio_review is not None
+            else self._run_portfolio_review
+        )
+        run_intraday_review = (
+            ingestion.run_intraday_review
+            if ingestion is not None and ingestion.run_intraday_review is not None
+            else self._run_intraday_review
+        )
 
         if request.include_daily_summary:
             daily_summary_result = self._run_stage(
                 stage_name="daily_summary",
                 required=request.daily_summary_required,
-                callback=self._run_daily_summary,
+                callback=run_daily_summary,
                 warnings=warnings,
             )
             if daily_summary_result is not None:
@@ -171,7 +204,7 @@ class LiveMarketRunner:
             portfolio_review = self._run_stage(
                 stage_name="portfolio_review",
                 required=request.portfolio_review_required,
-                callback=self._run_portfolio_review,
+                callback=run_portfolio_review,
                 warnings=warnings,
             )
             if portfolio_review is not None and not isinstance(
@@ -186,7 +219,7 @@ class LiveMarketRunner:
             intraday_review = self._run_stage(
                 stage_name="intraday_review",
                 required=request.intraday_review_required,
-                callback=self._run_intraday_review,
+                callback=run_intraday_review,
                 warnings=warnings,
             )
             if intraday_review is not None and not isinstance(
@@ -210,7 +243,7 @@ class LiveMarketRunner:
                 daily_summary,
                 portfolio_review,
                 intraday_review,
-                request.portfolio_path,
+                resolved_portfolio_path,
             )
 
         if (
@@ -227,7 +260,7 @@ class LiveMarketRunner:
                 daily_summary,
                 portfolio_review,
                 intraday_review,
-                request.portfolio_path,
+                resolved_portfolio_path,
             )
 
         state_transitions = (
@@ -254,6 +287,15 @@ class LiveMarketRunner:
                 tuple(state_artifacts.update_result.current_snapshot.current_alertable_states)
                 if state_artifacts is not None
                 else ()
+            ),
+            ingestion_adapter_name=(
+                ingestion.adapter_name if ingestion is not None else None
+            ),
+            ingestion_mode=(
+                ingestion.ingestion_mode if ingestion is not None else None
+            ),
+            ingestion_updates=(
+                tuple(ingestion.updates) if ingestion is not None else ()
             ),
             warnings=tuple(warnings),
             paths_written=(
@@ -288,10 +330,12 @@ class LiveMarketRunner:
 def run_market_cycle(
     runner: LiveMarketRunner,
     request: LiveMarketCycleRequest,
+    *,
+    ingestion: MarketCycleIngestionEnvelope | None = None,
 ) -> LiveMarketCycleResult:
     """Convenience wrapper around ``LiveMarketRunner.run_cycle``."""
 
-    return runner.run_cycle(request)
+    return runner.run_cycle(request, ingestion=ingestion)
 
 
 def _validate_request(request: LiveMarketCycleRequest) -> None:
@@ -306,6 +350,46 @@ def _validate_request(request: LiveMarketCycleRequest) -> None:
     if request.intraday_review_required and not request.include_intraday_review:
         raise ValueError(
             "intraday_review_required=True requires include_intraday_review=True."
+        )
+
+
+def _validate_ingestion(
+    request: LiveMarketCycleRequest,
+    ingestion: MarketCycleIngestionEnvelope | None,
+) -> None:
+    if ingestion is None:
+        return
+    if not isinstance(ingestion, MarketCycleIngestionEnvelope):
+        raise TypeError("ingestion must be a MarketCycleIngestionEnvelope.")
+    if ingestion.as_of_date != request.as_of_date:
+        raise ValueError("ingestion.as_of_date must match request.as_of_date.")
+    if (
+        request.portfolio_path is not None
+        and ingestion.portfolio_path is not None
+        and request.portfolio_path != ingestion.portfolio_path
+    ):
+        raise ValueError("ingestion.portfolio_path must match request.portfolio_path.")
+    update_types = {update.update_type for update in ingestion.updates}
+    if (
+        request.include_daily_summary
+        and "candidate_universe_refresh_batch" not in update_types
+    ):
+        raise ValueError(
+            "ingestion.updates must include 'candidate_universe_refresh_batch' when include_daily_summary=True."
+        )
+    if (
+        request.include_portfolio_review
+        and "portfolio_symbol_refresh_batch" not in update_types
+    ):
+        raise ValueError(
+            "ingestion.updates must include 'portfolio_symbol_refresh_batch' when include_portfolio_review=True."
+        )
+    if (
+        request.include_intraday_review
+        and "portfolio_symbol_refresh_batch" not in update_types
+    ):
+        raise ValueError(
+            "ingestion.updates must include 'portfolio_symbol_refresh_batch' when include_intraday_review=True."
         )
 
 
