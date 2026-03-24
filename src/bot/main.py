@@ -18,6 +18,7 @@ import pandas as pd
 import yaml
 
 from bot.api.internal_api import InternalApiQueryService, serve_internal_api
+from bot.dashboard.operator_dashboard import serve_operator_dashboard
 from bot.backtest.engine import DailyBarBacktestEngine
 from bot.backtest.metrics import (
     OBJECTIVE_CHOICES,
@@ -987,6 +988,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bind port for the local internal API server.",
     )
     serve_internal_api_parser.set_defaults(handler=_handle_serve_internal_api)
+
+    serve_operator_dashboard_parser = subparsers.add_parser(
+        "serve-operator-dashboard",
+        help="Serve the local read-only operator dashboard and internal API.",
+    )
+    serve_operator_dashboard_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host for the local operator dashboard server.",
+    )
+    serve_operator_dashboard_parser.add_argument(
+        "--port",
+        type=int,
+        default=8780,
+        help="Bind port for the local operator dashboard server.",
+    )
+    serve_operator_dashboard_parser.add_argument(
+        "--refresh-seconds",
+        type=int,
+        default=5,
+        help="Polling cadence for the dashboard client.",
+    )
+    serve_operator_dashboard_parser.set_defaults(handler=_handle_serve_operator_dashboard)
 
     generate_orders_parser = subparsers.add_parser(
         "generate-orders",
@@ -2566,6 +2590,35 @@ def _handle_serve_internal_api(args: argparse.Namespace) -> int:
             raise ValueError(f"Failed to start internal API server: {exc}") from exc
     except KeyboardInterrupt:
         LOGGER.info("Stopping internal API server.")
+    return 0
+
+
+def _handle_serve_operator_dashboard(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    if args.port <= 0:
+        raise ValueError("port must be greater than zero.")
+    if args.refresh_seconds <= 0:
+        raise ValueError("refresh_seconds must be greater than zero.")
+    LOGGER.info(
+        "Starting operator dashboard on http://%s:%s/dashboard",
+        args.host,
+        args.port,
+    )
+    try:
+        try:
+            serve_operator_dashboard(
+                query_service=InternalApiQueryService(
+                    project_root=config.project_root,
+                    config=config,
+                ),
+                host=args.host,
+                port=args.port,
+                refresh_interval_seconds=args.refresh_seconds,
+            )
+        except OSError as exc:
+            raise ValueError(f"Failed to start operator dashboard server: {exc}") from exc
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping operator dashboard server.")
     return 0
 
 

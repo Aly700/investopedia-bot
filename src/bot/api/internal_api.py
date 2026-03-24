@@ -187,14 +187,16 @@ class InternalApiQueryService:
                 sum(exposure.approximate_notional for exposure in exposures) - reserved_notional,
                 0.0,
             )
-        reserved_slot_count = sum(
-            1
-            for record in capacity_reserving_orders
-            if pending_order_reserves_unmatched_slot(
-                record,
-                current_positions=current_positions,
+        reserved_slot_count: int | None = None
+        if position_context_available:
+            reserved_slot_count = sum(
+                1
+                for record in capacity_reserving_orders
+                if pending_order_reserves_unmatched_slot(
+                    record,
+                    current_positions=current_positions,
+                )
             )
-        )
         pending_order_count_by_sector: dict[str, int] = {}
         reserved_notional_by_sector: dict[str, float] = {}
         for record in capacity_reserving_orders:

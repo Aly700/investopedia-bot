@@ -168,6 +168,7 @@ def test_internal_api_pending_orders_marks_position_context_unknown_without_mark
     assert payload["data"]["summary"]["available_slots"] is None
     assert payload["data"]["summary"]["current_position_notional"] is None
     assert payload["data"]["summary"]["pending_fill_notional"] is None
+    assert payload["data"]["summary"]["reserved_slot_count"] is None
     assert payload["warnings"]
 
 
