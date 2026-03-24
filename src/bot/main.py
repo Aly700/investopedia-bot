@@ -18,6 +18,7 @@ from typing import Any, Mapping, Optional, Sequence, cast
 import pandas as pd
 import yaml
 
+from bot.api.control_api import OperatorControlService, serve_operator_control_api
 from bot.api.internal_api import InternalApiQueryService, serve_internal_api
 from bot.dashboard.operator_dashboard import serve_operator_dashboard
 from bot.backtest.engine import DailyBarBacktestEngine
@@ -1138,6 +1139,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bind port for the local internal API server.",
     )
     serve_internal_api_parser.set_defaults(handler=_handle_serve_internal_api)
+
+    serve_operator_control_api_parser = subparsers.add_parser(
+        "serve-operator-control-api",
+        help="Serve the local write-capable operator control API.",
+    )
+    serve_operator_control_api_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host for the local operator control API server.",
+    )
+    serve_operator_control_api_parser.add_argument(
+        "--port",
+        type=int,
+        default=8766,
+        help="Bind port for the local operator control API server.",
+    )
+    serve_operator_control_api_parser.set_defaults(handler=_handle_serve_operator_control_api)
 
     serve_operator_dashboard_parser = subparsers.add_parser(
         "serve-operator-dashboard",
@@ -2872,6 +2890,32 @@ def _handle_serve_internal_api(args: argparse.Namespace) -> int:
             raise ValueError(f"Failed to start internal API server: {exc}") from exc
     except KeyboardInterrupt:
         LOGGER.info("Stopping internal API server.")
+    return 0
+
+
+def _handle_serve_operator_control_api(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    if args.port <= 0:
+        raise ValueError("port must be greater than zero.")
+    LOGGER.info(
+        "Starting operator control API server on http://%s:%s/control",
+        args.host,
+        args.port,
+    )
+    try:
+        try:
+            serve_operator_control_api(
+                control_service=OperatorControlService(
+                    project_root=config.project_root,
+                    env_file=getattr(args, "env_file", None),
+                ),
+                host=args.host,
+                port=args.port,
+            )
+        except OSError as exc:
+            raise ValueError(f"Failed to start operator control API server: {exc}") from exc
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping operator control API server.")
     return 0
 
 

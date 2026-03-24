@@ -1,5 +1,26 @@
 """Internal backend API surface."""
 
+from .control_api import (
+    OPERATOR_CONTROL_API_VERSION,
+    OPERATOR_CONTROL_HTTP_ENDPOINTS,
+    CancelPendingOrderCommand,
+    ForceBrokerSyncCommand,
+    OperatorCommandResult,
+    OperatorControlHttpServer,
+    OperatorControlService,
+    OperatorControlState,
+    OperatorControlStateStore,
+    PauseExecutionCommand,
+    ReplacePendingOrderCommand,
+    ResumeExecutionCommand,
+    SubmitPendingOrderCommand,
+    create_operator_control_server,
+    default_operator_control_audit_log_path,
+    default_operator_control_state_path,
+    load_operator_control_audit_records,
+    operator_control_response_for_request,
+    serve_operator_control_api,
+)
 from .internal_api import (
     INTERNAL_API_ENDPOINTS,
     INTERNAL_API_VERSION,
@@ -10,10 +31,29 @@ from .internal_api import (
 )
 
 __all__ = [
+    "CancelPendingOrderCommand",
+    "ForceBrokerSyncCommand",
     "INTERNAL_API_ENDPOINTS",
     "INTERNAL_API_VERSION",
     "InternalApiHttpServer",
     "InternalApiQueryService",
+    "OPERATOR_CONTROL_API_VERSION",
+    "OPERATOR_CONTROL_HTTP_ENDPOINTS",
+    "OperatorCommandResult",
+    "OperatorControlHttpServer",
+    "OperatorControlService",
+    "OperatorControlState",
+    "OperatorControlStateStore",
+    "PauseExecutionCommand",
+    "ReplacePendingOrderCommand",
+    "ResumeExecutionCommand",
+    "SubmitPendingOrderCommand",
     "create_internal_api_server",
+    "create_operator_control_server",
+    "default_operator_control_audit_log_path",
+    "default_operator_control_state_path",
+    "load_operator_control_audit_records",
+    "operator_control_response_for_request",
+    "serve_operator_control_api",
     "serve_internal_api",
 ]
