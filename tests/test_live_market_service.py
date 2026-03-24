@@ -17,6 +17,7 @@ from bot.orchestration.live_runner import (
 )
 from bot.reporting.daily_report import build_daily_research_summary
 from bot.service.live_market_service import (
+    LiveMarketServiceStatusStore,
     LiveMarketSupervisor,
     ReconnectBackoffPolicy,
 )
@@ -418,6 +419,38 @@ def test_live_market_supervisor_gracefully_shutdowns_and_flushes_remaining_buffe
     assert status.cycle_count == 1
     assert status.service_state == "stopped"
     assert connection.closed is True
+
+
+def test_live_market_supervisor_persists_status_artifact_when_store_is_configured(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc))
+    connection = FakeWebsocketConnection(
+        [
+            json.dumps({"type": "candidate_universe_refresh_batch", "as_of_date": "2024-01-05"}),
+            json.dumps({"type": "market_context_refresh_batch", "as_of_date": "2024-01-05"}),
+        ]
+    )
+    status_store = LiveMarketServiceStatusStore(tmp_path)
+    supervisor = _build_supervisor(
+        tmp_path,
+        transport=JsonWebsocketTransport(
+            url="wss://example.test/live",
+            connection_factory=FakeConnectionFactory([connection]),
+        ),
+        clock=clock,
+        flush_interval_seconds=1,
+        poll_interval_seconds=1.0,
+    )
+    supervisor.status_store = status_store
+
+    status = supervisor.run(max_iterations=3)
+    persisted = status_store.load()
+
+    assert status.cycle_count == 1
+    assert persisted.updated_at_utc is not None
+    assert persisted.status.cycle_count == 1
+    assert persisted.status.service_state == "stopped"
 
 
 def test_live_market_supervisor_malformed_messages_do_not_crash_service(

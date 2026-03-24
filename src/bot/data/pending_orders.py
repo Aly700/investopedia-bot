@@ -644,7 +644,10 @@ def build_order_reservation_state(
     reserved_slot_count = sum(
         1
         for record in active_orders
-        if _reserves_unmatched_slot(record, current_positions=current_positions)
+        if pending_order_reserves_unmatched_slot(
+            record,
+            current_positions=current_positions,
+        )
     )
     pending_symbols = tuple(sorted({record.symbol for record in active_orders}))
     pending_order_count_by_sector: dict[str, int] = {}
@@ -709,6 +712,16 @@ def build_pending_order_holding_exposures(
         > 0
     ]
     return tuple(sorted(exposures, key=lambda exposure: exposure.symbol))
+
+
+def pending_order_reserves_unmatched_slot(
+    record: PendingOrderRecord,
+    *,
+    current_positions: Sequence[ExistingPosition],
+) -> bool:
+    """Return whether a pending buy still consumes a slot beyond live holdings."""
+
+    return _reserves_unmatched_slot(record, current_positions=current_positions)
 
 
 def _build_pending_order_state(payload: Mapping[str, Any]) -> PendingOrderState:

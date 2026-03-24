@@ -17,6 +17,7 @@ from typing import Any, Mapping, Optional, Sequence, cast
 import pandas as pd
 import yaml
 
+from bot.api.internal_api import InternalApiQueryService, serve_internal_api
 from bot.backtest.engine import DailyBarBacktestEngine
 from bot.backtest.metrics import (
     OBJECTIVE_CHOICES,
@@ -218,6 +219,7 @@ from bot.state.market_state import (
     write_market_state_change_summary,
 )
 from bot.service.live_market_service import (
+    LiveMarketServiceStatusStore,
     LiveMarketSupervisor,
     ReconnectBackoffPolicy,
 )
@@ -968,6 +970,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional maximum supervisor iterations before exiting.",
     )
     run_live_market_service_parser.set_defaults(handler=_handle_run_live_market_service)
+
+    serve_internal_api_parser = subparsers.add_parser(
+        "serve-internal-api",
+        help="Serve the local read-only internal backend API for operational state.",
+    )
+    serve_internal_api_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host for the local internal API server.",
+    )
+    serve_internal_api_parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Bind port for the local internal API server.",
+    )
+    serve_internal_api_parser.set_defaults(handler=_handle_serve_internal_api)
 
     generate_orders_parser = subparsers.add_parser(
         "generate-orders",
@@ -2505,6 +2524,7 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
             max_delay_seconds=args.max_reconnect_delay_seconds,
         ),
         handle_cycle_result=handle_cycle_result,
+        status_store=LiveMarketServiceStatusStore(config.project_root),
     )
     status = supervisor.run(max_iterations=args.max_iterations)
     payload = {
@@ -2520,6 +2540,32 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
         "outputs": dict(sorted(latest_outputs.items())),
     }
     _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_serve_internal_api(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    if args.port <= 0:
+        raise ValueError("port must be greater than zero.")
+    LOGGER.info(
+        "Starting internal API server on http://%s:%s",
+        args.host,
+        args.port,
+    )
+    try:
+        try:
+            serve_internal_api(
+                query_service=InternalApiQueryService(
+                    project_root=config.project_root,
+                    config=config,
+                ),
+                host=args.host,
+                port=args.port,
+            ),
+        except OSError as exc:
+            raise ValueError(f"Failed to start internal API server: {exc}") from exc
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping internal API server.")
     return 0
 
 

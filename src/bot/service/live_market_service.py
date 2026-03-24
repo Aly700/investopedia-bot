@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import time
 from typing import Any, Callable
 
+from bot.data.state_persistence import (
+    StateArtifactPath,
+    coerce_iso8601_datetime_text,
+    coerce_positive_int,
+    load_json_mapping_file,
+    write_json_file,
+)
 from bot.ingestion.streaming import WebsocketIngestionAdapter
 from bot.logging_utils import get_logger
 from bot.orchestration.live_runner import (
@@ -17,6 +25,20 @@ from bot.orchestration.live_runner import (
 
 
 LOGGER = get_logger(__name__)
+
+LIVE_MARKET_SERVICE_STATUS_SCHEMA_VERSION = 1
+_LIVE_MARKET_SERVICE_STATUS_PATH = StateArtifactPath(
+    preferred_relative_path=(
+        "data",
+        "processed",
+        "state",
+        "snapshots",
+        "live_market_service_status.json",
+    ),
+    legacy_relative_paths=(
+        ("data", "processed", "state", "live_market_service_status.json"),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -79,6 +101,122 @@ class LiveMarketServiceStatus:
             "last_cycle_warning_count": self.last_cycle_warning_count,
         }
 
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> "LiveMarketServiceStatus":
+        return cls(
+            service_state=_optional_text(payload.get("service_state")) or "starting",
+            connected=_optional_bool(payload.get("connected")) or False,
+            stale=_optional_bool(payload.get("stale")) or False,
+            reconnect_attempt_count=_non_negative_int(
+                payload.get("reconnect_attempt_count"),
+                "reconnect_attempt_count",
+            ),
+            cycle_count=_non_negative_int(payload.get("cycle_count"), "cycle_count"),
+            warning_count=_non_negative_int(payload.get("warning_count"), "warning_count"),
+            last_message_at_utc=_optional_iso8601_datetime(payload.get("last_message_at_utc")),
+            last_connected_at_utc=_optional_iso8601_datetime(
+                payload.get("last_connected_at_utc")
+            ),
+            last_successful_flush_at_utc=_optional_iso8601_datetime(
+                payload.get("last_successful_flush_at_utc")
+            ),
+            last_warning=_optional_text(payload.get("last_warning")),
+            last_error=_optional_text(payload.get("last_error")),
+            last_cycle_status=_optional_text(payload.get("last_cycle_status")),
+            last_cycle_warning_count=_non_negative_int(
+                payload.get("last_cycle_warning_count"),
+                "last_cycle_warning_count",
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class LiveMarketServiceStatusArtifact:
+    """Persisted live-service status wrapper for external readers."""
+
+    schema_version: int
+    updated_at_utc: str | None
+    status: LiveMarketServiceStatus
+
+    def __post_init__(self) -> None:
+        coerce_positive_int(self.schema_version, "schema_version")
+        if self.updated_at_utc is not None:
+            coerce_iso8601_datetime_text(self.updated_at_utc, "updated_at_utc")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "updated_at_utc": self.updated_at_utc,
+            "status": self.status.to_dict(),
+        }
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> "LiveMarketServiceStatusArtifact":
+        raw_status = payload.get("status", {})
+        if not isinstance(raw_status, dict):
+            raise ValueError("status must be a mapping.")
+        return cls(
+            schema_version=coerce_positive_int(
+                payload.get("schema_version"),
+                "schema_version",
+            ),
+            updated_at_utc=_optional_iso8601_datetime(payload.get("updated_at_utc")),
+            status=LiveMarketServiceStatus.from_mapping(raw_status),
+        )
+
+
+@dataclass(frozen=True)
+class LiveMarketServiceStatusStore:
+    """Project-scoped loader/saver for persisted live-service status."""
+
+    project_root: Path
+
+    @property
+    def path(self) -> Path:
+        return default_live_market_service_status_path(self.project_root)
+
+    def load(self) -> LiveMarketServiceStatusArtifact:
+        return load_live_market_service_status_artifact(self.path)
+
+    def save(
+        self,
+        status: LiveMarketServiceStatus,
+        *,
+        updated_at_utc: str,
+    ) -> Path:
+        artifact = LiveMarketServiceStatusArtifact(
+            schema_version=LIVE_MARKET_SERVICE_STATUS_SCHEMA_VERSION,
+            updated_at_utc=updated_at_utc,
+            status=status,
+        )
+        return write_json_file(self.path, artifact.to_dict())
+
+
+def default_live_market_service_status_path(project_root: Path) -> Path:
+    """Return the preferred repo-relative service-status artifact path."""
+
+    return _LIVE_MARKET_SERVICE_STATUS_PATH.resolve(project_root)
+
+
+def load_live_market_service_status_artifact(
+    path: Path,
+) -> LiveMarketServiceStatusArtifact:
+    """Load live-service status, degrading gracefully on missing/corrupt files."""
+
+    return load_json_mapping_file(
+        path,
+        artifact_label="live market service status",
+        logger=LOGGER,
+        empty_value=lambda: LiveMarketServiceStatusArtifact(
+            schema_version=LIVE_MARKET_SERVICE_STATUS_SCHEMA_VERSION,
+            updated_at_utc=None,
+            status=LiveMarketServiceStatus(),
+        ),
+        build=lambda payload, _source_path: LiveMarketServiceStatusArtifact.from_mapping(
+            dict(payload)
+        ),
+    )
+
 
 @dataclass
 class LiveMarketSupervisor:
@@ -95,6 +233,7 @@ class LiveMarketSupervisor:
     now_utc: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     flush_on_shutdown: bool = True
     handle_cycle_result: Callable[[LiveMarketCycleResult], None] | None = None
+    status_store: LiveMarketServiceStatusStore | None = None
     status: LiveMarketServiceStatus = field(default_factory=LiveMarketServiceStatus, init=False)
     _stop_requested: bool = field(default=False, init=False, repr=False)
 
@@ -115,6 +254,7 @@ class LiveMarketSupervisor:
             self._attempt_connect(now)
             if not self.adapter.connected:
                 self._refresh_liveness(now)
+                self._persist_status(now)
                 return self.status
 
         poll_result = self.adapter.poll_messages(
@@ -134,6 +274,7 @@ class LiveMarketSupervisor:
             if poll_result.warning_count:
                 self.status.last_error = poll_result.warnings[-1]
             self._refresh_liveness(now)
+            self._persist_status(now)
             return self.status
 
         envelope = self.adapter.flush_ready_cycle_ingestion(self.request, now_utc=now)
@@ -161,12 +302,14 @@ class LiveMarketSupervisor:
                         self._record_warning(f"cycle result handler failed: {exc}")
 
         self._refresh_liveness(now)
+        self._persist_status(now)
         return self.status
 
     def run(self, *, max_iterations: int | None = None) -> LiveMarketServiceStatus:
         """Run the long-lived service loop until stopped or interrupted."""
 
         iteration_count = 0
+        self._persist_status(self.now_utc())
         try:
             while not self._stop_requested:
                 self.run_once()
@@ -242,6 +385,7 @@ class LiveMarketSupervisor:
         self.status.connected = False
         self.status.stale = False
         self.status.service_state = "stopped"
+        self._persist_status(self.now_utc())
 
     def _flush_on_shutdown(self) -> None:
         if not self.adapter.has_pending_updates(as_of_date=self.request.as_of_date):
@@ -275,6 +419,49 @@ class LiveMarketSupervisor:
         LOGGER.warning("%s", message)
         self.status.warning_count += 1
         self.status.last_warning = message
+
+    def _persist_status(self, now: datetime) -> None:
+        if self.status_store is None:
+            return
+        try:
+            self.status_store.save(
+                self.status,
+                updated_at_utc=now.astimezone(timezone.utc).isoformat(),
+            )
+        except OSError as exc:
+            LOGGER.warning("Failed to persist live market service status: %s", exc)
+
+
+def _optional_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _optional_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _optional_iso8601_datetime(value: object) -> str | None:
+    cleaned = _optional_text(value)
+    if cleaned is None:
+        return None
+    return coerce_iso8601_datetime_text(cleaned, "datetime")
+
+
+def _non_negative_int(value: object, field_name: str) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer, not a boolean.")
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer.") from exc
+    if coerced < 0:
+        raise ValueError(f"{field_name} cannot be negative.")
+    return coerced
 
 
 def run_live_market_service(
