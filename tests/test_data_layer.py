@@ -33,6 +33,21 @@ from bot.data.intraday_state_journal import (
     update_intraday_state_journal,
     write_intraday_state_journal,
 )
+from bot.data.pending_orders import (
+    PendingOrderRecord,
+    build_pending_order_holding_exposures,
+    build_pending_order_record_from_execution_order,
+    build_order_reservation_state,
+    create_pending_order,
+    default_pending_order_state_path,
+    load_pending_order_state,
+    mark_pending_order_cancelled,
+    mark_pending_order_expired,
+    mark_pending_order_filled,
+    mark_pending_order_partially_filled,
+    replace_pending_order,
+    write_pending_order_state,
+)
 from bot.data.portfolio_heat import (
     PortfolioHoldingExposure,
     build_portfolio_heat_context,
@@ -59,6 +74,7 @@ from bot.data.trade_feedback import (
     load_trade_feedback_events,
     summarize_trade_feedback_events,
 )
+from bot.execution.interface import ExecutionOrder
 from bot.data.volatility_context import (
     MAX_VOLATILITY_CONTEXT_BAR_AGE_DAYS,
     build_volatility_regime_context,
@@ -80,6 +96,7 @@ from bot.data.providers import (
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
 from bot.reporting.daily_report import PortfolioReviewRow, build_portfolio_review_report
 from bot.reporting.trade_review import build_trade_review_analytics_summary
+from bot.risk.portfolio_rules import ExistingPosition
 from bot.state.market_state import (
     MarketStateActionState,
     MarketStateBreadthContext,
@@ -933,6 +950,9 @@ def test_state_paths_use_preferred_journal_and_log_layout_for_new_projects(
     assert default_position_trajectory_journal_path(tmp_path) == (
         tmp_path / "data" / "processed" / "state" / "journals" / "position_trajectory.json"
     )
+    assert default_pending_order_state_path(tmp_path) == (
+        tmp_path / "data" / "processed" / "state" / "snapshots" / "pending_orders.json"
+    )
     assert default_trade_feedback_log_path(tmp_path) == (
         tmp_path / "data" / "processed" / "state" / "logs" / "trade_feedback.jsonl"
     )
@@ -945,6 +965,7 @@ def test_state_paths_fall_back_to_legacy_layout_when_existing_artifacts_are_pres
     candidate_legacy = tmp_path / "data" / "processed" / "state" / "candidate_scores.json"
     intraday_legacy_dir = tmp_path / "data" / "processed" / "state" / "intraday_journal"
     position_legacy = tmp_path / "data" / "processed" / "state" / "position_trajectory.json"
+    pending_order_legacy = tmp_path / "data" / "processed" / "state" / "pending_orders.json"
     trade_feedback_legacy = (
         tmp_path / "data" / "processed" / "state" / "trade_decision_log.jsonl"
     )
@@ -954,6 +975,7 @@ def test_state_paths_fall_back_to_legacy_layout_when_existing_artifacts_are_pres
     intraday_legacy_dir.mkdir(parents=True, exist_ok=True)
     (intraday_legacy_dir / "2024-01-05.json").write_text("{}", encoding="utf-8")
     position_legacy.write_text("{}", encoding="utf-8")
+    pending_order_legacy.write_text("{}", encoding="utf-8")
     trade_feedback_legacy.write_text("", encoding="utf-8")
 
     assert default_candidate_score_journal_path(tmp_path) == candidate_legacy
@@ -961,7 +983,508 @@ def test_state_paths_fall_back_to_legacy_layout_when_existing_artifacts_are_pres
         intraday_legacy_dir / "2024-01-05.json"
     )
     assert default_position_trajectory_journal_path(tmp_path) == position_legacy
+    assert default_pending_order_state_path(tmp_path) == pending_order_legacy
     assert default_trade_feedback_log_path(tmp_path) == trade_feedback_legacy
+
+
+def test_pending_order_state_persists_and_reserves_capacity(tmp_path: Path) -> None:
+    state_path = default_pending_order_state_path(tmp_path)
+    initial_state = load_pending_order_state(state_path)
+
+    created = create_pending_order(
+        initial_state,
+        PendingOrderRecord(
+            order_id="ord_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=10,
+            requested_price=100.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+            preset_name="standard_breakout",
+            trade_id="trade_aapl",
+            linked_decision_id="decision_aapl",
+            sector_name="Technology",
+            industry_name="Software",
+        ),
+    )
+    written_path = write_pending_order_state(created.state, state_path)
+    reloaded = load_pending_order_state(written_path)
+    reservation_state = build_order_reservation_state(
+        reloaded,
+        current_equity=10_000.0,
+        current_positions=[],
+        max_concurrent_positions=4,
+    )
+
+    assert reloaded.orders["ord_aapl_1"].trade_id == "trade_aapl"
+    assert reservation_state.active_order_count == 1
+    assert reservation_state.reserved_notional == pytest.approx(1_000.0)
+    assert reservation_state.available_capital == pytest.approx(9_000.0)
+    assert reservation_state.available_slots == 3
+    assert reservation_state.pending_order_count_by_sector == {"Technology": 1}
+    assert reservation_state.reserved_notional_by_sector == {
+        "Technology": pytest.approx(1_000.0)
+    }
+
+
+def test_pending_order_cancellation_releases_reservations() -> None:
+    created = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_msft_1",
+            symbol="MSFT",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=5,
+            requested_price=200.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+        ),
+    )
+
+    cancelled = mark_pending_order_cancelled(
+        created.state,
+        "ord_msft_1",
+        occurred_at="2024-01-05T15:00:00+00:00",
+    )
+    reservation_state = build_order_reservation_state(
+        cancelled.state,
+        current_equity=10_000.0,
+        current_positions=[],
+        max_concurrent_positions=4,
+    )
+
+    assert cancelled.orders[0].status == "cancelled"
+    assert cancelled.orders[0].reserved_notional == 0.0
+    assert cancelled.orders[0].reserved_slot is False
+    assert reservation_state.active_order_count == 0
+    assert reservation_state.reserved_notional == 0.0
+    assert reservation_state.available_slots == 4
+
+
+def test_pending_order_fill_transitions_and_returns_position_link() -> None:
+    created = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_nvda_1",
+            symbol="NVDA",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=8,
+            requested_price=500.0,
+            filled_quantity=0,
+            reserved_notional=4_000.0,
+            reserved_slot=True,
+            preset_name="aggressive_breakout",
+            trade_id="trade_nvda",
+            stop_price=480.0,
+        ),
+    )
+
+    filled = mark_pending_order_filled(
+        created.state,
+        "ord_nvda_1",
+        occurred_at="2024-01-05T15:10:00+00:00",
+        fill_price=501.5,
+    )
+    reservation_state = build_order_reservation_state(
+        filled.state,
+        current_equity=25_000.0,
+        current_positions=[],
+        max_concurrent_positions=4,
+    )
+
+    assert filled.orders[0].status == "filled"
+    assert filled.orders[0].filled_quantity == 8
+    assert filled.orders[0].reserved_notional == 0.0
+    assert filled.position_update is not None
+    assert filled.position_update.symbol == "NVDA"
+    assert filled.position_update.shares == 8
+    assert filled.position_update.average_entry_price == pytest.approx(501.5)
+    assert filled.position_update.metadata["order_id"] == "ord_nvda_1"
+    assert filled.position_update.metadata["trade_id"] == "trade_nvda"
+    assert reservation_state.active_order_count == 0
+
+
+def test_pending_order_partial_fill_preserves_total_capacity_until_position_refresh(
+    tmp_path: Path,
+) -> None:
+    state_path = default_pending_order_state_path(tmp_path)
+    created = create_pending_order(
+        load_pending_order_state(state_path),
+        PendingOrderRecord(
+            order_id="ord_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=10,
+            requested_price=100.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+            trade_id="trade_aapl",
+            linked_decision_id="decision_aapl",
+        ),
+    )
+
+    partially_filled = mark_pending_order_partially_filled(
+        created.state,
+        "ord_aapl_1",
+        occurred_at="2024-01-05T14:45:00+00:00",
+        filled_quantity=5,
+    )
+    reservation_state = build_order_reservation_state(
+        partially_filled.state,
+        current_equity=10_000.0,
+        current_positions=[],
+        max_concurrent_positions=4,
+    )
+
+    assert partially_filled.orders[0].status == "partially_filled"
+    assert partially_filled.orders[0].reserved_notional == pytest.approx(500.0)
+    assert reservation_state.reserved_notional == pytest.approx(500.0)
+    assert reservation_state.pending_fill_notional == pytest.approx(500.0)
+    assert reservation_state.available_capital == pytest.approx(9_000.0)
+
+    persisted_path = write_pending_order_state(partially_filled.state, state_path)
+    reloaded = load_pending_order_state(persisted_path)
+    reloaded_reservation_state = build_order_reservation_state(
+        reloaded,
+        current_equity=10_000.0,
+        current_positions=[],
+        max_concurrent_positions=4,
+    )
+
+    assert reloaded_reservation_state.reserved_notional == pytest.approx(500.0)
+    assert reloaded_reservation_state.pending_fill_notional == pytest.approx(500.0)
+    assert reloaded_reservation_state.available_capital == pytest.approx(9_000.0)
+
+    absorbed_reservation_state = build_order_reservation_state(
+        reloaded,
+        current_equity=10_000.0,
+        current_positions=[
+            ExistingPosition(
+                symbol="AAPL",
+                shares=5,
+                average_entry_price=100.0,
+                source="pending_order_fill",
+                metadata={"order_id": "ord_aapl_1"},
+            )
+        ],
+        max_concurrent_positions=4,
+    )
+
+    assert absorbed_reservation_state.current_position_notional == pytest.approx(500.0)
+    assert absorbed_reservation_state.reserved_notional == pytest.approx(500.0)
+    assert absorbed_reservation_state.pending_fill_notional == pytest.approx(0.0)
+    assert absorbed_reservation_state.reserved_slot_count == 0
+    assert absorbed_reservation_state.available_slots == 3
+    assert absorbed_reservation_state.available_capital == pytest.approx(9_000.0)
+
+
+def test_pending_order_partial_fill_absorbed_position_does_not_double_count_slot_capacity() -> None:
+    partially_filled_state = mark_pending_order_partially_filled(
+        create_pending_order(
+            load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+            PendingOrderRecord(
+                order_id="ord_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T14:30:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                filled_quantity=0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+                linked_decision_id="decision_aapl",
+            ),
+        ).state,
+        "ord_aapl_1",
+        occurred_at="2024-01-05T14:45:00+00:00",
+        filled_quantity=5,
+    ).state
+
+    reservation_state = build_order_reservation_state(
+        partially_filled_state,
+        current_equity=10_000.0,
+        current_positions=[
+            ExistingPosition(
+                symbol="AAPL",
+                shares=5,
+                average_entry_price=100.0,
+                source="pending_order_fill",
+                metadata={"linked_decision_id": "decision_aapl"},
+            )
+        ],
+        max_concurrent_positions=4,
+    )
+
+    assert reservation_state.active_order_count == 1
+    assert reservation_state.reserved_slot_count == 0
+    assert reservation_state.available_slots == 3
+
+
+def test_pending_market_buy_uses_fallback_notional_for_heat_exposure() -> None:
+    record = build_pending_order_record_from_execution_order(
+        ExecutionOrder(
+            date=date(2024, 1, 5),
+            symbol="AAPL",
+            action="BUY",
+            quantity=10,
+            intended_order_type="MARKET",
+            entry_price_hint=None,
+            strategy_name="breakout_momentum",
+            metadata={
+                "notional_value": 1_000.0,
+                "signal_metadata": {
+                    "sector_name": "Technology",
+                    "industry_name": "Software",
+                },
+            },
+        ),
+        order_id="ord_market_aapl_1",
+        created_at="2024-01-05T14:30:00+00:00",
+    )
+    state = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        record,
+    ).state
+    exposures = build_pending_order_holding_exposures(state)
+    context = build_portfolio_heat_context(
+        exposures,
+        candidate_sector="Technology",
+        candidate_industry="Software",
+        max_positions_per_sector=2,
+        max_same_industry_positions=2,
+        max_sector_notional_pct=0.50,
+    )
+    projection = project_portfolio_heat_context(
+        context,
+        candidate_notional_value=1_000.0,
+    )
+
+    assert record.reserved_notional == pytest.approx(1_000.0)
+    assert record.entry_hint == pytest.approx(100.0)
+    assert exposures[0].approximate_notional == pytest.approx(1_000.0)
+    assert projection.sector_notional_concentration_risk is True
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected_decision_id"),
+    [
+        ({"decision_id": "decision_top_level"}, "decision_top_level"),
+        (
+            {"signal_metadata": {"decision_id": "decision_nested"}},
+            "decision_nested",
+        ),
+    ],
+)
+def test_build_pending_order_record_extracts_linked_decision_id_from_metadata_shapes(
+    metadata: dict[str, object],
+    expected_decision_id: str,
+) -> None:
+    record = build_pending_order_record_from_execution_order(
+        ExecutionOrder(
+            date=date(2024, 1, 5),
+            symbol="AAPL",
+            action="BUY",
+            quantity=10,
+            intended_order_type="LIMIT",
+            entry_price_hint=100.0,
+            metadata=metadata,
+        ),
+        order_id="ord_aapl_1",
+        created_at="2024-01-05T14:30:00+00:00",
+    )
+
+    assert record.linked_decision_id == expected_decision_id
+
+
+def test_pending_order_rejects_duplicate_active_buy_symbol() -> None:
+    created = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=10,
+            requested_price=100.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Only one active capacity-reserving buy order is allowed per symbol.",
+    ):
+        create_pending_order(
+            created.state,
+            PendingOrderRecord(
+                order_id="ord_aapl_2",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T14:31:00+00:00",
+                status="pending",
+                requested_quantity=8,
+                requested_price=101.0,
+                filled_quantity=0,
+                reserved_notional=808.0,
+                reserved_slot=True,
+            ),
+        )
+
+
+def test_replace_pending_order_transfers_active_reservation_cleanly() -> None:
+    created = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=10,
+            requested_price=100.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+        ),
+    )
+
+    replaced = replace_pending_order(
+        created.state,
+        "ord_aapl_1",
+        replacement=PendingOrderRecord(
+            order_id="ord_aapl_2",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:35:00+00:00",
+            status="pending",
+            requested_quantity=10,
+            requested_price=101.0,
+            filled_quantity=0,
+            reserved_notional=1_010.0,
+            reserved_slot=True,
+        ),
+        occurred_at="2024-01-05T14:35:00+00:00",
+    )
+    reservation_state = build_order_reservation_state(
+        replaced.state,
+        current_equity=10_000.0,
+        current_positions=[],
+        max_concurrent_positions=4,
+    )
+
+    assert replaced.state.orders["ord_aapl_1"].status == "replaced"
+    assert replaced.state.orders["ord_aapl_2"].status == "pending"
+    assert reservation_state.active_order_count == 1
+    assert reservation_state.reserved_notional == pytest.approx(1_010.0)
+    assert reservation_state.pending_symbols == ("AAPL",)
+
+
+def test_pending_order_expire_releases_reservations() -> None:
+    created = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_shop_1",
+            symbol="SHOP",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=5,
+            requested_price=200.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+        ),
+    )
+
+    expired = mark_pending_order_expired(
+        created.state,
+        "ord_shop_1",
+        occurred_at="2024-01-05T16:00:00+00:00",
+    )
+    reservation_state = build_order_reservation_state(
+        expired.state,
+        current_equity=10_000.0,
+        current_positions=[],
+        max_concurrent_positions=4,
+    )
+
+    assert expired.orders[0].status == "expired"
+    assert reservation_state.active_order_count == 0
+    assert reservation_state.reserved_notional == 0.0
+    assert reservation_state.pending_fill_notional == 0.0
+    assert reservation_state.available_capital == pytest.approx(10_000.0)
+
+
+def test_pending_order_terminal_updates_raise_on_cancel_then_expire_race() -> None:
+    created = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_amzn_1",
+            symbol="AMZN",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=5,
+            requested_price=200.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+        ),
+    )
+    cancelled = mark_pending_order_cancelled(
+        created.state,
+        "ord_amzn_1",
+        occurred_at="2024-01-05T15:00:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="Only active pending orders can be marked expired."):
+        mark_pending_order_expired(
+            cancelled.state,
+            "ord_amzn_1",
+            occurred_at="2024-01-05T16:00:00+00:00",
+        )
+
+
+def test_pending_order_state_ignores_corrupt_files(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    state_path = default_pending_order_state_path(tmp_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{bad-json", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        state = load_pending_order_state(state_path)
+
+    assert state.orders == {}
+    assert "Ignoring pending order state" in caplog.text
 
 
 def test_candidate_score_journal_normalizes_symbol_update_keys() -> None:

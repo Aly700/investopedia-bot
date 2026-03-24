@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from datetime import datetime, timezone
 from datetime import timedelta
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -60,6 +61,18 @@ from bot.data.intraday_state_journal import (
     default_intraday_state_journal_path,
     preview_intraday_trajectory_features,
     update_intraday_state_journal,
+)
+from bot.data.pending_orders import (
+    OrderReservationState,
+    PendingOrderRecord,
+    PendingOrderState,
+    PendingOrderStateStore,
+    build_pending_order_record_from_execution_order,
+    build_order_reservation_state,
+    build_pending_order_holding_exposures,
+    create_pending_order,
+    replace_pending_order,
+    upsert_pending_order_state,
 )
 from bot.data.portfolio_heat import (
     PortfolioHoldingExposure,
@@ -116,6 +129,7 @@ from bot.execution.manual_executor import (
     write_execution_batch,
     write_manual_order_sheet,
 )
+from bot.execution.interface import ExecutionBatch, ExecutionOrder
 from bot.execution.prioritization import (
     annotate_execution_priority,
     rank_risk_assessed_candidates,
@@ -1025,6 +1039,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--refresh-cache",
         action="store_true",
         help="Bypass local cache and force provider fetches.",
+    )
+    generate_orders_parser.add_argument(
+        "--stage-pending-orders",
+        action="store_true",
+        help="Persist generated buy orders into pending-order state for later capacity-aware runs.",
     )
     generate_orders_parser.set_defaults(handler=_handle_generate_orders)
 
@@ -2629,6 +2648,14 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         config.strategy.risk,
         config.game_rules.rules,
     )
+    pending_order_state, pending_order_reservation_state = (
+        _build_pending_order_reservation_state(
+            project_root=config.project_root,
+            current_equity=current_equity,
+            current_positions=current_positions,
+            constraints=constraints,
+        )
+    )
     assessed_candidates = []
     no_signal_symbols: list[str] = []
     symbol_frames: dict[str, pd.DataFrame] = {}
@@ -2723,6 +2750,12 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
     portfolio_holding_exposures = _build_portfolio_holding_exposures(
         current_positions,
         current_position_classifications,
+    )
+    portfolio_holding_exposures.extend(
+        build_pending_order_holding_exposures(
+            pending_order_state,
+            current_positions=current_positions,
+        )
     )
 
     for member in universe_members:
@@ -2858,6 +2891,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             current_equity=current_equity,
             current_positions=current_positions,
             constraints=constraints,
+            reservation_state=pending_order_reservation_state,
         ),
         current_equity=current_equity,
     )
@@ -2869,6 +2903,28 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
 
     executor = ManualExecutor()
     batch = executor.build_execution_batch(assessed_candidates, as_of_date=args.as_of)
+    staged_pending_order_count = 0
+    staged_pending_order_path: Path | None = None
+    post_stage_pending_order_summary: dict[str, Any] | None = None
+    if args.stage_pending_orders and batch.orders:
+        staged_pending_order_count, staged_pending_order_path, staged_state = (
+            _stage_execution_batch_pending_orders(
+                project_root=config.project_root,
+                batch=batch,
+            )
+        )
+        if staged_pending_order_path is not None:
+            post_stage_pending_order_summary = build_order_reservation_state(
+                staged_state,
+                current_equity=current_equity,
+                current_positions=current_positions,
+                max_concurrent_positions=constraints.max_concurrent_positions,
+            ).to_dict()
+    effective_pending_order_summary = (
+        post_stage_pending_order_summary
+        if post_stage_pending_order_summary is not None
+        else pending_order_reservation_state.to_dict()
+    )
     report = build_daily_signal_report(
         as_of_date=args.as_of,
         execution_batch=batch,
@@ -2877,6 +2933,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         current_positions=current_positions,
         no_signal_symbols=no_signal_symbols,
         benchmark_symbol=strategy_settings.benchmark_symbol if strategy_settings.enable_regime_filter else None,
+        pending_order_summary=effective_pending_order_summary,
     )
 
     output_dir = (args.output_dir or _default_daily_output_dir(config.project_root, args.as_of)).resolve()
@@ -2905,6 +2962,14 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         "portfolio_file": str(args.portfolio_file.resolve()) if args.portfolio_file else None,
         "current_position_count": len(current_positions),
         "current_position_symbols": [position.symbol for position in current_positions],
+        "pending_order_summary": effective_pending_order_summary,
+        "blocked_by_pending_reservations_count": sum(
+            candidate.approved
+            and candidate.execution_priority is not None
+            and candidate.execution_priority.capacity_blocked_by_pending
+            and not candidate.execution_priority.actionable_now
+            for candidate in assessed_candidates
+        ),
         "relative_volume_confirmation_required": (
             strategy_settings.require_relative_volume_confirmation
         ),
@@ -2937,10 +3002,15 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             "daily_signal_report_json": str(signal_report_json_path),
             "daily_signal_report_csv": str(signal_report_csv_path),
         },
+        "staged_pending_order_count": staged_pending_order_count,
     }
     if trade_feedback_log_path is not None:
         payload["outputs"]["trade_decision_log"] = str(trade_feedback_log_path)
         payload["outputs"]["trade_feedback_log"] = str(trade_feedback_log_path)
+    if staged_pending_order_path is not None:
+        payload["outputs"]["pending_order_state"] = str(staged_pending_order_path)
+    if post_stage_pending_order_summary is not None:
+        payload["post_stage_pending_order_summary"] = post_stage_pending_order_summary
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -3688,12 +3758,126 @@ def _order_decision_id(order: object | None) -> str | None:
     metadata = getattr(order, "metadata", None)
     if not isinstance(metadata, Mapping):
         return None
-    direct = _clean_optional_text(metadata.get("decision_id"))
-    if direct is not None:
-        return direct
-    signal_metadata = metadata.get("signal_metadata")
-    if isinstance(signal_metadata, Mapping):
-        return _clean_optional_text(signal_metadata.get("decision_id"))
+    return _extract_linked_decision_id(metadata)
+
+
+def _pending_order_trade_id(order: ExecutionOrder) -> str:
+    return build_trade_id(
+        symbol=order.symbol,
+        entry_date=order.date,
+        average_entry_price=order.entry_price_hint,
+        decision_id=_order_decision_id(order),
+    )
+
+
+def _pending_order_id(order: ExecutionOrder) -> str:
+    decision_id = _order_decision_id(order)
+    if decision_id is not None:
+        identity_payload = {
+            "symbol": order.symbol.strip().upper(),
+            "date": order.date.isoformat(),
+            "action": order.action,
+            "decision_id": decision_id,
+            "strategy_name": order.strategy_name,
+        }
+    else:
+        identity_payload = {
+            "symbol": order.symbol.strip().upper(),
+            "date": order.date.isoformat(),
+            "action": order.action,
+            "quantity": order.quantity,
+            "intended_order_type": order.intended_order_type,
+            "entry_price_hint": order.entry_price_hint,
+            "stop_level": order.stop_level,
+            "strategy_name": order.strategy_name,
+            "decision_id": None,
+        }
+    serialized = json.dumps(
+        identity_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = hashlib.sha1(serialized.encode("utf-8")).hexdigest()[:16]
+    return f"order_{digest}"
+
+
+def _stage_execution_batch_pending_orders(
+    *,
+    project_root: Path,
+    batch: ExecutionBatch,
+) -> tuple[int, Path | None, PendingOrderState]:
+    store = PendingOrderStateStore(project_root)
+    state = store.load()
+    staged_count = 0
+    changed = False
+    for order in batch.orders:
+        decision_id = _order_decision_id(order)
+        record = build_pending_order_record_from_execution_order(
+            order,
+            order_id=_pending_order_id(order),
+            created_at=batch.generated_at_utc,
+            trade_id=_pending_order_trade_id(order),
+            linked_decision_id=decision_id,
+        )
+        existing = state.orders.get(record.order_id)
+        if existing is not None:
+            updated_record = replace(
+                record,
+                created_at=existing.created_at,
+                trade_id=existing.trade_id or record.trade_id,
+            )
+            if updated_record == existing:
+                continue
+            state = upsert_pending_order_state(
+                state,
+                updated_record,
+                updated_at=batch.generated_at_utc,
+            )
+            staged_count += 1
+            changed = True
+            continue
+        existing_active_decision_order = _find_active_pending_order_for_decision(
+            state,
+            symbol=record.symbol,
+            decision_id=decision_id,
+        )
+        if existing_active_decision_order is not None:
+            replacement = replace(
+                record,
+                trade_id=existing_active_decision_order.trade_id or record.trade_id,
+            )
+            result = replace_pending_order(
+                state,
+                existing_active_decision_order.order_id,
+                replacement=replacement,
+                occurred_at=batch.generated_at_utc,
+            )
+        else:
+            result = create_pending_order(state, record)
+        if result.state != state:
+            staged_count += 1
+            changed = True
+        state = result.state
+    if not changed:
+        return staged_count, None, state
+    return staged_count, store.save(state), state
+
+
+def _find_active_pending_order_for_decision(
+    state: PendingOrderState,
+    *,
+    symbol: str,
+    decision_id: str | None,
+) -> PendingOrderRecord | None:
+    if decision_id is None:
+        return None
+    normalized_symbol = symbol.strip().upper()
+    for record in state.active_orders():
+        if record.symbol != normalized_symbol:
+            continue
+        if record.linked_decision_id == decision_id:
+            return record
     return None
 
 
@@ -4118,6 +4302,14 @@ def _run_daily_summary_workflow(
         config.strategy.risk,
         config.game_rules.rules,
     )
+    pending_order_state, pending_order_reservation_state = (
+        _build_pending_order_reservation_state(
+            project_root=config.project_root,
+            current_equity=current_equity,
+            current_positions=resolved_current_positions,
+            constraints=constraints,
+        )
+    )
     evaluations: list[PresetCandidateEvaluation] = []
     no_signal_symbols_by_preset: dict[str, list[str]] = {
         preset.name: []
@@ -4143,6 +4335,12 @@ def _run_daily_summary_workflow(
     portfolio_holding_exposures = _build_portfolio_holding_exposures(
         resolved_current_positions,
         current_position_classifications,
+    )
+    portfolio_holding_exposures.extend(
+        build_pending_order_holding_exposures(
+            pending_order_state,
+            current_positions=resolved_current_positions,
+        )
     )
     sector_contexts = _load_sector_contexts(
         config=config,
@@ -4382,6 +4580,7 @@ def _run_daily_summary_workflow(
         current_equity=current_equity,
         current_positions=resolved_current_positions,
         constraints=constraints,
+        reservation_state=pending_order_reservation_state,
     )
     evaluations = [
         replace(evaluation, candidate=candidate)
@@ -4423,6 +4622,7 @@ def _run_daily_summary_workflow(
         market_context=summary_market_context,
         preset_selection_source=preset_selection_source,
         force_require_relative_volume_confirmation=bool(args.require_relative_volume),
+        pending_order_summary=pending_order_reservation_state.to_dict(),
     )
     return {
         "summary": summary,
@@ -4432,6 +4632,7 @@ def _run_daily_summary_workflow(
         "preset_selection_source": preset_selection_source,
         "current_positions": resolved_current_positions,
         "current_equity": current_equity,
+        "pending_order_summary": pending_order_reservation_state.to_dict(),
         "candidate_score_journal_path": journal_path,
     }
 
@@ -5754,6 +5955,27 @@ def _load_current_positions(portfolio_file: Path | None) -> list[ExistingPositio
         return load_existing_positions(portfolio_file)
     except PortfolioInputError as exc:
         raise ValueError(str(exc)) from exc
+
+
+def _load_pending_order_state(project_root: Path) -> PendingOrderState:
+    return PendingOrderStateStore(project_root).load()
+
+
+def _build_pending_order_reservation_state(
+    *,
+    project_root: Path,
+    current_equity: float,
+    current_positions: Sequence[ExistingPosition],
+    constraints: PortfolioConstraints,
+) -> tuple[PendingOrderState, OrderReservationState]:
+    pending_order_state = _load_pending_order_state(project_root)
+    reservation_state = build_order_reservation_state(
+        pending_order_state,
+        current_equity=current_equity,
+        current_positions=current_positions,
+        max_concurrent_positions=constraints.max_concurrent_positions,
+    )
+    return pending_order_state, reservation_state
 
 
 def _load_earnings_contexts(

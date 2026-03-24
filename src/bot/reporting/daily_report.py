@@ -333,6 +333,7 @@ class DailyResearchSummary:
     execution_batch: ExecutionBatch
     market_context: MarketContext | None = None
     force_require_relative_volume_confirmation: bool = False
+    pending_order_summary: dict[str, Any] | None = None
 
     @property
     def recommended_preset(self) -> str | None:
@@ -421,6 +422,11 @@ class DailyResearchSummary:
             "current_position_count": len(self.current_positions),
             "current_position_symbols": [position.symbol for position in self.current_positions],
             "current_positions": [position.to_dict() for position in self.current_positions],
+            "pending_order_summary": (
+                dict(self.pending_order_summary)
+                if self.pending_order_summary is not None
+                else None
+            ),
             "candidate_count": len(self.rows),
             "approved_count": len(approved_rows),
             "rejected_count": len(rejected_rows),
@@ -464,6 +470,23 @@ class DailyResearchSummary:
             f"Relative-volume policy: {self.relative_volume_policy} | "
             f"Preset selection: {self.preset_selection_source or 'n/a'}"
         )
+        if self.pending_order_summary is not None:
+            pending_fill_notional = float(
+                self.pending_order_summary.get("pending_fill_notional", 0.0) or 0.0
+            )
+            pending_line = (
+                "Pending orders: "
+                f"{self.pending_order_summary.get('active_order_count', 0)} | "
+                f"Reserved capital: {self.pending_order_summary.get('reserved_notional', 0.0):.2f}"
+            )
+            if pending_fill_notional > 0:
+                pending_line += (
+                    f" | Pending fills awaiting holdings: {pending_fill_notional:.2f}"
+                )
+            pending_line += (
+                f" | Available capital: {self.pending_order_summary.get('available_capital', 0.0):.2f}"
+            )
+            lines.append(pending_line)
         breadth_line = _market_breadth_brief_line(self.market_context)
         if breadth_line is not None:
             lines.append(breadth_line)
@@ -1335,6 +1358,7 @@ class DailySignalReport:
     no_signal_symbols: tuple[str, ...]
     benchmark_symbol: str | None
     rows: tuple[DailySignalReportRow, ...]
+    pending_order_summary: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly report payload."""
@@ -1350,6 +1374,11 @@ class DailySignalReport:
             "current_position_count": len(self.current_positions),
             "current_position_symbols": [position.symbol for position in self.current_positions],
             "current_positions": [position.to_dict() for position in self.current_positions],
+            "pending_order_summary": (
+                dict(self.pending_order_summary)
+                if self.pending_order_summary is not None
+                else None
+            ),
             "signal_count": len(self.rows),
             "approved_count": approved_count,
             "rejected_count": rejected_count,
@@ -1369,6 +1398,7 @@ def build_daily_signal_report(
     current_positions: Sequence[ExistingPosition] = (),
     no_signal_symbols: Sequence[str] = (),
     benchmark_symbol: str | None = None,
+    pending_order_summary: Mapping[str, Any] | None = None,
 ) -> DailySignalReport:
     """Build a report covering approved and rejected signals for one daily run."""
 
@@ -1393,6 +1423,11 @@ def build_daily_signal_report(
         no_signal_symbols=tuple(no_signal_symbols),
         benchmark_symbol=benchmark_symbol,
         rows=rows,
+        pending_order_summary=(
+            dict(pending_order_summary)
+            if pending_order_summary is not None
+            else None
+        ),
     )
 
 
@@ -1465,6 +1500,7 @@ def build_daily_research_summary(
     market_context: MarketContext | None = None,
     preset_selection_source: str | None = None,
     force_require_relative_volume_confirmation: bool = False,
+    pending_order_summary: Mapping[str, Any] | None = None,
 ) -> DailyResearchSummary:
     """Build a consolidated daily preset summary from evaluated candidates."""
 
@@ -1518,6 +1554,11 @@ def build_daily_research_summary(
         execution_batch=execution_batch,
         market_context=market_context,
         force_require_relative_volume_confirmation=force_require_relative_volume_confirmation,
+        pending_order_summary=(
+            dict(pending_order_summary)
+            if pending_order_summary is not None
+            else None
+        ),
     )
 
 

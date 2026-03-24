@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Any, Mapping, Sequence
 
+from bot.data.pending_orders import OrderReservationState
 from bot.features import MarketContext
 from bot.risk.portfolio_rules import ExistingPosition, PortfolioConstraints, RiskAssessedCandidate
 
@@ -30,8 +31,13 @@ class ExecutionPriority:
     capital_efficiency_score: float
     queue_rank: int | None = None
     remaining_slots: int = 0
+    available_capital: float | None = None
+    reserved_notional: float = 0.0
+    reserved_slot_count: int = 0
     actionable_now: bool = False
     priority_bucket: str = "lower_priority"
+    capacity_blocked_by_pending: bool = False
+    capacity_block_reason: str | None = None
     rationale: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -41,6 +47,12 @@ class ExecutionPriority:
             raise ValueError("queue_rank must be greater than zero when provided.")
         if self.remaining_slots < 0:
             raise ValueError("remaining_slots cannot be negative.")
+        if self.available_capital is not None and self.available_capital < 0:
+            raise ValueError("available_capital cannot be negative when provided.")
+        if self.reserved_notional < 0:
+            raise ValueError("reserved_notional cannot be negative.")
+        if self.reserved_slot_count < 0:
+            raise ValueError("reserved_slot_count cannot be negative.")
         if self.priority_bucket not in EXECUTION_PRIORITY_BUCKETS:
             raise ValueError(
                 f"priority_bucket must be one of {EXECUTION_PRIORITY_BUCKETS}, got '{self.priority_bucket}'."
@@ -59,8 +71,13 @@ class ExecutionPriority:
             "capital_efficiency_score": self.capital_efficiency_score,
             "queue_rank": self.queue_rank,
             "remaining_slots": self.remaining_slots,
+            "available_capital": self.available_capital,
+            "reserved_notional": self.reserved_notional,
+            "reserved_slot_count": self.reserved_slot_count,
             "actionable_now": self.actionable_now,
             "priority_bucket": self.priority_bucket,
+            "capacity_blocked_by_pending": self.capacity_blocked_by_pending,
+            "capacity_block_reason": self.capacity_block_reason,
             "rationale": list(self.rationale),
         }
 
@@ -133,10 +150,44 @@ def annotate_execution_priority(
     current_equity: float,
     current_positions: Sequence[ExistingPosition],
     constraints: PortfolioConstraints,
+    reservation_state: OrderReservationState | None = None,
 ) -> list[RiskAssessedCandidate]:
     """Attach execution-priority metadata to approved candidates."""
 
-    remaining_slots = max(constraints.max_concurrent_positions - len(current_positions), 0)
+    current_position_notional = sum(
+        float(position.shares) * float(position.average_entry_price)
+        for position in current_positions
+    )
+    reserved_notional = (
+        reservation_state.reserved_notional
+        if reservation_state is not None
+        else 0.0
+    )
+    reserved_slot_count = (
+        reservation_state.reserved_slot_count
+        if reservation_state is not None
+        else 0
+    )
+    remaining_slots = (
+        reservation_state.available_slots
+        if reservation_state is not None
+        else max(constraints.max_concurrent_positions - len(current_positions), 0)
+    )
+    baseline_remaining_slots = max(
+        constraints.max_concurrent_positions - len(current_positions),
+        0,
+    )
+    available_capital = (
+        reservation_state.available_capital
+        if reservation_state is not None
+        else max(current_equity - current_position_notional, 0.0)
+    )
+    baseline_available_capital = max(current_equity - current_position_notional, 0.0)
+    pending_symbols = (
+        set(reservation_state.pending_symbols)
+        if reservation_state is not None
+        else set()
+    )
     prioritized_candidates: list[RiskAssessedCandidate] = list(candidates)
 
     approved_entries: list[tuple[int, RiskAssessedCandidate, ExecutionPriority]] = []
@@ -190,22 +241,77 @@ def annotate_execution_priority(
         )
     )
 
+    actionable_rank = 0
+    consumed_capital = 0.0
     for queue_rank, (index, candidate, priority) in enumerate(approved_entries, start=1):
-        actionable_now = queue_rank <= remaining_slots
-        priority_bucket = _priority_bucket_for_rank(
-            queue_rank=queue_rank,
-            remaining_slots=remaining_slots,
+        blocked_by_pending_symbol = candidate.signal.symbol.strip().upper() in pending_symbols
+        slot_available = actionable_rank < remaining_slots
+        baseline_slot_available = actionable_rank < baseline_remaining_slots
+        remaining_capital = max(available_capital - consumed_capital, 0.0)
+        baseline_remaining_capital = max(
+            baseline_available_capital - consumed_capital,
+            0.0,
         )
+        fits_remaining_capital = (
+            candidate.sizing.notional_value <= remaining_capital + 1e-9
+        )
+        fits_baseline_remaining_capital = (
+            candidate.sizing.notional_value <= baseline_remaining_capital + 1e-9
+        )
+        actionable_now = (
+            not blocked_by_pending_symbol
+            and slot_available
+            and fits_remaining_capital
+        )
+        if actionable_now:
+            actionable_rank += 1
+            consumed_capital += max(candidate.sizing.notional_value, 0.0)
+            priority_bucket = _priority_bucket_for_rank(
+                queue_rank=actionable_rank,
+                remaining_slots=remaining_slots,
+            )
+            capacity_block_reason = None
+            capacity_blocked_by_pending = False
+        else:
+            priority_bucket = "capacity_constrained"
+            slot_blocked_by_pending = (
+                not blocked_by_pending_symbol
+                and not slot_available
+                and baseline_slot_available
+                and reserved_slot_count > 0
+            )
+            capital_blocked_by_pending = (
+                not blocked_by_pending_symbol
+                and not fits_remaining_capital
+                and fits_baseline_remaining_capital
+                and reserved_notional > 0
+            )
+            capacity_block_reason = _capacity_block_reason(
+                blocked_by_pending_symbol=blocked_by_pending_symbol,
+                slot_blocked_by_pending=slot_blocked_by_pending,
+                capital_blocked_by_pending=capital_blocked_by_pending,
+            )
+            capacity_blocked_by_pending = (
+                blocked_by_pending_symbol
+                or slot_blocked_by_pending
+                or capital_blocked_by_pending
+            )
         finalized_priority = replace(
             priority,
             queue_rank=queue_rank,
             remaining_slots=remaining_slots,
+            available_capital=available_capital,
+            reserved_notional=reserved_notional,
+            reserved_slot_count=reserved_slot_count,
             actionable_now=actionable_now,
             priority_bucket=priority_bucket,
+            capacity_blocked_by_pending=capacity_blocked_by_pending,
+            capacity_block_reason=capacity_block_reason,
             rationale=_priority_rationale(
                 priority_bucket=priority_bucket,
                 sector_support_score=priority.sector_support_score,
                 portfolio_heat_penalty=priority.portfolio_heat_penalty,
+                capacity_block_reason=capacity_block_reason,
             ),
         )
         prioritized_candidates[index] = replace(
@@ -289,6 +395,7 @@ def _priority_rationale(
     priority_bucket: str,
     sector_support_score: float,
     portfolio_heat_penalty: float,
+    capacity_block_reason: str | None = None,
 ) -> tuple[str, ...]:
     if priority_bucket == "top_priority":
         rationale = ["Top priority due to the strongest overall execution score."]
@@ -322,9 +429,26 @@ def _priority_rationale(
                 "Priority is capped because sector support is not especially strong.",
             )
         return ("Approved but lower priority than stronger actionable setups.",)
+    if capacity_block_reason is not None:
+        return (capacity_block_reason,)
     return (
         "Crowded out by higher-ranked approved opportunities under current position limits.",
     )
+
+
+def _capacity_block_reason(
+    *,
+    blocked_by_pending_symbol: bool,
+    slot_blocked_by_pending: bool,
+    capital_blocked_by_pending: bool,
+) -> str:
+    if blocked_by_pending_symbol:
+        return "A pending order is already active for this symbol."
+    if slot_blocked_by_pending:
+        return "Crowded out because pending orders already reserve portfolio slots."
+    if capital_blocked_by_pending:
+        return "Crowded out because pending orders already reserve portfolio capital."
+    return "Crowded out by higher-ranked approved opportunities under current position limits."
 
 
 def _sector_support_score(candidate: RiskAssessedCandidate) -> float:

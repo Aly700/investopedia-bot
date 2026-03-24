@@ -15,6 +15,13 @@ from bot.config import load_app_config
 from bot.data.candidate_journal import default_candidate_score_journal_path
 from bot.data.earnings import EarningsRiskContext
 from bot.data.intraday_state_journal import default_intraday_state_journal_path
+from bot.data.pending_orders import (
+    PendingOrderRecord,
+    build_order_reservation_state,
+    create_pending_order,
+    default_pending_order_state_path,
+    load_pending_order_state,
+)
 from bot.data.portfolio_heat import (
     PortfolioHoldingExposure,
     build_portfolio_heat_context,
@@ -35,6 +42,7 @@ from bot.data.trade_feedback import (
 )
 from bot.data.sector_context import SectorFeatureContext, SymbolSectorClassification
 from bot.data.providers import DataProviderError
+from bot.execution.interface import ExecutionBatch, ExecutionOrder
 from bot.execution.manual_executor import ManualExecutor
 from bot.execution.prioritization import (
     annotate_execution_priority,
@@ -564,6 +572,221 @@ def test_execution_priority_uses_portfolio_heat_to_lower_priority_without_reject
     assert "portfolio heat is already elevated in this sector" in " ".join(
         ranked[1].execution_priority.rationale
     ).lower()
+
+
+def test_execution_priority_blocks_lower_priority_candidate_when_pending_reserves_slot_capacity() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    stronger = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=40,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.4,
+    )
+    weaker = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=True,
+        shares=40,
+        prior_high=99.5,
+        entry_price=100.5,
+        relative_volume=1.6,
+    )
+    pending_order_state = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_pending_1",
+            symbol="NVDA",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=10,
+            requested_price=100.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+        ),
+    ).state
+    reservation_state = build_order_reservation_state(
+        pending_order_state,
+        current_equity=100_000.0,
+        current_positions=[],
+        max_concurrent_positions=2,
+    )
+
+    prioritized_candidates = annotate_execution_priority(
+        [stronger.candidate, weaker.candidate],
+        current_equity=100_000.0,
+        current_positions=[],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=2,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+        reservation_state=reservation_state,
+    )
+    execution_batch = ManualExecutor().build_execution_batch(
+        prioritized_candidates,
+        as_of_date=date(2024, 1, 5),
+    )
+    ranked = rank_risk_assessed_candidates(
+        prioritized_candidates,
+        current_equity=100_000.0,
+    )
+
+    assert len(execution_batch.orders) == 1
+    assert ranked[0].execution_priority is not None
+    assert ranked[0].execution_priority.actionable_now is True
+    assert ranked[1].execution_priority is not None
+    assert ranked[1].execution_priority.actionable_now is False
+    assert ranked[1].execution_priority.priority_bucket == "capacity_constrained"
+    assert ranked[1].execution_priority.capacity_blocked_by_pending is True
+    assert "pending orders already reserve portfolio slots" in " ".join(
+        ranked[1].execution_priority.rationale
+    ).lower()
+
+
+def test_execution_priority_does_not_blame_pending_when_open_positions_already_exhaust_capacity() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    candidate = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=40,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.0,
+    )
+    current_positions = [
+        ExistingPosition(symbol="MSFT", shares=10, average_entry_price=100.0)
+    ]
+    pending_order_state = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_pending_1",
+            symbol="NVDA",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=10,
+            requested_price=100.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+        ),
+    ).state
+    reservation_state = build_order_reservation_state(
+        pending_order_state,
+        current_equity=100_000.0,
+        current_positions=current_positions,
+        max_concurrent_positions=1,
+    )
+
+    prioritized_candidates = annotate_execution_priority(
+        [candidate.candidate],
+        current_equity=100_000.0,
+        current_positions=current_positions,
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=1,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+        reservation_state=reservation_state,
+    )
+    priority = prioritized_candidates[0].execution_priority
+
+    assert priority is not None
+    assert priority.actionable_now is False
+    assert priority.capacity_blocked_by_pending is False
+    assert (
+        priority.capacity_block_reason
+        == "Crowded out by higher-ranked approved opportunities under current position limits."
+    )
+
+
+def test_execution_priority_keeps_smaller_later_candidate_actionable_when_pending_blocks_only_oversized_name() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+    oversized = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=150,
+        prior_high=99.0,
+        entry_price=100.0,
+        relative_volume=2.6,
+    )
+    smaller = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=True,
+        shares=50,
+        prior_high=99.0,
+        entry_price=100.0,
+        relative_volume=1.6,
+    )
+    pending_order_state = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_pending_1",
+            symbol="NVDA",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=200,
+            requested_price=100.0,
+            filled_quantity=0,
+            reserved_notional=20_000.0,
+            reserved_slot=True,
+        ),
+    ).state
+    reservation_state = build_order_reservation_state(
+        pending_order_state,
+        current_equity=30_000.0,
+        current_positions=[],
+        max_concurrent_positions=3,
+    )
+
+    prioritized_candidates = annotate_execution_priority(
+        [oversized.candidate, smaller.candidate],
+        current_equity=30_000.0,
+        current_positions=[],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=3,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+        reservation_state=reservation_state,
+    )
+    execution_batch = ManualExecutor().build_execution_batch(
+        prioritized_candidates,
+        as_of_date=date(2024, 1, 5),
+    )
+    ranked = rank_risk_assessed_candidates(
+        prioritized_candidates,
+        current_equity=30_000.0,
+    )
+    priorities_by_symbol = {
+        candidate.signal.symbol: candidate.execution_priority
+        for candidate in prioritized_candidates
+    }
+
+    assert [order.symbol for order in execution_batch.orders] == ["BBB"]
+    assert [candidate.signal.symbol for candidate in ranked] == ["BBB", "AAA"]
+    assert priorities_by_symbol["AAA"] is not None
+    assert priorities_by_symbol["AAA"].actionable_now is False
+    assert priorities_by_symbol["AAA"].capacity_blocked_by_pending is True
+    assert (
+        priorities_by_symbol["AAA"].capacity_block_reason
+        == "Crowded out because pending orders already reserve portfolio capital."
+    )
+    assert priorities_by_symbol["BBB"] is not None
+    assert priorities_by_symbol["BBB"].actionable_now is True
+    assert priorities_by_symbol["BBB"].capacity_blocked_by_pending is False
 
 
 def test_execution_priority_lower_priority_without_features_does_not_blame_sector_context() -> None:
@@ -4002,6 +4225,393 @@ def test_handle_generate_orders_rolls_forward_approved_sector_exposure_between_c
     assert report_payload["rows"][1]["rejection_reasons"] == [
         "Portfolio already has 3 Technology positions; adding another would exceed the per-sector limit of 3."
     ]
+
+
+def test_handle_generate_orders_accounts_for_pending_order_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    candidate_path = tmp_path / "candidates.txt"
+    candidate_path.write_text("AAPL\n", encoding="utf-8")
+    output_dir = tmp_path / "orders"
+    args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(output_dir),
+            "--format",
+            "json",
+        ]
+    )
+    current_positions = [
+        ExistingPosition(symbol="MSFT", shares=10, average_entry_price=100.0),
+        ExistingPosition(symbol="NVDA", shares=10, average_entry_price=100.0),
+        ExistingPosition(symbol="JPM", shares=10, average_entry_price=100.0),
+    ]
+    pending_order_state = create_pending_order(
+        load_pending_order_state(Path("/tmp/does-not-exist-pending-orders.json")),
+        PendingOrderRecord(
+            order_id="ord_pending_1",
+            symbol="TSLA",
+            side="BUY",
+            order_type="LIMIT",
+            created_at="2024-01-05T14:30:00+00:00",
+            status="pending",
+            requested_quantity=10,
+            requested_price=100.0,
+            filled_quantity=0,
+            reserved_notional=1_000.0,
+            reserved_slot=True,
+        ),
+    ).state
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [99.0],
+                    "high": [101.0],
+                    "low": [98.0],
+                    "close": [100.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
+    monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: current_positions)
+    monkeypatch.setattr(main_module, "_load_pending_order_state", lambda project_root: pending_order_state)
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "compute_market_breadth_from_frames",
+        lambda *args, **kwargs: {
+            "market_breadth_pct_above_200ma": 0.72,
+            "market_breadth_pct_above_50ma": 0.76,
+            "market_breadth_state": "healthy",
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context",
+        lambda **kwargs: {
+            "vix_close": 18.0,
+            "vix_sma_short": 17.8,
+            "vix_sma_long": 18.2,
+            "volatility_regime_state": "calm",
+            "volatility_regime_risk_off": False,
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        lambda *args, **kwargs: StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol="AAPL",
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=100.0,
+            stop_hint=95.0,
+            metadata={"prior_high": 99.0, "relative_volume": 1.8},
+        ),
+    )
+
+    result = main_module._handle_generate_orders(args)
+    payload = json.loads(capsys.readouterr().out)
+    report_payload = json.loads(
+        (output_dir / "daily_signal_report.json").read_text(encoding="utf-8")
+    )
+
+    assert result == 0
+    assert payload["approved_signal_count"] == 1
+    assert payload["approved_order_count"] == 0
+    assert payload["blocked_by_pending_reservations_count"] == 1
+    assert payload["pending_order_summary"]["active_order_count"] == 1
+    assert payload["pending_order_summary"]["available_slots"] == 0
+    assert report_payload["pending_order_summary"]["reserved_slot_count"] == 1
+    assert "pending orders already reserve portfolio slots" in report_payload["rows"][0]["rationale"].lower()
+
+
+def test_handle_generate_orders_can_stage_pending_orders_for_later_capacity_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    candidate_path_stage = tmp_path / "stage_candidates.txt"
+    candidate_path_consume = tmp_path / "consume_candidates.txt"
+    candidate_path_stage.write_text("AAPL\n", encoding="utf-8")
+    candidate_path_consume.write_text("MSFT\n", encoding="utf-8")
+    stage_output_dir = tmp_path / "stage-orders"
+    consume_output_dir = tmp_path / "consume-orders"
+    current_positions = [
+        ExistingPosition(symbol="META", shares=10, average_entry_price=100.0),
+        ExistingPosition(symbol="NVDA", shares=10, average_entry_price=100.0),
+        ExistingPosition(symbol="JPM", shares=10, average_entry_price=100.0),
+    ]
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [99.0],
+                    "high": [101.0],
+                    "low": [98.0],
+                    "close": [100.0],
+                    "volume": [2_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    def fake_breakout_signal(
+        bars: pd.DataFrame,
+        *,
+        settings: object,
+        benchmark_frame: pd.DataFrame | None,
+        has_open_position: bool,
+        symbol: str,
+    ) -> StrategySignal:
+        return StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=100.0,
+            stop_hint=95.0,
+            metadata={"prior_high": 99.0, "relative_volume": 1.8},
+        )
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
+    monkeypatch.setattr(
+        main_module,
+        "create_daily_bar_provider",
+        lambda config, env_file: FakeProvider(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_current_positions",
+        lambda portfolio_file: current_positions,
+    )
+    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "compute_market_breadth_from_frames",
+        lambda *args, **kwargs: {
+            "market_breadth_pct_above_200ma": 0.72,
+            "market_breadth_pct_above_50ma": 0.76,
+            "market_breadth_state": "healthy",
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context",
+        lambda **kwargs: {
+            "vix_close": 18.0,
+            "vix_sma_short": 17.8,
+            "vix_sma_long": 18.2,
+            "volatility_regime_state": "calm",
+            "volatility_regime_risk_off": False,
+        },
+    )
+    monkeypatch.setattr(main_module, "generate_breakout_signal", fake_breakout_signal)
+
+    stage_args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path_stage),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(stage_output_dir),
+            "--format",
+            "json",
+            "--stage-pending-orders",
+        ]
+    )
+
+    assert main_module._handle_generate_orders(stage_args) == 0
+    staged_payload = json.loads(capsys.readouterr().out)
+    persisted_state = load_pending_order_state(default_pending_order_state_path(tmp_path))
+    staged_report_payload = json.loads(
+        (stage_output_dir / "daily_signal_report.json").read_text(encoding="utf-8")
+    )
+
+    assert staged_payload["staged_pending_order_count"] == 1
+    assert len(persisted_state.orders) == 1
+    assert tuple(record.symbol for record in persisted_state.active_orders()) == ("AAPL",)
+    assert staged_report_payload["pending_order_summary"]["active_order_count"] == 1
+    assert staged_report_payload["pending_order_summary"]["available_slots"] == 0
+
+    consume_args = build_parser().parse_args(
+        [
+            "generate-orders",
+            str(candidate_path_consume),
+            "--as-of",
+            "2024-01-05",
+            "--disable-regime-filter",
+            "--output-dir",
+            str(consume_output_dir),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert main_module._handle_generate_orders(consume_args) == 0
+    consume_payload = json.loads(capsys.readouterr().out)
+
+    assert consume_payload["approved_signal_count"] == 1
+    assert consume_payload["approved_order_count"] == 0
+    assert consume_payload["blocked_by_pending_reservations_count"] == 1
+    assert consume_payload["pending_order_summary"]["active_order_count"] == 1
+    assert consume_payload["pending_order_summary"]["available_slots"] == 0
+
+
+def test_stage_execution_batch_pending_orders_updates_same_decision_across_reruns(
+    tmp_path: Path,
+) -> None:
+    first_batch = ExecutionBatch(
+        executor_name="manual_executor",
+        as_of_date=date(2024, 1, 5),
+        generated_at_utc="2024-01-05T15:00:00+00:00",
+        orders=(
+            ExecutionOrder(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                action="BUY",
+                quantity=10,
+                intended_order_type="LIMIT",
+                entry_price_hint=100.0,
+                strategy_name="breakout_momentum",
+                metadata={"signal_metadata": {"decision_id": "decision_aapl"}},
+            ),
+        ),
+    )
+    second_batch = ExecutionBatch(
+        executor_name="manual_executor",
+        as_of_date=date(2024, 1, 5),
+        generated_at_utc="2024-01-05T15:05:00+00:00",
+        orders=(
+            ExecutionOrder(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                action="BUY",
+                quantity=9,
+                intended_order_type="LIMIT",
+                entry_price_hint=101.0,
+                strategy_name="breakout_momentum",
+                metadata={"signal_metadata": {"decision_id": "decision_aapl"}},
+            ),
+        ),
+    )
+
+    first_result = main_module._stage_execution_batch_pending_orders(
+        project_root=tmp_path,
+        batch=first_batch,
+    )
+    second_result = main_module._stage_execution_batch_pending_orders(
+        project_root=tmp_path,
+        batch=second_batch,
+    )
+    persisted_state = load_pending_order_state(default_pending_order_state_path(tmp_path))
+    active_orders = persisted_state.active_orders()
+
+    assert first_result[0] == 1
+    assert second_result[0] == 1
+    assert len(active_orders) == 1
+    assert active_orders[0].symbol == "AAPL"
+    assert active_orders[0].linked_decision_id == "decision_aapl"
+    assert active_orders[0].requested_quantity == 9
+    assert active_orders[0].requested_price == pytest.approx(101.0)
+    assert active_orders[0].reserved_notional == pytest.approx(909.0)
+
+
+def test_stage_execution_batch_pending_orders_without_decision_id_still_hits_duplicate_symbol_boundary(
+    tmp_path: Path,
+) -> None:
+    first_batch = ExecutionBatch(
+        executor_name="manual_executor",
+        as_of_date=date(2024, 1, 5),
+        generated_at_utc="2024-01-05T15:00:00+00:00",
+        orders=(
+            ExecutionOrder(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                action="BUY",
+                quantity=10,
+                intended_order_type="LIMIT",
+                entry_price_hint=100.0,
+                strategy_name="breakout_momentum",
+                metadata={},
+            ),
+        ),
+    )
+    second_batch = ExecutionBatch(
+        executor_name="manual_executor",
+        as_of_date=date(2024, 1, 5),
+        generated_at_utc="2024-01-05T15:05:00+00:00",
+        orders=(
+            ExecutionOrder(
+                date=date(2024, 1, 5),
+                symbol="AAPL",
+                action="BUY",
+                quantity=9,
+                intended_order_type="LIMIT",
+                entry_price_hint=101.0,
+                strategy_name="breakout_momentum",
+                metadata={},
+            ),
+        ),
+    )
+
+    first_result = main_module._stage_execution_batch_pending_orders(
+        project_root=tmp_path,
+        batch=first_batch,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Only one active capacity-reserving buy order is allowed per symbol.",
+    ):
+        main_module._stage_execution_batch_pending_orders(
+            project_root=tmp_path,
+            batch=second_batch,
+        )
+
+    persisted_state = load_pending_order_state(default_pending_order_state_path(tmp_path))
+    active_orders = persisted_state.active_orders()
+
+    assert first_result[0] == 1
+    assert len(active_orders) == 1
+    assert active_orders[0].symbol == "AAPL"
+    assert active_orders[0].linked_decision_id is None
+    assert active_orders[0].requested_quantity == 10
+    assert active_orders[0].requested_price == pytest.approx(100.0)
 
 
 def test_handle_daily_summary_uses_workflow_universe_count(
