@@ -76,6 +76,13 @@ class PendingOrderRecord:
     linked_decision_id: str | None = None
     sector_name: str | None = None
     industry_name: str | None = None
+    broker_name: str | None = None
+    broker_order_id: str | None = None
+    client_order_id: str | None = None
+    broker_status: str | None = None
+    submitted_at: str | None = None
+    last_broker_update_at: str | None = None
+    average_fill_price: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -108,6 +115,15 @@ class PendingOrderRecord:
             raise ValueError("entry_hint must be positive when provided.")
         if self.stop_price is not None and self.stop_price <= 0:
             raise ValueError("stop_price must be positive when provided.")
+        if self.submitted_at is not None:
+            coerce_iso8601_datetime_text(self.submitted_at, "submitted_at")
+        if self.last_broker_update_at is not None:
+            coerce_iso8601_datetime_text(
+                self.last_broker_update_at,
+                "last_broker_update_at",
+            )
+        if self.average_fill_price is not None and self.average_fill_price <= 0:
+            raise ValueError("average_fill_price must be positive when provided.")
         if self.reserved_notional < 0:
             raise ValueError("reserved_notional cannot be negative.")
         if self.status in PENDING_ORDER_ACTIVE_STATUSES and self.remaining_quantity <= 0:
@@ -135,6 +151,7 @@ class PendingOrderRecord:
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
+            "order_id": self.order_id,
             "symbol": self.symbol,
             "side": self.side,
             "order_type": self.order_type,
@@ -161,6 +178,20 @@ class PendingOrderRecord:
             payload["sector_name"] = self.sector_name
         if self.industry_name is not None:
             payload["industry_name"] = self.industry_name
+        if self.broker_name is not None:
+            payload["broker_name"] = self.broker_name
+        if self.broker_order_id is not None:
+            payload["broker_order_id"] = self.broker_order_id
+        if self.client_order_id is not None:
+            payload["client_order_id"] = self.client_order_id
+        if self.broker_status is not None:
+            payload["broker_status"] = self.broker_status
+        if self.submitted_at is not None:
+            payload["submitted_at"] = self.submitted_at
+        if self.last_broker_update_at is not None:
+            payload["last_broker_update_at"] = self.last_broker_update_at
+        if self.average_fill_price is not None:
+            payload["average_fill_price"] = self.average_fill_price
         if self.metadata:
             payload["metadata"] = dict(self.metadata)
         return payload
@@ -195,6 +226,19 @@ class PendingOrderRecord:
             linked_decision_id=_mapping_optional_text(data, "linked_decision_id"),
             sector_name=_mapping_optional_text(data, "sector_name"),
             industry_name=_mapping_optional_text(data, "industry_name"),
+            broker_name=_mapping_optional_text(data, "broker_name"),
+            broker_order_id=_mapping_optional_text(data, "broker_order_id"),
+            client_order_id=_mapping_optional_text(data, "client_order_id"),
+            broker_status=_mapping_optional_text(data, "broker_status"),
+            submitted_at=_mapping_optional_text(data, "submitted_at"),
+            last_broker_update_at=_mapping_optional_text(
+                data,
+                "last_broker_update_at",
+            ),
+            average_fill_price=_mapping_optional_positive_float(
+                data,
+                "average_fill_price",
+            ),
             metadata=dict(raw_metadata),
         )
 

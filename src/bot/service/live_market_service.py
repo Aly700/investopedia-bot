@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from bot.data.state_persistence import (
     StateArtifactPath,
@@ -17,6 +17,12 @@ from bot.data.state_persistence import (
 )
 from bot.ingestion.streaming import WebsocketIngestionAdapter
 from bot.logging_utils import get_logger
+from bot.notifications import (
+    NotificationEvent,
+    NotificationRouter,
+    build_service_state_notifications,
+    build_service_warning_notification,
+)
 from bot.orchestration.live_runner import (
     LiveMarketCycleRequest,
     LiveMarketCycleResult,
@@ -234,6 +240,7 @@ class LiveMarketSupervisor:
     flush_on_shutdown: bool = True
     handle_cycle_result: Callable[[LiveMarketCycleResult], None] | None = None
     status_store: LiveMarketServiceStatusStore | None = None
+    notification_router: NotificationRouter | None = None
     status: LiveMarketServiceStatus = field(default_factory=LiveMarketServiceStatus, init=False)
     _stop_requested: bool = field(default=False, init=False, repr=False)
 
@@ -250,10 +257,15 @@ class LiveMarketSupervisor:
         """Run one service iteration."""
 
         now = self.now_utc()
+        previous_service_state = self.status.service_state
         if not self.adapter.connected:
             self._attempt_connect(now)
             if not self.adapter.connected:
                 self._refresh_liveness(now)
+                self._notify_service_state_change(
+                    previous_state=previous_service_state,
+                    now=now,
+                )
                 self._persist_status(now)
                 return self.status
 
@@ -274,6 +286,10 @@ class LiveMarketSupervisor:
             if poll_result.warning_count:
                 self.status.last_error = poll_result.warnings[-1]
             self._refresh_liveness(now)
+            self._notify_service_state_change(
+                previous_state=previous_service_state,
+                now=now,
+            )
             self._persist_status(now)
             return self.status
 
@@ -302,6 +318,10 @@ class LiveMarketSupervisor:
                         self._record_warning(f"cycle result handler failed: {exc}")
 
         self._refresh_liveness(now)
+        self._notify_service_state_change(
+            previous_state=previous_service_state,
+            now=now,
+        )
         self._persist_status(now)
         return self.status
 
@@ -419,6 +439,14 @@ class LiveMarketSupervisor:
         LOGGER.warning("%s", message)
         self.status.warning_count += 1
         self.status.last_warning = message
+        if self.notification_router is None:
+            return
+        event = build_service_warning_notification(
+            message,
+            created_at=self.now_utc().astimezone(timezone.utc).isoformat(),
+        )
+        if event is not None:
+            self._route_notifications((event,))
 
     def _persist_status(self, now: datetime) -> None:
         if self.status_store is None:
@@ -430,6 +458,30 @@ class LiveMarketSupervisor:
             )
         except OSError as exc:
             LOGGER.warning("Failed to persist live market service status: %s", exc)
+
+    def _notify_service_state_change(
+        self,
+        *,
+        previous_state: str,
+        now: datetime,
+    ) -> None:
+        if self.notification_router is None:
+            return
+        events = build_service_state_notifications(
+            previous_state=previous_state,
+            current_state=self.status.service_state,
+            created_at=now.astimezone(timezone.utc).isoformat(),
+        )
+        if events:
+            self._route_notifications(events)
+
+    def _route_notifications(self, events: Sequence[NotificationEvent]) -> None:
+        if self.notification_router is None or not events:
+            return
+        try:
+            self.notification_router.route_events(events)
+        except Exception as exc:
+            LOGGER.warning("Notification routing failed: %s", exc)
 
 
 def _optional_text(value: object) -> str | None:

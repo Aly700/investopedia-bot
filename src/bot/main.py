@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from datetime import timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Optional, Sequence, cast
@@ -34,10 +35,20 @@ from bot.backtest.walkforward import (
     walkforward_fetch_start,
     write_walkforward_reports,
 )
+from bot.broker import (
+    BrokerExecutionAdapter,
+    BrokerExecutionError,
+    BrokerOrderUpdate,
+    BrokerReplaceOrderRequest,
+    create_broker_execution_adapter,
+    reconcile_broker_order_updates,
+    submit_pending_orders_via_broker,
+)
 from bot.config import (
     AppConfig,
     ConfigError,
     UniverseProfileConfig,
+    _read_env_file,
     default_config_dir,
     default_env_file,
     load_app_config,
@@ -152,6 +163,16 @@ from bot.ingestion.streaming import LiveUpdateBufferSnapshot, WebsocketIngestion
 from bot.ingestion.websocket_transport import JsonWebsocketTransport
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
+from bot.notifications import (
+    NotificationEvent,
+    NotificationRoute,
+    NotificationRouter,
+    NotificationDeliveryStateStore,
+    WebhookNotificationChannel,
+    build_market_state_transition_notification,
+    build_trade_feedback_notification,
+    build_warning_notification,
+)
 from bot.orchestration.live_runner import (
     LiveMarketCycleRequest,
     LiveMarketCycleResult,
@@ -236,6 +257,134 @@ def _configured_provider_name(config: object) -> str | None:
     data_sources = getattr(config, "data_sources", None)
     provider_name = getattr(data_sources, "provider", None)
     return provider_name if isinstance(provider_name, str) and provider_name else None
+
+
+def _add_notification_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--notification-webhook-url",
+        default=None,
+        help="Optional outbound webhook URL for notification delivery.",
+    )
+    parser.add_argument(
+        "--notification-webhook-format",
+        choices=("generic", "discord"),
+        default=None,
+        help="Optional webhook payload format override.",
+    )
+    parser.add_argument(
+        "--notification-min-severity",
+        choices=("info", "warning", "critical"),
+        default=None,
+        help="Optional minimum notification severity to deliver.",
+    )
+
+
+def _notification_environment(env_file: Path | None) -> dict[str, str]:
+    merged = _read_env_file(env_file)
+    merged.update(dict(os.environ))
+    return merged
+
+
+def _build_notification_router(
+    *,
+    project_root: Path,
+    env_file: Path | None,
+    webhook_url: str | None,
+    webhook_format: str | None,
+    minimum_severity: str | None,
+) -> NotificationRouter | None:
+    merged_env = _notification_environment(env_file)
+    resolved_webhook_url = _clean_optional_text(webhook_url)
+    resolved_format = _clean_optional_text(webhook_format)
+    if resolved_webhook_url is None:
+        resolved_webhook_url = _clean_optional_text(merged_env.get("NOTIFICATION_WEBHOOK_URL"))
+    if resolved_webhook_url is None:
+        discord_webhook_url = _clean_optional_text(merged_env.get("DISCORD_WEBHOOK_URL"))
+        if discord_webhook_url is not None:
+            resolved_webhook_url = discord_webhook_url
+            resolved_format = resolved_format or "discord"
+    if resolved_webhook_url is None:
+        return None
+    resolved_minimum_severity = (
+        _clean_optional_text(minimum_severity)
+        or _clean_optional_text(merged_env.get("NOTIFICATION_MIN_SEVERITY"))
+    )
+    channel = WebhookNotificationChannel(
+        webhook_url=resolved_webhook_url,
+        payload_format=resolved_format or "generic",
+    )
+    return NotificationRouter(
+        routes=(
+            NotificationRoute(
+                channel=channel,
+                minimum_severity=resolved_minimum_severity,
+            ),
+        ),
+        state_store=NotificationDeliveryStateStore(project_root),
+    )
+
+
+def _route_notification_events(
+    router: NotificationRouter | None,
+    events: Sequence[NotificationEvent],
+) -> dict[str, object] | None:
+    if router is None or not events:
+        return None
+    batch_result = router.route_events(events)
+    return batch_result.to_dict()
+
+
+def _notification_events_from_cycle_result(
+    cycle_result: LiveMarketCycleResult,
+) -> tuple[NotificationEvent, ...]:
+    if cycle_result.market_state_snapshot is None:
+        return ()
+    created_at = cycle_result.market_state_snapshot.as_of_timestamp
+    return tuple(
+        build_market_state_transition_notification(
+            transition,
+            created_at=created_at,
+        )
+        for transition in cycle_result.state_transitions
+    )
+
+
+def _notification_events_from_trade_feedback_events(
+    events: Sequence[TradeFeedbackEvent],
+) -> tuple[NotificationEvent, ...]:
+    notifications: list[NotificationEvent] = []
+    for event in events:
+        notification = build_trade_feedback_notification(event)
+        if notification is not None:
+            notifications.append(notification)
+    return tuple(notifications)
+
+
+def _notification_events_from_warning_messages(
+    *,
+    workflow: str,
+    created_at: str,
+    warnings: Sequence[str],
+    related_ids: Mapping[str, str] | None = None,
+) -> tuple[NotificationEvent, ...]:
+    notifications: list[NotificationEvent] = []
+    for warning in warnings:
+        message_hash = hashlib.sha1(
+            f"{workflow}:{warning}".encode("utf-8")
+        ).hexdigest()[:16]
+        notifications.append(
+            build_warning_notification(
+                event_type="execution_warning",
+                severity="warning",
+                title=f"{workflow} warning",
+                body=warning,
+                created_at=created_at,
+                related_ids=dict(related_ids or {}),
+                dedupe_key=f"execution-warning:{message_hash}",
+                suppression_scope="once",
+            )
+        )
+    return tuple(notifications)
 
 
 class NoIntradayDataError(ValueError):
@@ -970,6 +1119,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional maximum supervisor iterations before exiting.",
     )
+    _add_notification_arguments(run_live_market_service_parser)
     run_live_market_service_parser.set_defaults(handler=_handle_run_live_market_service)
 
     serve_internal_api_parser = subparsers.add_parser(
@@ -1089,6 +1239,118 @@ def build_parser() -> argparse.ArgumentParser:
         help="Persist generated buy orders into pending-order state for later capacity-aware runs.",
     )
     generate_orders_parser.set_defaults(handler=_handle_generate_orders)
+
+    submit_broker_orders_parser = subparsers.add_parser(
+        "submit-broker-orders",
+        help="Submit active staged pending orders through the configured broker adapter.",
+    )
+    submit_broker_orders_parser.add_argument(
+        "--broker",
+        default="alpaca",
+        help="Broker adapter name.",
+    )
+    submit_broker_orders_parser.add_argument(
+        "--order-id",
+        dest="order_ids",
+        action="append",
+        default=None,
+        help="Optional local pending order id to submit. Repeat for multiple orders.",
+    )
+    submit_broker_orders_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    _add_notification_arguments(submit_broker_orders_parser)
+    submit_broker_orders_parser.set_defaults(handler=_handle_submit_broker_orders)
+
+    sync_broker_orders_parser = subparsers.add_parser(
+        "sync-broker-orders",
+        help="Reconcile broker order truth back into local pending-order state.",
+    )
+    sync_broker_orders_parser.add_argument(
+        "--broker",
+        default="alpaca",
+        help="Broker adapter name.",
+    )
+    sync_broker_orders_parser.add_argument(
+        "--order-id",
+        dest="order_ids",
+        action="append",
+        default=None,
+        help="Optional local pending order id to sync. Repeat for multiple orders.",
+    )
+    sync_broker_orders_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    _add_notification_arguments(sync_broker_orders_parser)
+    sync_broker_orders_parser.set_defaults(handler=_handle_sync_broker_orders)
+
+    cancel_broker_order_parser = subparsers.add_parser(
+        "cancel-broker-order",
+        help="Cancel one active broker-linked pending order.",
+    )
+    cancel_broker_order_parser.add_argument(
+        "order_id",
+        help="Local pending order id to cancel.",
+    )
+    cancel_broker_order_parser.add_argument(
+        "--broker",
+        default="alpaca",
+        help="Broker adapter name.",
+    )
+    cancel_broker_order_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    _add_notification_arguments(cancel_broker_order_parser)
+    cancel_broker_order_parser.set_defaults(handler=_handle_cancel_broker_order)
+
+    replace_broker_order_parser = subparsers.add_parser(
+        "replace-broker-order",
+        help="Replace one active broker-linked pending order.",
+    )
+    replace_broker_order_parser.add_argument(
+        "order_id",
+        help="Local pending order id to replace.",
+    )
+    replace_broker_order_parser.add_argument(
+        "--broker",
+        default="alpaca",
+        help="Broker adapter name.",
+    )
+    replace_broker_order_parser.add_argument(
+        "--quantity",
+        type=int,
+        default=None,
+        help="Optional replacement quantity.",
+    )
+    replace_broker_order_parser.add_argument(
+        "--limit-price",
+        type=float,
+        default=None,
+        help="Optional replacement limit price.",
+    )
+    replace_broker_order_parser.add_argument(
+        "--stop-price",
+        type=float,
+        default=None,
+        help="Optional replacement stop price.",
+    )
+    replace_broker_order_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    _add_notification_arguments(replace_broker_order_parser)
+    replace_broker_order_parser.set_defaults(handler=_handle_replace_broker_order)
 
     render_orders_parser = subparsers.add_parser(
         "render-orders",
@@ -1502,7 +1764,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         return int(args.handler(args))
-    except (ConfigError, DataProviderConfigurationError, DataProviderError, ManualOrderError, ValueError) as exc:
+    except (
+        BrokerExecutionError,
+        ConfigError,
+        DataProviderConfigurationError,
+        DataProviderError,
+        ManualOrderError,
+        ValueError,
+    ) as exc:
         LOGGER.error("%s", exc)
         return 1
 
@@ -2501,6 +2770,13 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
         flush_interval_seconds=args.flush_interval_seconds,
     )
     latest_outputs: dict[str, str] = {}
+    notification_router = _build_notification_router(
+        project_root=config.project_root,
+        env_file=args.env_file,
+        webhook_url=getattr(args, "notification_webhook_url", None),
+        webhook_format=getattr(args, "notification_webhook_format", None),
+        minimum_severity=getattr(args, "notification_min_severity", None),
+    )
 
     def handle_cycle_result(cycle_result: LiveMarketCycleResult) -> None:
         latest_outputs.update(
@@ -2508,6 +2784,10 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
                 cycle_result,
                 output_dir=output_dir,
             )
+        )
+        _route_notification_events(
+            notification_router,
+            _notification_events_from_cycle_result(cycle_result),
         )
 
     supervisor = LiveMarketSupervisor(
@@ -2549,6 +2829,7 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
         ),
         handle_cycle_result=handle_cycle_result,
         status_store=LiveMarketServiceStatusStore(config.project_root),
+        notification_router=notification_router,
     )
     status = supervisor.run(max_iterations=args.max_iterations)
     payload = {
@@ -2560,6 +2841,7 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
             str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
         ),
         "include_intraday_review": bool(args.include_intraday_review),
+        "notifications_enabled": notification_router is not None,
         "status": status.to_dict(),
         "outputs": dict(sorted(latest_outputs.items())),
     }
@@ -3110,6 +3392,330 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         payload["outputs"]["pending_order_state"] = str(staged_pending_order_path)
     if post_stage_pending_order_summary is not None:
         payload["post_stage_pending_order_summary"] = post_stage_pending_order_summary
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_submit_broker_orders(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    store = PendingOrderStateStore(config.project_root)
+    starting_state = store.load()
+    adapter = _create_broker_adapter(args.broker, env_file=args.env_file)
+    notification_router = _build_notification_router(
+        project_root=config.project_root,
+        env_file=args.env_file,
+        webhook_url=getattr(args, "notification_webhook_url", None),
+        webhook_format=getattr(args, "notification_webhook_format", None),
+        minimum_severity=getattr(args, "notification_min_severity", None),
+    )
+    submission_result = submit_pending_orders_via_broker(
+        starting_state,
+        adapter=adapter,
+        order_ids=args.order_ids,
+    )
+    pending_order_state_path = _save_pending_order_state_if_changed(
+        store,
+        previous_state=starting_state,
+        updated_state=submission_result.state,
+    )
+    feedback_events = _broker_submission_feedback_events(
+        workflow="submit-broker-orders",
+        state=submission_result.state,
+        submitted_updates=submission_result.submitted_updates,
+        lifecycle_events=submission_result.lifecycle_events,
+    )
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=feedback_events,
+    )
+    notification_delivery = _route_notification_events(
+        notification_router,
+        _notification_events_from_trade_feedback_events(feedback_events)
+        + _notification_events_from_warning_messages(
+            workflow="submit-broker-orders",
+            created_at=_trade_feedback_timestamp_utc(),
+            warnings=submission_result.warnings,
+        ),
+    )
+    payload = {
+        "command": "submit-broker-orders",
+        "broker": args.broker,
+        "submitted_count": len(submission_result.submitted_updates),
+        "skipped_order_ids": list(submission_result.skipped_order_ids),
+        "warnings": list(submission_result.warnings),
+        "submitted_updates": [update.to_dict() for update in submission_result.submitted_updates],
+        "outputs": {},
+    }
+    if pending_order_state_path is not None:
+        payload["outputs"]["pending_order_state"] = str(pending_order_state_path)
+    if trade_feedback_log_path is not None:
+        payload["outputs"]["trade_feedback_log"] = str(trade_feedback_log_path)
+    if notification_delivery is not None:
+        payload["notification_delivery"] = notification_delivery
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_sync_broker_orders(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    store = PendingOrderStateStore(config.project_root)
+    starting_state = store.load()
+    adapter = _create_broker_adapter(args.broker, env_file=args.env_file)
+    notification_router = _build_notification_router(
+        project_root=config.project_root,
+        env_file=args.env_file,
+        webhook_url=getattr(args, "notification_webhook_url", None),
+        webhook_format=getattr(args, "notification_webhook_format", None),
+        minimum_severity=getattr(args, "notification_min_severity", None),
+    )
+    selected_orders = _select_pending_orders_for_broker_sync(
+        starting_state,
+        order_ids=args.order_ids,
+    )
+    broker_updates, broker_warnings = _load_broker_updates_for_pending_orders(
+        adapter,
+        selected_orders,
+        use_open_order_scan=not bool(args.order_ids),
+    )
+    reconciliation = reconcile_broker_order_updates(starting_state, broker_updates)
+    pending_order_state_path = _save_pending_order_state_if_changed(
+        store,
+        previous_state=starting_state,
+        updated_state=reconciliation.state,
+    )
+    warnings = list(broker_warnings) + list(reconciliation.warnings)
+    feedback_events = _broker_reconciliation_feedback_events(
+        workflow="sync-broker-orders",
+        state=reconciliation.state,
+        lifecycle_events=reconciliation.lifecycle_events,
+        matched_updates=reconciliation.matched_updates,
+    )
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=feedback_events,
+    )
+    notification_delivery = _route_notification_events(
+        notification_router,
+        _notification_events_from_trade_feedback_events(feedback_events)
+        + _notification_events_from_warning_messages(
+            workflow="sync-broker-orders",
+            created_at=_trade_feedback_timestamp_utc(),
+            warnings=warnings,
+        ),
+    )
+    payload = {
+        "command": "sync-broker-orders",
+        "broker": args.broker,
+        "selected_order_count": len(selected_orders),
+        "matched_update_count": len(reconciliation.matched_updates),
+        "unmatched_update_count": len(reconciliation.unmatched_updates),
+        "warnings": warnings,
+        "matched_updates": [update.to_dict() for update in reconciliation.matched_updates],
+        "unmatched_updates": [update.to_dict() for update in reconciliation.unmatched_updates],
+        "outputs": {},
+    }
+    if pending_order_state_path is not None:
+        payload["outputs"]["pending_order_state"] = str(pending_order_state_path)
+    if trade_feedback_log_path is not None:
+        payload["outputs"]["trade_feedback_log"] = str(trade_feedback_log_path)
+    if notification_delivery is not None:
+        payload["notification_delivery"] = notification_delivery
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_cancel_broker_order(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    store = PendingOrderStateStore(config.project_root)
+    starting_state = store.load()
+    record = starting_state.orders.get(args.order_id)
+    if record is None:
+        raise ValueError(f"Unknown pending order_id '{args.order_id}'.")
+    if not record.active:
+        raise ValueError(f"Pending order '{args.order_id}' is not active.")
+    adapter = _create_broker_adapter(args.broker, env_file=args.env_file)
+    if record.broker_order_id is None:
+        raise ValueError(
+            f"Pending order '{args.order_id}' does not have a broker_order_id yet."
+        )
+    update = adapter.cancel_order(record.broker_order_id)
+    notification_router = _build_notification_router(
+        project_root=config.project_root,
+        env_file=args.env_file,
+        webhook_url=getattr(args, "notification_webhook_url", None),
+        webhook_format=getattr(args, "notification_webhook_format", None),
+        minimum_severity=getattr(args, "notification_min_severity", None),
+    )
+    warnings: list[str] = []
+    if update is None:
+        occurred_at = _trade_feedback_timestamp_utc()
+        warnings.append(
+            f"Broker cancel request for '{args.order_id}' succeeded but no broker order snapshot was returned."
+        )
+        updated_state = _mark_pending_order_broker_cancel_pending(
+            starting_state,
+            order_id=args.order_id,
+            occurred_at=occurred_at,
+        )
+        lifecycle_events: tuple[Any, ...] = ()
+        matched_updates: tuple[BrokerOrderUpdate, ...] = ()
+    else:
+        reconciliation = reconcile_broker_order_updates(starting_state, (update,))
+        updated_state = reconciliation.state
+        warnings.extend(reconciliation.warnings)
+        lifecycle_events = reconciliation.lifecycle_events
+        matched_updates = reconciliation.matched_updates
+    pending_order_state_path = _save_pending_order_state_if_changed(
+        store,
+        previous_state=starting_state,
+        updated_state=updated_state,
+    )
+    feedback_events = _broker_reconciliation_feedback_events(
+        workflow="cancel-broker-order",
+        state=updated_state,
+        lifecycle_events=lifecycle_events,
+        matched_updates=matched_updates,
+    )
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=feedback_events,
+    )
+    notification_delivery = _route_notification_events(
+        notification_router,
+        _notification_events_from_trade_feedback_events(feedback_events)
+        + _notification_events_from_warning_messages(
+            workflow="cancel-broker-order",
+            created_at=_trade_feedback_timestamp_utc(),
+            warnings=warnings,
+            related_ids={"order_id": args.order_id},
+        ),
+    )
+    payload = {
+        "command": "cancel-broker-order",
+        "broker": args.broker,
+        "order_id": args.order_id,
+        "warnings": warnings,
+        "outputs": {},
+    }
+    if update is not None:
+        payload["broker_update"] = update.to_dict()
+    if pending_order_state_path is not None:
+        payload["outputs"]["pending_order_state"] = str(pending_order_state_path)
+    if trade_feedback_log_path is not None:
+        payload["outputs"]["trade_feedback_log"] = str(trade_feedback_log_path)
+    if notification_delivery is not None:
+        payload["notification_delivery"] = notification_delivery
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_replace_broker_order(args: argparse.Namespace) -> int:
+    config = load_app_config(config_dir=args.config_dir)
+    store = PendingOrderStateStore(config.project_root)
+    starting_state = store.load()
+    existing = starting_state.orders.get(args.order_id)
+    if existing is None:
+        raise ValueError(f"Unknown pending order_id '{args.order_id}'.")
+    if not existing.active:
+        raise ValueError(f"Pending order '{args.order_id}' is not active.")
+    if existing.broker_order_id is None:
+        raise ValueError(
+            f"Pending order '{args.order_id}' does not have a broker_order_id yet."
+        )
+    if args.quantity is None and args.limit_price is None and args.stop_price is None:
+        raise ValueError(
+            "At least one of --quantity, --limit-price, or --stop-price is required."
+        )
+    adapter = _create_broker_adapter(args.broker, env_file=args.env_file)
+    notification_router = _build_notification_router(
+        project_root=config.project_root,
+        env_file=args.env_file,
+        webhook_url=getattr(args, "notification_webhook_url", None),
+        webhook_format=getattr(args, "notification_webhook_format", None),
+        minimum_severity=getattr(args, "notification_min_severity", None),
+    )
+    replacement_local_order_id = _replacement_pending_order_id(
+        existing,
+        quantity=args.quantity,
+        limit_price=args.limit_price,
+        stop_price=args.stop_price,
+    )
+    replacement_update = adapter.replace_order(
+        existing.broker_order_id,
+        BrokerReplaceOrderRequest(
+            quantity=args.quantity,
+            time_in_force="DAY",
+            client_order_id=replacement_local_order_id,
+            limit_price=args.limit_price,
+            stop_price=args.stop_price,
+        ),
+    )
+    occurred_at = (
+        replacement_update.updated_at
+        or replacement_update.submitted_at
+        or _trade_feedback_timestamp_utc()
+    )
+    replacement_record = _build_replacement_pending_order_record(
+        existing,
+        local_order_id=replacement_local_order_id,
+        occurred_at=occurred_at,
+        quantity=args.quantity,
+        limit_price=args.limit_price,
+        stop_price=args.stop_price,
+    )
+    replace_result = replace_pending_order(
+        starting_state,
+        existing.order_id,
+        replacement=replacement_record,
+        occurred_at=occurred_at,
+    )
+    reconciliation = reconcile_broker_order_updates(
+        replace_result.state,
+        (replacement_update,),
+    )
+    updated_state = reconciliation.state
+    pending_order_state_path = _save_pending_order_state_if_changed(
+        store,
+        previous_state=starting_state,
+        updated_state=updated_state,
+    )
+    feedback_events = _broker_replacement_feedback_events(
+        state=updated_state,
+        replacement_update=replacement_update,
+        replacement_order_id=replacement_local_order_id,
+    )
+    trade_feedback_log_path = _append_trade_feedback_events_safe(
+        project_root=config.project_root,
+        events=feedback_events,
+    )
+    notification_delivery = _route_notification_events(
+        notification_router,
+        _notification_events_from_trade_feedback_events(feedback_events)
+        + _notification_events_from_warning_messages(
+            workflow="replace-broker-order",
+            created_at=_trade_feedback_timestamp_utc(),
+            warnings=reconciliation.warnings,
+            related_ids={
+                "order_id": args.order_id,
+                "replacement_order_id": replacement_local_order_id,
+            },
+        ),
+    )
+    payload = {
+        "command": "replace-broker-order",
+        "broker": args.broker,
+        "replaced_order_id": args.order_id,
+        "replacement_order_id": replacement_local_order_id,
+        "broker_update": replacement_update.to_dict(),
+        "warnings": list(reconciliation.warnings),
+        "outputs": {},
+    }
+    if pending_order_state_path is not None:
+        payload["outputs"]["pending_order_state"] = str(pending_order_state_path)
+    if trade_feedback_log_path is not None:
+        payload["outputs"]["trade_feedback_log"] = str(trade_feedback_log_path)
+    if notification_delivery is not None:
+        payload["notification_delivery"] = notification_delivery
     _print_structured(payload, output_format=args.format)
     return 0
 
@@ -3978,6 +4584,394 @@ def _find_active_pending_order_for_decision(
         if record.linked_decision_id == decision_id:
             return record
     return None
+
+
+def _create_broker_adapter(
+    broker_name: str,
+    *,
+    env_file: Path | None,
+) -> BrokerExecutionAdapter:
+    return create_broker_execution_adapter(
+        broker_name,
+        env_file=env_file,
+    )
+
+
+def _save_pending_order_state_if_changed(
+    store: PendingOrderStateStore,
+    *,
+    previous_state: PendingOrderState,
+    updated_state: PendingOrderState,
+) -> Path | None:
+    if updated_state == previous_state:
+        return None
+    return store.save(updated_state)
+
+
+def _mark_pending_order_broker_cancel_pending(
+    state: PendingOrderState,
+    *,
+    order_id: str,
+    occurred_at: str,
+) -> PendingOrderState:
+    record = state.orders.get(order_id)
+    if record is None:
+        raise ValueError(f"Unknown pending order_id '{order_id}'.")
+    updated_record = replace(
+        record,
+        broker_status="pending_cancel",
+        last_broker_update_at=occurred_at,
+    )
+    if updated_record == record:
+        return state
+    return upsert_pending_order_state(
+        state,
+        updated_record,
+        updated_at=occurred_at,
+    )
+
+
+def _broker_update_identity_key(update: BrokerOrderUpdate) -> tuple[str, str]:
+    return (
+        update.broker_order_id,
+        update.client_order_id or "",
+    )
+
+
+def _pending_order_matches_broker_update(
+    record: PendingOrderRecord,
+    update: BrokerOrderUpdate,
+) -> bool:
+    if record.broker_order_id is not None and record.broker_order_id == update.broker_order_id:
+        return True
+    candidate_client_order_id = record.client_order_id or record.order_id
+    if update.client_order_id is not None and candidate_client_order_id == update.client_order_id:
+        return True
+    return False
+
+
+def _select_pending_orders_for_broker_sync(
+    state: PendingOrderState,
+    *,
+    order_ids: Sequence[str] | None,
+) -> tuple[PendingOrderRecord, ...]:
+    requested_ids = {order_id.strip() for order_id in (order_ids or ()) if order_id.strip()}
+    selected = [
+        record
+        for record in state.active_orders()
+        if not requested_ids or record.order_id in requested_ids
+    ]
+    return tuple(selected)
+
+
+def _load_broker_updates_for_pending_orders(
+    adapter: BrokerExecutionAdapter,
+    orders: Sequence[PendingOrderRecord],
+    *,
+    use_open_order_scan: bool = False,
+) -> tuple[tuple[BrokerOrderUpdate, ...], tuple[str, ...]]:
+    updates_by_identity: dict[tuple[str, str], BrokerOrderUpdate] = {}
+    warnings: list[str] = []
+    broker_open_updates: tuple[BrokerOrderUpdate, ...] = ()
+    if use_open_order_scan:
+        try:
+            broker_open_updates = adapter.list_open_orders()
+        except BrokerExecutionError as exc:
+            warnings.append(f"Broker open-order scan unavailable: {exc}")
+        else:
+            for update in broker_open_updates:
+                updates_by_identity[_broker_update_identity_key(update)] = update
+    for record in orders:
+        if use_open_order_scan and any(
+            _pending_order_matches_broker_update(record, update)
+            for update in broker_open_updates
+        ):
+            continue
+        try:
+            if record.broker_order_id is not None:
+                update = adapter.get_order(record.broker_order_id)
+                updates_by_identity[_broker_update_identity_key(update)] = update
+                continue
+            client_order_id = record.client_order_id or record.order_id
+            update = adapter.get_order(client_order_id=client_order_id)
+            updates_by_identity[_broker_update_identity_key(update)] = update
+        except BrokerExecutionError as exc:
+            warnings.append(
+                f"Broker update unavailable for local pending order '{record.order_id}': {exc}"
+            )
+    return tuple(updates_by_identity.values()), tuple(warnings)
+
+
+def _replacement_pending_order_id(
+    record: PendingOrderRecord,
+    *,
+    quantity: int | None,
+    limit_price: float | None,
+    stop_price: float | None,
+) -> str:
+    identity_payload = {
+        "existing_order_id": record.order_id,
+        "quantity": quantity,
+        "limit_price": limit_price,
+        "stop_price": stop_price,
+        "broker_order_id": record.broker_order_id,
+    }
+    serialized = json.dumps(
+        identity_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    digest = hashlib.sha1(serialized.encode("utf-8")).hexdigest()[:16]
+    return f"order_{digest}"
+
+
+def _build_replacement_pending_order_record(
+    existing: PendingOrderRecord,
+    *,
+    local_order_id: str,
+    occurred_at: str,
+    quantity: int | None,
+    limit_price: float | None,
+    stop_price: float | None,
+) -> PendingOrderRecord:
+    requested_quantity = quantity if quantity is not None else existing.requested_quantity
+    if requested_quantity <= existing.filled_quantity:
+        raise ValueError(
+            "Replacement quantity must exceed the already filled quantity for the order."
+        )
+    requested_price = (
+        limit_price
+        if existing.order_type in {"LIMIT", "STOP_LIMIT"} and limit_price is not None
+        else existing.requested_price
+    )
+    resolved_entry_hint = requested_price or existing.entry_hint
+    remaining_quantity = requested_quantity - existing.filled_quantity
+    reservation_price = requested_price or existing.entry_hint or 0.0
+    return PendingOrderRecord(
+        order_id=local_order_id,
+        symbol=existing.symbol,
+        side=existing.side,
+        order_type=existing.order_type,
+        created_at=occurred_at,
+        status="pending",
+        requested_quantity=requested_quantity,
+        filled_quantity=existing.filled_quantity,
+        requested_price=requested_price,
+        entry_hint=resolved_entry_hint,
+        stop_price=stop_price if stop_price is not None else existing.stop_price,
+        reserved_notional=(
+            remaining_quantity * reservation_price
+            if existing.side == "BUY"
+            else 0.0
+        ),
+        reserved_slot=existing.side == "BUY" and remaining_quantity > 0,
+        preset_name=existing.preset_name,
+        trade_id=existing.trade_id,
+        linked_decision_id=existing.linked_decision_id,
+        sector_name=existing.sector_name,
+        industry_name=existing.industry_name,
+        client_order_id=local_order_id,
+        metadata=dict(existing.metadata),
+    )
+
+
+def _broker_submission_feedback_events(
+    *,
+    workflow: str,
+    state: PendingOrderState,
+    submitted_updates: Sequence[BrokerOrderUpdate],
+    lifecycle_events: Sequence[Any],
+) -> tuple[TradeFeedbackEvent, ...]:
+    events: list[TradeFeedbackEvent] = []
+    for update in submitted_updates:
+        record = _find_pending_order_record_for_broker_update(state, update)
+        if record is None:
+            continue
+        timestamp_utc = (
+            update.submitted_at
+            or update.updated_at
+            or record.last_broker_update_at
+            or record.created_at
+        )
+        event = _broker_trade_feedback_event(
+            event_type="broker_submitted",
+            workflow=workflow,
+            record=record,
+            timestamp_utc=timestamp_utc,
+        )
+        if event is not None:
+            events.append(event)
+    events.extend(
+        _broker_reconciliation_feedback_events(
+            workflow=workflow,
+            state=state,
+            lifecycle_events=lifecycle_events,
+            matched_updates=submitted_updates,
+        )
+    )
+    return tuple(events)
+
+
+def _broker_reconciliation_feedback_events(
+    *,
+    workflow: str,
+    state: PendingOrderState,
+    lifecycle_events: Sequence[Any],
+    matched_updates: Sequence[BrokerOrderUpdate],
+) -> tuple[TradeFeedbackEvent, ...]:
+    updates_by_order_id: dict[str, BrokerOrderUpdate] = {}
+    for update in matched_updates:
+        record = _find_pending_order_record_for_broker_update(state, update)
+        if record is not None:
+            updates_by_order_id[record.order_id] = update
+    events: list[TradeFeedbackEvent] = []
+    for lifecycle_event in lifecycle_events:
+        order_id = getattr(lifecycle_event, "order_id", None)
+        if not isinstance(order_id, str):
+            continue
+        record = state.orders.get(order_id)
+        if record is None:
+            continue
+        update = updates_by_order_id.get(order_id)
+        event_type = _broker_feedback_event_type_for_lifecycle(
+            getattr(lifecycle_event, "event_type", None)
+        )
+        if event_type is None:
+            continue
+        timestamp_utc = (
+            record.last_broker_update_at
+            or (update.updated_at if update is not None else None)
+            or (update.submitted_at if update is not None else None)
+            or getattr(lifecycle_event, "occurred_at", None)
+            or record.created_at
+        )
+        event = _broker_trade_feedback_event(
+            event_type=event_type,
+            workflow=workflow,
+            record=record,
+            timestamp_utc=timestamp_utc,
+        )
+        if event is not None:
+            events.append(event)
+    return tuple(events)
+
+
+def _broker_replacement_feedback_events(
+    *,
+    state: PendingOrderState,
+    replacement_update: BrokerOrderUpdate,
+    replacement_order_id: str,
+) -> tuple[TradeFeedbackEvent, ...]:
+    record = state.orders.get(replacement_order_id)
+    if record is None:
+        return ()
+    timestamp_utc = (
+        replacement_update.updated_at
+        or replacement_update.submitted_at
+        or record.last_broker_update_at
+        or record.created_at
+    )
+    event = _broker_trade_feedback_event(
+        event_type="broker_replaced",
+        workflow="replace-broker-order",
+        record=record,
+        timestamp_utc=timestamp_utc,
+    )
+    return (event,) if event is not None else ()
+
+
+def _find_pending_order_record_for_broker_update(
+    state: PendingOrderState,
+    update: BrokerOrderUpdate,
+) -> PendingOrderRecord | None:
+    for record in state.orders.values():
+        if record.broker_order_id == update.broker_order_id:
+            return record
+    if update.client_order_id is not None:
+        record = state.orders.get(update.client_order_id)
+        if record is not None:
+            return record
+        for existing in state.orders.values():
+            if existing.client_order_id == update.client_order_id:
+                return existing
+    return None
+
+
+def _broker_feedback_event_type_for_lifecycle(
+    lifecycle_event_type: object,
+) -> str | None:
+    if lifecycle_event_type == "filled":
+        return "executed"
+    if lifecycle_event_type == "cancelled":
+        return "broker_cancelled"
+    if lifecycle_event_type == "expired":
+        return "broker_expired"
+    if lifecycle_event_type == "replaced":
+        return "broker_replaced"
+    return None
+
+
+def _broker_trade_feedback_event(
+    *,
+    event_type: str,
+    workflow: str,
+    record: PendingOrderRecord,
+    timestamp_utc: str,
+) -> TradeFeedbackEvent | None:
+    as_of_date = _broker_event_date(timestamp_utc)
+    if as_of_date is None:
+        return None
+    quantity = record.filled_quantity if event_type == "executed" else record.requested_quantity
+    return TradeFeedbackEvent(
+        event_type=event_type,
+        workflow=workflow,
+        symbol=record.symbol,
+        as_of_date=as_of_date,
+        timestamp_utc=timestamp_utc,
+        decision_id=record.linked_decision_id,
+        trade_id=record.trade_id,
+        linked_decision_id=record.linked_decision_id,
+        preset_name=record.preset_name,
+        strategy_name=_extract_strategy_name_from_metadata(record.metadata),
+        suggested_action=record.side,
+        approved=True,
+        quantity=quantity,
+        entry_price_hint=(
+            record.average_fill_price
+            if event_type == "executed"
+            else record.requested_price or record.entry_hint
+        ),
+        stop_price=record.stop_price,
+        notional_value=(
+            quantity
+            * (
+                record.average_fill_price
+                if event_type == "executed"
+                else record.requested_price or record.entry_hint or 0.0
+            )
+            if quantity is not None
+            else None
+        ),
+        metadata={
+            "order_id": record.order_id,
+            "broker_name": record.broker_name,
+            "broker_order_id": record.broker_order_id,
+            "client_order_id": record.client_order_id,
+            "broker_status": record.broker_status,
+        },
+    )
+
+
+def _broker_event_date(timestamp_utc: str | None) -> date | None:
+    cleaned = _clean_optional_text(timestamp_utc)
+    if cleaned is None:
+        return None
+    normalized = cleaned[:-1] + "+00:00" if cleaned.endswith("Z") else cleaned
+    try:
+        return datetime.fromisoformat(normalized).date()
+    except ValueError:
+        return None
 
 
 def _candidate_trade_feedback_event(

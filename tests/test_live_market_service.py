@@ -10,6 +10,13 @@ from bot.execution.manual_executor import ManualExecutor
 from bot.ingestion.streaming import WebsocketIngestionAdapter
 from bot.ingestion.websocket_transport import JsonWebsocketTransport
 from bot.main import build_parser
+from bot.notifications import (
+    NotificationChannel,
+    NotificationDeliveryStateStore,
+    NotificationEvent,
+    NotificationRoute,
+    NotificationRouter,
+)
 from bot.orchestration.live_runner import (
     LiveMarketCycleRequest,
     LiveMarketRunner,
@@ -483,6 +490,45 @@ def test_live_market_supervisor_malformed_messages_do_not_crash_service(
     assert status.last_cycle_status == "ok"
 
 
+def test_live_market_supervisor_routes_connectivity_notifications(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc))
+    connection = FakeWebsocketConnection(
+        [
+            json.dumps(
+                {"type": "candidate_universe_refresh_batch", "as_of_date": "2024-01-05"}
+            ),
+            json.dumps({"type": "market_context_refresh_batch", "as_of_date": "2024-01-05"}),
+        ]
+    )
+    transport = JsonWebsocketTransport(
+        url="wss://example.test/live",
+        connection_factory=FakeConnectionFactory([OSError("offline"), connection]),
+    )
+    channel = RecordingNotificationChannel()
+    router = NotificationRouter(
+        routes=(NotificationRoute(channel=channel),),
+        state_store=NotificationDeliveryStateStore(tmp_path),
+    )
+    supervisor = _build_supervisor(
+        tmp_path,
+        transport=transport,
+        clock=clock,
+        flush_interval_seconds=1,
+        poll_interval_seconds=1.0,
+    )
+    supervisor.notification_router = router
+
+    status = supervisor.run(max_iterations=4)
+
+    assert status.cycle_count == 1
+    assert [event.title for event in channel.events] == [
+        "Live market service retrying",
+        "Live market connectivity recovered",
+    ]
+
+
 def test_build_parser_accepts_run_live_market_service_command() -> None:
     args = build_parser().parse_args(
         [
@@ -571,6 +617,16 @@ class FakeConnectionFactory:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class RecordingNotificationChannel(NotificationChannel):
+    channel_name = "recording"
+
+    def __init__(self) -> None:
+        self.events: list[NotificationEvent] = []
+
+    def deliver(self, event: NotificationEvent) -> None:
+        self.events.append(event)
 
 
 class FakeWebsocketConnection:
