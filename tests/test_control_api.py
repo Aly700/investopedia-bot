@@ -866,6 +866,24 @@ def test_operator_control_response_for_request_returns_control_index() -> None:
     assert payload["service"] == "investopedia-bot-operator-control-api"
 
 
+def test_operator_control_response_for_request_returns_readable_safety_state_by_default(
+    tmp_path: Path,
+) -> None:
+    service = OperatorControlService(project_root=tmp_path)
+
+    status, payload = operator_control_response_for_request(
+        control_service=service,
+        method="GET",
+        path="/control/safety",
+        body=None,
+    )
+
+    assert status == HTTPStatus.OK
+    assert payload["available"] is True
+    assert payload["data"]["control_state_readable"] is True
+    assert payload["data"]["safety_state"]["execution_submission_enabled"] is True
+
+
 def test_operator_control_response_for_request_returns_structured_safety_when_state_is_malformed(
     tmp_path: Path,
 ) -> None:

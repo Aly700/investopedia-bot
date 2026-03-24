@@ -2937,6 +2937,10 @@ def _handle_serve_operator_dashboard(args: argparse.Namespace) -> int:
                     project_root=config.project_root,
                     config=config,
                 ),
+                control_service=OperatorControlService(
+                    project_root=config.project_root,
+                    env_file=getattr(args, "env_file", None),
+                ),
                 host=args.host,
                 port=args.port,
                 refresh_interval_seconds=args.refresh_seconds,

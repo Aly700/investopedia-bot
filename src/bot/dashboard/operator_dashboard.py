@@ -1,4 +1,4 @@
-"""Static operator dashboard served alongside the internal backend API."""
+"""Static operator dashboard served alongside the internal and control APIs."""
 
 from __future__ import annotations
 
@@ -8,6 +8,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from urllib.parse import urlparse
 
+from bot.api.control_api import (
+    OperatorControlService,
+    operator_control_response_for_request,
+)
 from bot.api.internal_api import InternalApiQueryService, internal_api_response_for_path
 from bot.logging_utils import get_logger
 
@@ -41,11 +45,15 @@ class OperatorDashboardHttpServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         *,
         query_service: InternalApiQueryService,
+        control_service: OperatorControlService | None = None,
         refresh_interval_seconds: int,
     ) -> None:
         if refresh_interval_seconds <= 0:
             raise ValueError("refresh_interval_seconds must be greater than zero.")
         self.query_service = query_service
+        self.control_service = control_service or OperatorControlService(
+            project_root=query_service.project_root
+        )
         self.refresh_interval_seconds = refresh_interval_seconds
         super().__init__(server_address, OperatorDashboardRequestHandler)
 
@@ -56,9 +64,45 @@ class OperatorDashboardRequestHandler(BaseHTTPRequestHandler):
     server: OperatorDashboardHttpServer
 
     def do_GET(self) -> None:
-        response = operator_dashboard_response_for_path(
+        response = operator_dashboard_response_for_request(
             query_service=self.server.query_service,
+            control_service=self.server.control_service,
+            method="GET",
             path=self.path,
+            body=None,
+            refresh_interval_seconds=self.server.refresh_interval_seconds,
+        )
+        self._write_content(
+            status=response.status,
+            content_type=response.content_type,
+            body=response.body,
+        )
+
+    def do_POST(self) -> None:
+        content_length_header = self.headers.get("Content-Length", "0") or "0"
+        try:
+            content_length = int(content_length_header)
+        except ValueError:
+            self._write_content(
+                status=HTTPStatus.BAD_REQUEST,
+                content_type="application/json; charset=utf-8",
+                body=json.dumps(
+                    {
+                        "error": "invalid_content_length",
+                        "message": "Content-Length must be an integer.",
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ).encode("utf-8"),
+            )
+            return
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b""
+        response = operator_dashboard_response_for_request(
+            query_service=self.server.query_service,
+            control_service=self.server.control_service,
+            method="POST",
+            path=self.path,
+            body=raw_body,
             refresh_interval_seconds=self.server.refresh_interval_seconds,
         )
         self._write_content(
@@ -87,6 +131,7 @@ class OperatorDashboardRequestHandler(BaseHTTPRequestHandler):
 def create_operator_dashboard_server(
     *,
     query_service: InternalApiQueryService,
+    control_service: OperatorControlService | None = None,
     host: str = "127.0.0.1",
     port: int = 8780,
     refresh_interval_seconds: int = 5,
@@ -96,6 +141,7 @@ def create_operator_dashboard_server(
     return OperatorDashboardHttpServer(
         (host, port),
         query_service=query_service,
+        control_service=control_service,
         refresh_interval_seconds=refresh_interval_seconds,
     )
 
@@ -103,6 +149,7 @@ def create_operator_dashboard_server(
 def serve_operator_dashboard(
     *,
     query_service: InternalApiQueryService,
+    control_service: OperatorControlService | None = None,
     host: str = "127.0.0.1",
     port: int = 8780,
     refresh_interval_seconds: int = 5,
@@ -111,6 +158,7 @@ def serve_operator_dashboard(
 
     server = create_operator_dashboard_server(
         query_service=query_service,
+        control_service=control_service,
         host=host,
         port=port,
         refresh_interval_seconds=refresh_interval_seconds,
@@ -153,10 +201,32 @@ def dashboard_asset_for_path(
 def operator_dashboard_response_for_path(
     *,
     query_service: InternalApiQueryService,
+    control_service: OperatorControlService | None = None,
     path: str,
     refresh_interval_seconds: int,
 ) -> OperatorDashboardAssetResponse:
     """Return either a dashboard asset or a proxied internal API JSON payload."""
+
+    return operator_dashboard_response_for_request(
+        query_service=query_service,
+        control_service=control_service,
+        method="GET",
+        path=path,
+        body=None,
+        refresh_interval_seconds=refresh_interval_seconds,
+    )
+
+
+def operator_dashboard_response_for_request(
+    *,
+    query_service: InternalApiQueryService,
+    control_service: OperatorControlService | None = None,
+    method: str,
+    path: str,
+    body: bytes | None,
+    refresh_interval_seconds: int,
+) -> OperatorDashboardAssetResponse:
+    """Return a dashboard asset or proxied API/control JSON payload."""
 
     asset = dashboard_asset_for_path(
         path=path,
@@ -164,10 +234,27 @@ def operator_dashboard_response_for_path(
     )
     if asset is not None:
         return asset
-    status, payload = internal_api_response_for_path(
-        query_service=query_service,
-        path=path,
-    )
+    normalized_path = urlparse(path).path.rstrip("/") or "/"
+    if normalized_path == "/control" or normalized_path.startswith("/control/"):
+        status, payload = operator_control_response_for_request(
+            control_service=control_service
+            or OperatorControlService(project_root=query_service.project_root),
+            method=method,
+            path=path,
+            body=body,
+        )
+    else:
+        if method != "GET":
+            status, payload = HTTPStatus.METHOD_NOT_ALLOWED, {
+                "error": "method_not_allowed",
+                "method": method,
+                "allowed_methods": ["GET"],
+            }
+        else:
+            status, payload = internal_api_response_for_path(
+                query_service=query_service,
+                path=path,
+            )
     return OperatorDashboardAssetResponse(
         status=status,
         content_type="application/json; charset=utf-8",
@@ -196,7 +283,7 @@ def _dashboard_html(refresh_interval_seconds: int) -> str:
           <p class="eyebrow">Investopedia Bot</p>
           <h1>Operator Dashboard</h1>
           <p class="hero-lede">
-            Read-only live view over the internal backend API.
+            Live operator console over the internal backend and control APIs.
             Polling every <span id="refresh-interval-label">{refresh_interval_seconds}s</span>.
           </p>
         </div>
@@ -220,6 +307,8 @@ def _dashboard_html(refresh_interval_seconds: int) -> str:
           <strong id="fetch-status-value">Idle</strong>
         </div>
       </section>
+
+      <section class="feedback-strip" id="control-feedback" hidden></section>
 
       <main class="panel-grid">
         <section class="panel panel-wide">
@@ -425,6 +514,10 @@ body {
   backdrop-filter: blur(12px);
 }
 
+.feedback-strip {
+  margin-top: 14px;
+}
+
 .overview-item {
   border-radius: 20px;
   padding: 16px 18px;
@@ -471,6 +564,99 @@ body {
 
 .panel-body {
   margin-top: 18px;
+}
+
+.control-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.action-button {
+  appearance: none;
+  border: none;
+  border-radius: 999px;
+  padding: 10px 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 120ms ease, opacity 120ms ease;
+}
+
+.action-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.56;
+}
+
+.action-button.good {
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+.action-button.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.action-button.bad {
+  background: var(--bad-soft);
+  color: var(--bad);
+}
+
+.action-button.neutral {
+  background: var(--neutral-soft);
+  color: var(--neutral);
+}
+
+.action-cluster {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.inline-form {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: 18px;
+  background: rgba(255, 249, 241, 0.92);
+  border: 1px solid rgba(29, 38, 36, 0.1);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.field-block label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.field-block input {
+  width: 100%;
+  border: 1px solid rgba(29, 38, 36, 0.14);
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.88);
+  color: var(--ink);
+  font: inherit;
+}
+
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
 }
 
 .is-loading {
@@ -647,6 +833,10 @@ code {
     grid-template-columns: 1fr;
   }
 
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
   .panel-wide {
     grid-column: span 1;
   }
@@ -669,7 +859,17 @@ const ENDPOINTS = {
   pendingOrders: "/pending-orders",
   portfolio: "/portfolio",
   analytics: "/analytics/trade-review",
+  controlSafety: "/control/safety",
 };
+const CONTROL_ENDPOINTS = {
+  pauseExecution: "/control/execution/pause",
+  resumeExecution: "/control/execution/resume",
+  submitOrder: "/control/orders/submit",
+  cancelOrder: "/control/orders/cancel",
+  replaceOrder: "/control/orders/replace",
+  forceBrokerSync: "/control/broker/sync",
+};
+const DEFAULT_CONTROL_BROKER = "alpaca";
 
 const els = {
   refreshButton: document.getElementById("refresh-button"),
@@ -677,6 +877,7 @@ const els = {
   lastRefreshValue: document.getElementById("last-refresh-value"),
   fetchStatusValue: document.getElementById("fetch-status-value"),
   connectionPill: document.getElementById("connection-pill"),
+  controlFeedback: document.getElementById("control-feedback"),
   serviceHealthBody: document.getElementById("service-health-body"),
   marketStateBody: document.getElementById("market-state-body"),
   portfolioStateBody: document.getElementById("portfolio-state-body"),
@@ -687,7 +888,13 @@ const els = {
 
 const state = {
   loading: false,
+  loadPromise: null,
+  pendingRefresh: false,
   lastRefreshAt: null,
+  currentResults: null,
+  actionInFlight: false,
+  lastControlResult: null,
+  replaceEditorOrderId: null,
 };
 
 function escapeHtml(value) {
@@ -705,6 +912,10 @@ function asObject(value) {
 
 function asArray(value) {
   return Array.isArray(value) ? value : [];
+}
+
+function isRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
 }
 
 function formatDateTime(value) {
@@ -730,6 +941,10 @@ function formatRatioPercent(value) {
 
 function formatOptionalCount(value) {
   return typeof value === "number" ? formatNumber(value) : "Unavailable";
+}
+
+function formatControlStatus(value) {
+  return value ? String(value).replace(/_/g, " ") : "n/a";
 }
 
 function describeCandidateActionability(item) {
@@ -762,6 +977,22 @@ function renderMetricGrid(items) {
         .join("")}
     </div>
   `;
+}
+
+function renderActionButton({ label, tone = "neutral", action, orderId = null, disabled = false }) {
+  const parts = [
+    `class="action-button ${tone}"`,
+    'type="button"',
+    `data-control-action="${escapeHtml(action)}"`,
+  ];
+  if (orderId) {
+    parts.push(`data-order-id="${escapeHtml(orderId)}"`);
+  }
+  if (disabled) {
+    parts.push("disabled");
+    parts.push('aria-disabled="true"');
+  }
+  return `<button ${parts.join(" ")}>${escapeHtml(label)}</button>`;
 }
 
 function renderChipRow(items, tone = "neutral") {
@@ -800,6 +1031,110 @@ function renderNotes(messages, tone = "neutral") {
     .filter(Boolean)
     .map((message) => `<div class="note ${tone}">${escapeHtml(message)}</div>`)
     .join("");
+}
+
+function controlSafetySnapshot(result) {
+  const fallback = {
+    available: false,
+    readable: false,
+    executionEnabled: null,
+    executionMode: "unknown",
+    pausedReason: null,
+    warnings: [],
+    fetchError: result && !result.ok ? result.error : null,
+    payload: {},
+  };
+  if (!result || !result.ok) {
+    return fallback;
+  }
+  const payload = asObject(result.payload);
+  const data = asObject(payload.data);
+  const safetyState = asObject(data.safety_state);
+  return {
+    available: payload.available === true,
+    readable: data.control_state_readable !== false,
+    executionEnabled:
+      typeof safetyState.execution_submission_enabled === "boolean"
+        ? safetyState.execution_submission_enabled
+        : null,
+    executionMode: safetyState.execution_mode || "unknown",
+    pausedReason: safetyState.paused_reason || null,
+    warnings: asArray(payload.warnings),
+    fetchError: payload.available ? null : payload.not_available_reason || "control_safety_unavailable",
+    payload,
+  };
+}
+
+function resolveControlBroker(order = null) {
+  if (isRecord(order) && typeof order.broker_name === "string" && order.broker_name.trim()) {
+    return order.broker_name.trim().toLowerCase();
+  }
+  const pendingPayload =
+    state.currentResults && state.currentResults.pendingOrders
+      ? asObject(state.currentResults.pendingOrders.payload)
+      : {};
+  const pendingData = asObject(pendingPayload.data);
+  const activeOrders = asArray(pendingData.active_orders);
+  const brokerOrder = activeOrders.find(
+    (item) => typeof item.broker_name === "string" && item.broker_name.trim()
+  );
+  if (brokerOrder) {
+    return brokerOrder.broker_name.trim().toLowerCase();
+  }
+  return DEFAULT_CONTROL_BROKER;
+}
+
+function renderControlFeedback() {
+  const element = els.controlFeedback;
+  const result = state.lastControlResult;
+  if (!result) {
+    element.hidden = true;
+    element.innerHTML = "";
+    return;
+  }
+
+  const payload = asObject(result.payload);
+  const warnings = asArray(payload.warnings);
+  let tone = "neutral";
+  let primaryMessage = result.error || payload.message || payload.error || "Operator action completed.";
+  const extraNotes = [];
+
+  if (payload.status === "completed") {
+    tone = "good";
+  } else if (payload.status === "needs_confirmation") {
+    tone = "warn";
+    if (payload.data && payload.data.transitional_state) {
+      extraNotes.push(
+        `Broker state is ${payload.data.transitional_state}. Reservation remains active until broker confirmation arrives.`
+      );
+    }
+    if (payload.data && payload.data.reservation_active === true) {
+      extraNotes.push("The order still reserves execution capacity while broker confirmation is pending.");
+    }
+  } else if (payload.status === "no_op") {
+    tone = "neutral";
+  } else if (payload.status === "rejected" || payload.status === "failed" || payload.error) {
+    tone = "bad";
+  } else if (!result.ok) {
+    tone = "bad";
+  }
+
+  if (payload.error_code === "control_state_unavailable") {
+    extraNotes.push(
+      "Operator control state is unreadable, so mutating actions are blocked until the backend state is repaired."
+    );
+  }
+
+  element.hidden = false;
+  element.innerHTML = `
+    <div class="note ${tone}">
+      <strong>${escapeHtml(payload.command_name || "Operator action")}</strong>
+      <div class="detail-line">${escapeHtml(primaryMessage)}</div>
+      ${payload.status ? `<div class="detail-line">Result: ${escapeHtml(formatControlStatus(payload.status))}</div>` : ""}
+    </div>
+    ${renderNotes(extraNotes, tone === "bad" ? "bad" : "warn")}
+    ${renderNotes(warnings, warnings.length ? "warn" : "neutral")}
+  `;
 }
 
 function setPanelUnavailable(element, label, reason) {
@@ -844,38 +1179,105 @@ async function fetchEndpoint(path) {
   }
 }
 
-function renderHealth(result) {
+async function postControlCommand(path, payload) {
+  try {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      cache: "no-store",
+      body: JSON.stringify(payload || {}),
+    });
+    const text = await response.text();
+    let parsedPayload = {};
+    if (text) {
+      try {
+        parsedPayload = JSON.parse(text);
+      } catch (error) {
+        return {
+          ok: false,
+          statusCode: response.status,
+          error: `Invalid JSON from ${path}: ${error.message}`,
+        };
+      }
+    }
+    return {
+      ok: response.ok,
+      statusCode: response.status,
+      payload: asObject(parsedPayload),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Control request failed for ${path}: ${error.message}`,
+    };
+  }
+}
+
+function renderHealth(result, controlResult) {
   const element = els.serviceHealthBody;
   element.classList.remove("is-loading");
-  if (!result.ok) {
-    setPanelUnavailable(element, "Health endpoint unavailable", result.error);
-    els.connectionPill.className = "pill bad";
-    els.connectionPill.textContent = "API error";
-    return;
-  }
-
-  const payload = asObject(result.payload);
-  if (!payload.available) {
-    setPanelUnavailable(
-      element,
-      "Health data unavailable",
-      payload.not_available_reason || "Live service status has not been written yet."
-    );
-    els.connectionPill.className = "pill neutral";
-    els.connectionPill.textContent = "No status";
-    return;
-  }
-
-  const data = asObject(payload.data);
-  const status = asObject(data.status);
-  const serviceState = status.service_state || "unknown";
-  els.connectionPill.className = `pill ${toneForStatus(serviceState)}`;
-  els.connectionPill.textContent = serviceState.replace(/_/g, " ");
-
+  const control = controlSafetySnapshot(controlResult);
+  let payload = {};
+  let data = {};
+  let status = {};
+  let serviceState = "unknown";
   const warningNotes = [];
   const errorNotes = [];
+
+  if (!result.ok) {
+    errorNotes.push(result.error || "Health endpoint unavailable.");
+    els.connectionPill.className = "pill bad";
+    els.connectionPill.textContent = "API error";
+  } else {
+    payload = asObject(result.payload);
+    if (!payload.available) {
+      warningNotes.push(
+        payload.not_available_reason || "Live service status has not been written yet."
+      );
+      els.connectionPill.className = "pill neutral";
+      els.connectionPill.textContent = "No status";
+    } else {
+      data = asObject(payload.data);
+      status = asObject(data.status);
+      serviceState = status.service_state || "unknown";
+      els.connectionPill.className = `pill ${toneForStatus(serviceState)}`;
+      els.connectionPill.textContent = serviceState.replace(/_/g, " ");
+    }
+  }
+
   if (status.last_warning) warningNotes.push(status.last_warning);
   if (status.last_error) errorNotes.push(status.last_error);
+  if (!control.available) {
+    warningNotes.push(control.fetchError || "Control safety endpoint unavailable.");
+  } else {
+    warningNotes.push(...control.warnings);
+    if (!control.readable) {
+      errorNotes.push(
+        "Operator control state is unreadable. Mutating actions are blocked until backend state is repaired."
+      );
+    } else if (control.executionEnabled === false) {
+      warningNotes.push(
+        control.pausedReason
+          ? `Execution submissions paused: ${control.pausedReason}`
+          : "Execution submissions are paused."
+      );
+    }
+  }
+
+  const pauseDisabled =
+    state.actionInFlight ||
+    !control.available ||
+    !control.readable ||
+    control.executionEnabled !== true;
+  const resumeDisabled =
+    state.actionInFlight ||
+    !control.available ||
+    !control.readable ||
+    control.executionEnabled !== false;
+  const syncDisabled = state.actionInFlight || !control.available || !control.readable;
 
   element.innerHTML = `
     ${renderMetricGrid([
@@ -887,9 +1289,34 @@ function renderHealth(result) {
       ["Last cycle warnings", formatNumber(status.last_cycle_warning_count)],
       ["Last message", formatDateTime(status.last_message_at_utc)],
       ["Last successful cycle", formatDateTime(status.last_successful_flush_at_utc)],
+      ["Execution submissions", control.executionEnabled === null ? "Unavailable" : control.executionEnabled ? "Enabled" : "Paused"],
+      ["Execution mode", formatControlStatus(control.executionMode)],
     ])}
     ${renderNotes(errorNotes, "bad")}
     ${renderNotes(warningNotes, warningNotes.length ? "warn" : "neutral")}
+    <div class="detail-stack">
+      <div class="detail-line"><strong>Execution controls</strong></div>
+      <div class="control-toolbar">
+        ${renderActionButton({
+          label: "Pause submissions",
+          tone: "warn",
+          action: "pause-execution",
+          disabled: pauseDisabled,
+        })}
+        ${renderActionButton({
+          label: "Resume submissions",
+          tone: "good",
+          action: "resume-execution",
+          disabled: resumeDisabled,
+        })}
+        ${renderActionButton({
+          label: "Force broker sync",
+          tone: "neutral",
+          action: "force-broker-sync",
+          disabled: syncDisabled,
+        })}
+      </div>
+    </div>
   `;
 }
 
@@ -998,7 +1425,98 @@ function renderPortfolio(result) {
   `;
 }
 
-function renderPendingOrders(result) {
+function renderPendingOrderActions(order, control) {
+  const isActiveOrder = order.status === "pending" || order.status === "partially_filled";
+  const controlBlocked = !control.available || !control.readable;
+  const submitDisabled =
+    state.actionInFlight ||
+    controlBlocked ||
+    control.executionEnabled !== true ||
+    !isActiveOrder ||
+    Boolean(order.broker_order_id);
+  const cancelDisabled =
+    state.actionInFlight ||
+    controlBlocked ||
+    !isActiveOrder ||
+    !order.broker_order_id ||
+    order.broker_status === "pending_cancel";
+  const replaceDisabled =
+    state.actionInFlight ||
+    controlBlocked ||
+    !isActiveOrder ||
+    !order.broker_order_id ||
+    order.broker_status === "pending_cancel";
+  return `
+    <div class="action-cluster">
+      ${renderActionButton({
+        label: "Submit",
+        tone: "good",
+        action: "submit-order",
+        orderId: order.order_id,
+        disabled: submitDisabled,
+      })}
+      ${renderActionButton({
+        label: "Cancel",
+        tone: "bad",
+        action: "cancel-order",
+        orderId: order.order_id,
+        disabled: cancelDisabled,
+      })}
+      ${renderActionButton({
+        label: state.replaceEditorOrderId === order.order_id ? "Editing…" : "Replace",
+        tone: "warn",
+        action: "open-replace-editor",
+        orderId: order.order_id,
+        disabled: replaceDisabled,
+      })}
+    </div>
+  `;
+}
+
+function renderReplaceEditor(order) {
+  return `
+    <div class="inline-form">
+      <div class="detail-line">
+        <strong>Replace ${escapeHtml(order.symbol || order.order_id || "order")}</strong>
+      </div>
+      <div class="detail-line">
+        Only changed fields will be sent to the backend replacement request.
+      </div>
+      <div class="form-grid">
+        <div class="field-block">
+          <label for="replace-quantity">Quantity</label>
+          <input id="replace-quantity" type="number" min="1" step="1" value="${escapeHtml(order.requested_quantity || "")}" />
+        </div>
+        <div class="field-block">
+          <label for="replace-limit-price">Limit price</label>
+          <input id="replace-limit-price" type="number" min="0.01" step="0.01" value="${escapeHtml(order.requested_price || "")}" />
+        </div>
+        <div class="field-block">
+          <label for="replace-stop-price">Stop price</label>
+          <input id="replace-stop-price" type="number" min="0.01" step="0.01" value="${escapeHtml(order.stop_price || "")}" />
+        </div>
+      </div>
+      <div class="form-actions">
+        ${renderActionButton({
+          label: "Submit replacement",
+          tone: "warn",
+          action: "submit-replace-order",
+          orderId: order.order_id,
+          disabled: state.actionInFlight,
+        })}
+        ${renderActionButton({
+          label: "Dismiss",
+          tone: "neutral",
+          action: "dismiss-replace-editor",
+          orderId: order.order_id,
+          disabled: state.actionInFlight,
+        })}
+      </div>
+    </div>
+  `;
+}
+
+function renderPendingOrders(result, controlResult) {
   const element = els.pendingOrdersBody;
   element.classList.remove("is-loading");
   if (!result.ok) {
@@ -1011,6 +1529,24 @@ function renderPendingOrders(result) {
   const data = asObject(payload.data);
   const summary = asObject(data.summary);
   const activeOrders = asArray(data.active_orders);
+  const control = controlSafetySnapshot(controlResult);
+  const controlNotes = [];
+  if (!control.available) {
+    controlNotes.push("Control API state is unavailable. Order actions are disabled.");
+  } else if (!control.readable) {
+    controlNotes.push("Operator control state is unreadable. Mutating actions are blocked.");
+  } else if (control.executionEnabled === false) {
+    controlNotes.push("Execution submissions are paused. Submit actions are disabled.");
+  }
+  let replaceOrder = activeOrders.find((order) => order.order_id === state.replaceEditorOrderId) || null;
+  const replaceEditorBlocked =
+    !control.available ||
+    !control.readable ||
+    (replaceOrder && replaceOrder.broker_status === "pending_cancel");
+  if ((!replaceOrder || replaceEditorBlocked) && state.replaceEditorOrderId) {
+    state.replaceEditorOrderId = null;
+    replaceOrder = null;
+  }
 
   element.innerHTML = `
     ${renderMetricGrid([
@@ -1025,6 +1561,7 @@ function renderPendingOrders(result) {
       [warnings[0] || "Live position context is unavailable. Capacity figures are partial."],
       "bad"
     )}
+    ${renderNotes(controlNotes, controlNotes.length ? "warn" : "neutral")}
     <div class="table-wrap">
       ${
         activeOrders.length
@@ -1035,8 +1572,10 @@ function renderPendingOrders(result) {
                   <th>Symbol</th>
                   <th>Side</th>
                   <th>Status</th>
+                  <th>Broker</th>
                   <th>Preset</th>
                   <th>Reserved</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -1046,9 +1585,11 @@ function renderPendingOrders(result) {
                       <tr>
                         <td><strong>${escapeHtml(order.symbol || "n/a")}</strong></td>
                         <td>${escapeHtml(order.side || "n/a")}</td>
-                        <td>${escapeHtml(order.status || "n/a")}</td>
+                        <td>${escapeHtml(order.broker_status || order.status || "n/a")}</td>
+                        <td>${escapeHtml(order.broker_name || "local")}</td>
                         <td>${escapeHtml(order.preset_name || "n/a")}</td>
                         <td>${formatCurrency(order.reserved_notional)}</td>
+                        <td>${renderPendingOrderActions(order, control)}</td>
                       </tr>
                     `
                   )
@@ -1059,6 +1600,7 @@ function renderPendingOrders(result) {
           : '<div class="empty-row">No active pending orders.</div>'
       }
     </div>
+    ${replaceOrder ? renderReplaceEditor(replaceOrder) : ""}
   `;
 }
 
@@ -1157,46 +1699,250 @@ function renderAnalytics(result) {
 }
 
 function renderDashboard(results) {
-  renderHealth(results.health);
+  renderControlFeedback();
+  renderHealth(results.health, results.controlSafety);
   renderMarketState(results.marketState, results.marketTransitions);
   renderPortfolio(results.portfolio);
-  renderPendingOrders(results.pendingOrders);
+  renderPendingOrders(results.pendingOrders, results.controlSafety);
   renderCandidateQueue(results.marketState);
   renderAnalytics(results.analytics);
 }
 
+function renderCurrentDashboard() {
+  if (state.currentResults) {
+    renderDashboard(state.currentResults);
+  } else {
+    renderControlFeedback();
+  }
+}
+
 async function loadDashboard({ manual = false } = {}) {
-  if (state.loading) return;
+  if (state.loading) {
+    state.pendingRefresh = true;
+    return state.loadPromise || Promise.resolve();
+  }
   state.loading = true;
-  els.fetchStatusValue.textContent = manual ? "Manual refresh..." : "Refreshing...";
-  const [health, marketState, marketTransitions, pendingOrders, portfolio, analytics] = await Promise.all([
-    fetchEndpoint(ENDPOINTS.health),
-    fetchEndpoint(ENDPOINTS.marketState),
-    fetchEndpoint(ENDPOINTS.marketTransitions),
-    fetchEndpoint(ENDPOINTS.pendingOrders),
-    fetchEndpoint(ENDPOINTS.portfolio),
-    fetchEndpoint(ENDPOINTS.analytics),
-  ]);
-  renderDashboard({
-    health,
-    marketState,
-    marketTransitions,
-    pendingOrders,
-    portfolio,
-    analytics,
-  });
-  state.lastRefreshAt = new Date();
-  els.lastRefreshValue.textContent = state.lastRefreshAt.toLocaleTimeString();
-  const failedCount = [health, marketState, marketTransitions, pendingOrders, portfolio, analytics].filter(
-    (result) => !result.ok
-  ).length;
-  els.fetchStatusValue.textContent = failedCount ? `${failedCount} fetch issue(s)` : "Fresh";
-  state.loading = false;
+  const currentLoadPromise = (async () => {
+    let loadError = null;
+    try {
+      els.fetchStatusValue.textContent = manual ? "Manual refresh..." : "Refreshing...";
+      const [health, marketState, marketTransitions, pendingOrders, portfolio, analytics, controlSafety] = await Promise.all([
+        fetchEndpoint(ENDPOINTS.health),
+        fetchEndpoint(ENDPOINTS.marketState),
+        fetchEndpoint(ENDPOINTS.marketTransitions),
+        fetchEndpoint(ENDPOINTS.pendingOrders),
+        fetchEndpoint(ENDPOINTS.portfolio),
+        fetchEndpoint(ENDPOINTS.analytics),
+        fetchEndpoint(ENDPOINTS.controlSafety),
+      ]);
+      state.currentResults = {
+        health,
+        marketState,
+        marketTransitions,
+        pendingOrders,
+        portfolio,
+        analytics,
+        controlSafety,
+      };
+      renderDashboard(state.currentResults);
+      state.lastRefreshAt = new Date();
+      els.lastRefreshValue.textContent = state.lastRefreshAt.toLocaleTimeString();
+      const failedCount = [health, marketState, marketTransitions, pendingOrders, portfolio, analytics, controlSafety].filter(
+        (result) => !result.ok
+      ).length;
+      els.fetchStatusValue.textContent = failedCount ? `${failedCount} fetch issue(s)` : "Fresh";
+    } catch (error) {
+      loadError = error;
+    } finally {
+      state.loading = false;
+    }
+    const shouldRefreshAgain = state.pendingRefresh;
+    state.pendingRefresh = false;
+    if (shouldRefreshAgain) {
+      await loadDashboard({ manual: true });
+    }
+    if (loadError) {
+      throw loadError;
+    }
+  })();
+  state.loadPromise = currentLoadPromise;
+  try {
+    await currentLoadPromise;
+  } finally {
+    if (state.loadPromise === currentLoadPromise) {
+      state.loadPromise = null;
+    }
+  }
+}
+
+function parseOptionalNumberInput(id, label) {
+  const input = document.getElementById(id);
+  if (!input) {
+    return { present: false };
+  }
+  const rawValue = input.value.trim();
+  if (!rawValue) {
+    return { present: false };
+  }
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return { error: `${label} must be a positive number.` };
+  }
+  return { present: true, value: parsed };
+}
+
+function setLocalControlError(message, commandName) {
+  state.lastControlResult = {
+    ok: false,
+    payload: {
+      command_name: commandName,
+      status: "rejected",
+      message,
+      warnings: [],
+    },
+  };
+  renderControlFeedback();
+}
+
+async function executeControlAction(path, payload) {
+  if (state.actionInFlight) {
+    return;
+  }
+  state.actionInFlight = true;
+  renderCurrentDashboard();
+  els.fetchStatusValue.textContent = "Applying operator action...";
+  try {
+    const result = await postControlCommand(path, payload);
+    state.lastControlResult = result;
+    await loadDashboard({ manual: true });
+  } finally {
+    state.actionInFlight = false;
+    renderCurrentDashboard();
+  }
+}
+
+async function handleControlAction(action, orderId) {
+  if (action === "pause-execution") {
+    await executeControlAction(CONTROL_ENDPOINTS.pauseExecution, {});
+    return;
+  }
+  if (action === "resume-execution") {
+    await executeControlAction(CONTROL_ENDPOINTS.resumeExecution, {});
+    return;
+  }
+  if (action === "force-broker-sync") {
+    await executeControlAction(CONTROL_ENDPOINTS.forceBrokerSync, {
+      broker: resolveControlBroker(),
+    });
+    return;
+  }
+
+  const pendingPayload =
+    state.currentResults && state.currentResults.pendingOrders
+      ? asObject(state.currentResults.pendingOrders.payload)
+      : {};
+  const pendingData = asObject(pendingPayload.data);
+  const activeOrders = asArray(pendingData.active_orders);
+  const order = activeOrders.find((item) => item.order_id === orderId);
+  if (!order) {
+    setLocalControlError(`Pending order '${orderId}' is no longer present in the dashboard state.`, action);
+    return;
+  }
+
+  if (action === "submit-order") {
+    if (!window.confirm(`Submit pending order ${order.order_id} for ${order.symbol}?`)) {
+      return;
+    }
+    await executeControlAction(CONTROL_ENDPOINTS.submitOrder, {
+      broker: resolveControlBroker(order),
+      order_id: order.order_id,
+    });
+    return;
+  }
+
+  if (action === "cancel-order") {
+    if (!window.confirm(`Cancel broker order for ${order.order_id} (${order.symbol})?`)) {
+      return;
+    }
+    await executeControlAction(CONTROL_ENDPOINTS.cancelOrder, {
+      broker: resolveControlBroker(order),
+      order_id: order.order_id,
+    });
+    return;
+  }
+
+  if (action === "open-replace-editor") {
+    state.replaceEditorOrderId = order.order_id;
+    renderCurrentDashboard();
+    return;
+  }
+
+  if (action === "dismiss-replace-editor") {
+    state.replaceEditorOrderId = null;
+    renderCurrentDashboard();
+    return;
+  }
+
+  if (action === "submit-replace-order") {
+    const quantityInput = parseOptionalNumberInput("replace-quantity", "Quantity");
+    const limitInput = parseOptionalNumberInput("replace-limit-price", "Limit price");
+    const stopInput = parseOptionalNumberInput("replace-stop-price", "Stop price");
+    const inputError = quantityInput.error || limitInput.error || stopInput.error;
+    if (inputError) {
+      setLocalControlError(inputError, "replace_pending_order");
+      return;
+    }
+    const payload = {
+      broker: resolveControlBroker(order),
+      order_id: order.order_id,
+    };
+    const existingQuantity =
+      typeof order.requested_quantity === "number" ? Math.round(order.requested_quantity) : null;
+    const existingLimitPrice =
+      typeof order.requested_price === "number" ? order.requested_price : null;
+    const existingStopPrice =
+      typeof order.stop_price === "number" ? order.stop_price : null;
+    if (
+      quantityInput.present &&
+      (existingQuantity === null || Math.round(quantityInput.value) !== existingQuantity)
+    ) {
+      payload.quantity = Math.round(quantityInput.value);
+    }
+    if (
+      limitInput.present &&
+      (existingLimitPrice === null || limitInput.value !== existingLimitPrice)
+    ) {
+      payload.limit_price = limitInput.value;
+    }
+    if (
+      stopInput.present &&
+      (existingStopPrice === null || stopInput.value !== existingStopPrice)
+    ) {
+      payload.stop_price = stopInput.value;
+    }
+    if (!("quantity" in payload) && !("limit_price" in payload) && !("stop_price" in payload)) {
+      setLocalControlError(
+        "Change at least one replacement field before submitting the order amendment.",
+        "replace_pending_order"
+      );
+      return;
+    }
+    state.replaceEditorOrderId = null;
+    await executeControlAction(CONTROL_ENDPOINTS.replaceOrder, payload);
+  }
 }
 
 els.refreshIntervalLabel.textContent = `${REFRESH_INTERVAL_SECONDS}s`;
 els.refreshButton.addEventListener("click", () => {
   loadDashboard({ manual: true });
+});
+document.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-control-action]");
+  if (!button || button.disabled) {
+    return;
+  }
+  event.preventDefault();
+  void handleControlAction(button.dataset.controlAction, button.dataset.orderId || null);
 });
 
 loadDashboard();
