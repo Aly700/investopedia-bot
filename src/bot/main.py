@@ -254,12 +254,23 @@ from bot.service.live_market_service import (
     LiveMarketSupervisor,
     ReconnectBackoffPolicy,
 )
+from bot.service.local_staging_runtime import (
+    LocalStagingRuntimeConfig,
+    create_local_staging_runtime,
+)
 
 
 LOGGER = get_logger(__name__)
 
 _POSITION_TRAJECTORY_OBSERVATION_METADATA_KEY = "_position_trajectory_observation"
 _TRADE_OUTCOME_SNAPSHOT_METADATA_KEY = "_trade_outcome_snapshot"
+
+
+@dataclass
+class _LiveMarketServiceBundle:
+    supervisor: LiveMarketSupervisor
+    latest_outputs: dict[str, str]
+    notification_router: NotificationRouter | None
 
 
 def _configured_provider_name(config: object) -> str | None:
@@ -458,6 +469,174 @@ def _persist_market_state(
         update_result=update_result,
         output_paths=outputs,
     )
+
+
+def _add_live_market_service_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    output_dir_help: str,
+) -> None:
+    parser.add_argument(
+        "candidate_path",
+        type=Path,
+        help="Path to a text or CSV file containing candidate symbols.",
+    )
+    parser.add_argument(
+        "--websocket-url",
+        required=True,
+        help="Websocket endpoint used for live market updates.",
+    )
+    parser.add_argument(
+        "--subscription-message",
+        action="append",
+        default=None,
+        type=_parse_json_message,
+        help="Optional JSON websocket subscription message. Repeat to send multiple subscriptions.",
+    )
+    parser.add_argument(
+        "--transport-name",
+        default="json-websocket",
+        help="Label for the live websocket transport.",
+    )
+    parser.add_argument(
+        "--portfolio-file",
+        type=Path,
+        default=None,
+        help="Optional CSV or JSON portfolio snapshot to include in the live cycle.",
+    )
+    parser.add_argument(
+        "--include-intraday-review",
+        action="store_true",
+        help="Include intraday portfolio review cycles when a portfolio file is provided.",
+    )
+    parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Trading session date used for the live cycle.",
+    )
+    parser.add_argument(
+        "--preset-names",
+        default=None,
+        help="Comma-separated preset names to evaluate for buy candidates.",
+    )
+    parser.add_argument(
+        "--comparison-results",
+        type=Path,
+        default=None,
+        help="Optional ranked preset output from compare-strategies.",
+    )
+    parser.add_argument(
+        "--equity",
+        type=float,
+        default=None,
+        help="Current account equity used for position sizing. Defaults to config starting_cash.",
+    )
+    parser.add_argument(
+        "--current-drawdown",
+        type=float,
+        default=0.0,
+        help="Current portfolio drawdown as a decimal fraction for drawdown-aware risk reduction.",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=20,
+        help="Lookback window used for universe liquidity screening.",
+    )
+    parser.add_argument(
+        "--benchmark-symbol",
+        default=None,
+        help="Optional benchmark override for the regime filter.",
+    )
+    parser.add_argument(
+        "--require-relative-volume",
+        action="store_true",
+        help="Require relative-volume confirmation for breakout entries.",
+    )
+    parser.add_argument(
+        "--disable-regime-filter",
+        action="store_true",
+        help="Disable the benchmark-based regime filter.",
+    )
+    parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        default=15,
+        help="Intraday aggregate interval in minutes when intraday review is enabled.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=output_dir_help,
+    )
+    parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="Bypass local cache and force provider fetches.",
+    )
+    parser.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=1.0,
+        help="Base supervisor sleep interval between live loop iterations.",
+    )
+    parser.add_argument(
+        "--flush-interval-seconds",
+        type=int,
+        default=5,
+        help="Streaming buffer flush interval in seconds.",
+    )
+    parser.add_argument(
+        "--stale-after-seconds",
+        type=float,
+        default=30.0,
+        help="Mark the service stale when no messages arrive within this many seconds.",
+    )
+    parser.add_argument(
+        "--receive-timeout-seconds",
+        type=float,
+        default=0.25,
+        help="Per-read websocket timeout for the concrete transport.",
+    )
+    parser.add_argument(
+        "--max-messages-per-poll",
+        type=int,
+        default=100,
+        help="Maximum websocket messages to process in one supervisor iteration.",
+    )
+    parser.add_argument(
+        "--initial-reconnect-delay-seconds",
+        type=float,
+        default=1.0,
+        help="Initial reconnect backoff in seconds.",
+    )
+    parser.add_argument(
+        "--max-reconnect-delay-seconds",
+        type=float,
+        default=30.0,
+        help="Maximum reconnect backoff in seconds.",
+    )
+    parser.add_argument(
+        "--reconnect-backoff-multiplier",
+        type=float,
+        default=2.0,
+        help="Reconnect backoff multiplier.",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="Optional maximum supervisor iterations before exiting.",
+    )
+    _add_notification_arguments(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -968,168 +1147,104 @@ def build_parser() -> argparse.ArgumentParser:
         "run-live-market-service",
         help="Run the long-lived websocket-driven live market supervisor.",
     )
-    run_live_market_service_parser.add_argument(
-        "candidate_path",
-        type=Path,
-        help="Path to a text or CSV file containing candidate symbols.",
+    _add_live_market_service_arguments(
+        run_live_market_service_parser,
+        output_dir_help="Optional directory for live report and state outputs.",
     )
-    run_live_market_service_parser.add_argument(
-        "--websocket-url",
+    run_live_market_service_parser.set_defaults(handler=_handle_run_live_market_service)
+
+    run_local_staging_runtime_parser = subparsers.add_parser(
+        "run-local-staging-runtime",
+        help="Launch the full local staging runtime stack under an isolated runtime root.",
+    )
+    _add_live_market_service_arguments(
+        run_local_staging_runtime_parser,
+        output_dir_help=(
+            "Optional archive directory for live report outputs. Defaults to "
+            "<archive-dir>/live_market/<as-of-date>."
+        ),
+    )
+    run_local_staging_runtime_parser.add_argument(
+        "--runtime-root",
+        type=Path,
         required=True,
-        help="Websocket endpoint used for live market updates.",
+        help="Filesystem root for the isolated local staging runtime.",
     )
-    run_live_market_service_parser.add_argument(
-        "--subscription-message",
-        action="append",
-        default=None,
-        type=_parse_json_message,
-        help="Optional JSON websocket subscription message. Repeat to send multiple subscriptions.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--transport-name",
-        default="json-websocket",
-        help="Label for the live websocket transport.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--portfolio-file",
+    run_local_staging_runtime_parser.add_argument(
+        "--hot-state-dir",
         type=Path,
         default=None,
-        help="Optional CSV or JSON portfolio snapshot to include in the live cycle.",
+        help="Optional hot-state directory mounted into the isolated runtime root.",
     )
-    run_live_market_service_parser.add_argument(
-        "--include-intraday-review",
-        action="store_true",
-        help="Include intraday portfolio review cycles when a portfolio file is provided.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--as-of",
-        type=_parse_iso_date,
-        default=date.today(),
-        help="Trading session date used for the live cycle.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--preset-names",
-        default=None,
-        help="Comma-separated preset names to evaluate for buy candidates.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--comparison-results",
+    run_local_staging_runtime_parser.add_argument(
+        "--logs-dir",
         type=Path,
         default=None,
-        help="Optional ranked preset output from compare-strategies.",
+        help="Optional active-log directory for the isolated runtime.",
     )
-    run_live_market_service_parser.add_argument(
-        "--equity",
-        type=float,
+    run_local_staging_runtime_parser.add_argument(
+        "--archive-dir",
+        type=Path,
         default=None,
-        help="Current account equity used for position sizing. Defaults to config starting_cash.",
+        help="Optional archive root for rotated logs and staged live outputs.",
     )
-    run_live_market_service_parser.add_argument(
-        "--current-drawdown",
-        type=float,
-        default=0.0,
-        help="Current portfolio drawdown as a decimal fraction for drawdown-aware risk reduction.",
+    run_local_staging_runtime_parser.add_argument(
+        "--active-log-filename",
+        default="local_staging_runtime.log",
+        help="Active runtime log filename under the configured logs directory.",
     )
-    run_live_market_service_parser.add_argument(
-        "--lookback-days",
+    run_local_staging_runtime_parser.add_argument(
+        "--log-rotate-max-bytes",
         type=int,
-        default=20,
-        help="Lookback window used for universe liquidity screening.",
+        default=250_000,
+        help="Rotate the active runtime log after this many bytes.",
     )
-    run_live_market_service_parser.add_argument(
-        "--benchmark-symbol",
-        default=None,
-        help="Optional benchmark override for the regime filter.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--require-relative-volume",
-        action="store_true",
-        help="Require relative-volume confirmation for breakout entries.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--disable-regime-filter",
-        action="store_true",
-        help="Disable the benchmark-based regime filter.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--interval-minutes",
-        type=int,
-        default=15,
-        help="Intraday aggregate interval in minutes when intraday review is enabled.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Optional directory for live report and state outputs.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--format",
-        choices=("yaml", "json"),
-        default="yaml",
-        help="Console summary output format.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--refresh-cache",
-        action="store_true",
-        help="Bypass local cache and force provider fetches.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--poll-interval-seconds",
-        type=float,
-        default=1.0,
-        help="Base supervisor sleep interval between live loop iterations.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--flush-interval-seconds",
+    run_local_staging_runtime_parser.add_argument(
+        "--log-rotate-backup-count",
         type=int,
         default=5,
-        help="Streaming buffer flush interval in seconds.",
+        help="Maximum archived runtime log files to keep.",
     )
-    run_live_market_service_parser.add_argument(
-        "--stale-after-seconds",
-        type=float,
-        default=30.0,
-        help="Mark the service stale when no messages arrive within this many seconds.",
+    run_local_staging_runtime_parser.add_argument(
+        "--internal-api-host",
+        default="127.0.0.1",
+        help="Bind host for the local staging internal API.",
     )
-    run_live_market_service_parser.add_argument(
-        "--receive-timeout-seconds",
-        type=float,
-        default=0.25,
-        help="Per-read websocket timeout for the concrete transport.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--max-messages-per-poll",
+    run_local_staging_runtime_parser.add_argument(
+        "--internal-api-port",
         type=int,
-        default=100,
-        help="Maximum websocket messages to process in one supervisor iteration.",
+        default=8765,
+        help="Bind port for the local staging internal API.",
     )
-    run_live_market_service_parser.add_argument(
-        "--initial-reconnect-delay-seconds",
-        type=float,
-        default=1.0,
-        help="Initial reconnect backoff in seconds.",
+    run_local_staging_runtime_parser.add_argument(
+        "--control-api-host",
+        default="127.0.0.1",
+        help="Bind host for the local staging operator control API.",
     )
-    run_live_market_service_parser.add_argument(
-        "--max-reconnect-delay-seconds",
-        type=float,
-        default=30.0,
-        help="Maximum reconnect backoff in seconds.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--reconnect-backoff-multiplier",
-        type=float,
-        default=2.0,
-        help="Reconnect backoff multiplier.",
-    )
-    run_live_market_service_parser.add_argument(
-        "--max-iterations",
+    run_local_staging_runtime_parser.add_argument(
+        "--control-api-port",
         type=int,
-        default=None,
-        help="Optional maximum supervisor iterations before exiting.",
+        default=8766,
+        help="Bind port for the local staging operator control API.",
     )
-    _add_notification_arguments(run_live_market_service_parser)
-    run_live_market_service_parser.set_defaults(handler=_handle_run_live_market_service)
+    run_local_staging_runtime_parser.add_argument(
+        "--dashboard-host",
+        default="127.0.0.1",
+        help="Bind host for the local staging dashboard.",
+    )
+    run_local_staging_runtime_parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8780,
+        help="Bind port for the local staging dashboard.",
+    )
+    run_local_staging_runtime_parser.add_argument(
+        "--dashboard-refresh-seconds",
+        type=int,
+        default=5,
+        help="Dashboard polling cadence in seconds.",
+    )
+    run_local_staging_runtime_parser.set_defaults(handler=_handle_run_local_staging_runtime)
 
     serve_internal_api_parser = subparsers.add_parser(
         "serve-internal-api",
@@ -2742,14 +2857,45 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
 
 def _handle_run_live_market_service(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
-    if args.include_intraday_review and args.portfolio_file is None:
-        raise ValueError("--include-intraday-review requires --portfolio-file.")
-
-    provider = create_daily_bar_provider(config, env_file=args.env_file)
     output_dir = (
         args.output_dir
         or _default_live_market_output_dir(config.project_root, args.as_of)
     ).resolve()
+    bundle = _build_live_market_service_bundle(
+        args,
+        config=config,
+        env_file=args.env_file,
+        output_dir=output_dir,
+    )
+    status = bundle.supervisor.run(max_iterations=args.max_iterations)
+    payload = {
+        "command": "run-live-market-service",
+        "as_of_date": args.as_of.isoformat(),
+        "websocket_url": args.websocket_url,
+        "transport_name": args.transport_name,
+        "portfolio_file": (
+            str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
+        ),
+        "include_intraday_review": bool(args.include_intraday_review),
+        "notifications_enabled": bundle.notification_router is not None,
+        "status": status.to_dict(),
+        "outputs": dict(sorted(bundle.latest_outputs.items())),
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _build_live_market_service_bundle(
+    args: argparse.Namespace,
+    *,
+    config: AppConfig,
+    env_file: Path | None,
+    output_dir: Path,
+) -> _LiveMarketServiceBundle:
+    if args.include_intraday_review and args.portfolio_file is None:
+        raise ValueError("--include-intraday-review requires --portfolio-file.")
+
+    provider = create_daily_bar_provider(config, env_file=env_file)
     output_dir.mkdir(parents=True, exist_ok=True)
     request = LiveMarketCycleRequest(
         workflow="monitor-market",
@@ -2813,7 +2959,7 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
     latest_outputs: dict[str, str] = {}
     notification_router = _build_notification_router(
         project_root=config.project_root,
-        env_file=args.env_file,
+        env_file=env_file,
         webhook_url=getattr(args, "notification_webhook_url", None),
         webhook_format=getattr(args, "notification_webhook_format", None),
         minimum_severity=getattr(args, "notification_min_severity", None),
@@ -2831,50 +2977,123 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
             _notification_events_from_cycle_result(cycle_result),
         )
 
-    supervisor = LiveMarketSupervisor(
-        runner=LiveMarketRunner(
-            build_monitor_report=lambda as_of_date, daily_summary, portfolio_review, intraday_review, portfolio_path: build_market_monitor_report(
-                as_of_date=as_of_date,
-                daily_summary=daily_summary,
-                portfolio_review=(
-                    _strip_internal_portfolio_review_report(portfolio_review)
-                    if portfolio_review is not None
-                    else None
+    return _LiveMarketServiceBundle(
+        supervisor=LiveMarketSupervisor(
+            runner=LiveMarketRunner(
+                build_monitor_report=lambda as_of_date, daily_summary, portfolio_review, intraday_review, portfolio_path: build_market_monitor_report(
+                    as_of_date=as_of_date,
+                    daily_summary=daily_summary,
+                    portfolio_review=(
+                        _strip_internal_portfolio_review_report(portfolio_review)
+                        if portfolio_review is not None
+                        else None
+                    ),
+                    portfolio_path=portfolio_path,
                 ),
-                portfolio_path=portfolio_path,
-            ),
-            persist_market_state=lambda as_of_date, workflow, daily_summary, portfolio_review, intraday_review, portfolio_path: _persist_market_state(
-                project_root=config.project_root,
-                output_dir=output_dir,
-                as_of_date=as_of_date,
-                workflow=workflow,
-                portfolio_path=portfolio_path,
-                daily_summary=daily_summary,
-                portfolio_review=(
-                    _strip_internal_portfolio_review_report(portfolio_review)
-                    if portfolio_review is not None
-                    else None
+                persist_market_state=lambda as_of_date, workflow, daily_summary, portfolio_review, intraday_review, portfolio_path: _persist_market_state(
+                    project_root=config.project_root,
+                    output_dir=output_dir,
+                    as_of_date=as_of_date,
+                    workflow=workflow,
+                    portfolio_path=portfolio_path,
+                    daily_summary=daily_summary,
+                    portfolio_review=(
+                        _strip_internal_portfolio_review_report(portfolio_review)
+                        if portfolio_review is not None
+                        else None
+                    ),
+                    intraday_review=intraday_review,
                 ),
-                intraday_review=intraday_review,
             ),
+            adapter=adapter,
+            request=request,
+            poll_interval_seconds=args.poll_interval_seconds,
+            stale_after_seconds=args.stale_after_seconds,
+            max_messages_per_poll=args.max_messages_per_poll,
+            reconnect_backoff=ReconnectBackoffPolicy(
+                initial_delay_seconds=args.initial_reconnect_delay_seconds,
+                multiplier=args.reconnect_backoff_multiplier,
+                max_delay_seconds=args.max_reconnect_delay_seconds,
+            ),
+            handle_cycle_result=handle_cycle_result,
+            status_store=LiveMarketServiceStatusStore(config.project_root),
+            notification_router=notification_router,
         ),
-        adapter=adapter,
-        request=request,
-        poll_interval_seconds=args.poll_interval_seconds,
-        stale_after_seconds=args.stale_after_seconds,
-        max_messages_per_poll=args.max_messages_per_poll,
-        reconnect_backoff=ReconnectBackoffPolicy(
-            initial_delay_seconds=args.initial_reconnect_delay_seconds,
-            multiplier=args.reconnect_backoff_multiplier,
-            max_delay_seconds=args.max_reconnect_delay_seconds,
-        ),
-        handle_cycle_result=handle_cycle_result,
-        status_store=LiveMarketServiceStatusStore(config.project_root),
+        latest_outputs=latest_outputs,
         notification_router=notification_router,
     )
-    status = supervisor.run(max_iterations=args.max_iterations)
+
+
+def _handle_run_local_staging_runtime(args: argparse.Namespace) -> int:
+    runtime_config = LocalStagingRuntimeConfig(
+        source_config_dir=args.config_dir,
+        runtime_root=args.runtime_root,
+        source_env_file=args.env_file,
+        hot_state_dir=args.hot_state_dir,
+        logs_dir=args.logs_dir,
+        archive_dir=args.archive_dir,
+        internal_api_host=args.internal_api_host,
+        internal_api_port=args.internal_api_port,
+        control_api_host=args.control_api_host,
+        control_api_port=args.control_api_port,
+        dashboard_host=args.dashboard_host,
+        dashboard_port=args.dashboard_port,
+        dashboard_refresh_seconds=args.dashboard_refresh_seconds,
+        active_log_filename=args.active_log_filename,
+        log_rotate_max_bytes=args.log_rotate_max_bytes,
+        log_rotate_backup_count=args.log_rotate_backup_count,
+    )
+    bundle_holder: dict[str, _LiveMarketServiceBundle] = {}
+    try:
+        runtime = create_local_staging_runtime(
+            runtime_config,
+            supervisor_factory=lambda config, paths: _capture_staging_supervisor(
+                bundle_holder,
+                _build_live_market_service_bundle(
+                    args,
+                    config=config,
+                    env_file=paths.env_file,
+                    output_dir=(
+                        args.output_dir
+                        or paths.archive_dir / "live_market" / args.as_of.isoformat()
+                    ).resolve(),
+                ),
+            ),
+        )
+    except OSError as exc:
+        raise ValueError(f"Failed to initialize local staging runtime: {exc}") from exc
+    runtime.configure_logging(level=args.log_level, json_logs=args.json_logs)
+    LOGGER.info(
+        "Starting local staging runtime: internal_api=%s control_api=%s dashboard=%s",
+        runtime.internal_api_url,
+        runtime.control_api_url,
+        runtime.dashboard_url,
+    )
+    try:
+        runtime.start(max_iterations=args.max_iterations)
+        runtime.wait_for_supervisor()
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping local staging runtime.")
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    finally:
+        runtime.stop()
+
+    bundle = bundle_holder.get("live_market_bundle")
+    supervisor_status = runtime.last_supervisor_result
     payload = {
-        "command": "run-live-market-service",
+        "command": "run-local-staging-runtime",
+        "runtime_root": str(runtime.paths.runtime_root),
+        "config_dir": str(runtime.paths.config_dir),
+        "env_file": str(runtime.paths.env_file),
+        "hot_state_dir": str(runtime.paths.hot_state_dir),
+        "logs_dir": str(runtime.paths.logs_dir),
+        "active_log_path": str(runtime.paths.active_log_path),
+        "archive_dir": str(runtime.paths.archive_dir),
+        "archived_logs_dir": str(runtime.paths.archived_logs_dir),
+        "internal_api_url": runtime.internal_api_url,
+        "control_api_url": runtime.control_api_url,
+        "dashboard_url": runtime.dashboard_url,
         "as_of_date": args.as_of.isoformat(),
         "websocket_url": args.websocket_url,
         "transport_name": args.transport_name,
@@ -2882,12 +3101,30 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
             str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
         ),
         "include_intraday_review": bool(args.include_intraday_review),
-        "notifications_enabled": notification_router is not None,
-        "status": status.to_dict(),
-        "outputs": dict(sorted(latest_outputs.items())),
+        "notifications_enabled": (
+            bundle.notification_router is not None if bundle is not None else False
+        ),
+        "status": (
+            supervisor_status.to_dict()
+            if hasattr(supervisor_status, "to_dict")
+            else supervisor_status
+        ),
+        "outputs": (
+            dict(sorted(bundle.latest_outputs.items()))
+            if bundle is not None
+            else {}
+        ),
     }
     _print_structured(payload, output_format=args.format)
     return 0
+
+
+def _capture_staging_supervisor(
+    holder: dict[str, _LiveMarketServiceBundle],
+    bundle: _LiveMarketServiceBundle,
+) -> LiveMarketSupervisor:
+    holder["live_market_bundle"] = bundle
+    return bundle.supervisor
 
 
 def _handle_serve_internal_api(args: argparse.Namespace) -> int:
