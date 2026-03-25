@@ -48,8 +48,12 @@ OPERATOR_CONTROL_API_VERSION = 1
 OPERATOR_CONTROL_HTTP_ENDPOINTS = (
     "/control",
     "/control/safety",
+    "/control/execution/policy",
     "/control/execution/pause",
     "/control/execution/resume",
+    "/control/execution/mode",
+    "/control/execution/live-confirmation",
+    "/control/execution/broker-trading",
     "/control/orders/submit",
     "/control/orders/cancel",
     "/control/orders/replace",
@@ -90,6 +94,8 @@ class OperatorControlState:
     updated_at_utc: str | None = None
     execution_submission_enabled: bool = True
     execution_mode: str = "paper"
+    live_actions_require_confirmation: bool = True
+    broker_trading_enabled: bool = False
     paused_reason: str | None = None
     last_pause_at_utc: str | None = None
     last_resume_at_utc: str | None = None
@@ -114,6 +120,8 @@ class OperatorControlState:
             "updated_at_utc": self.updated_at_utc,
             "execution_submission_enabled": self.execution_submission_enabled,
             "execution_mode": self.execution_mode,
+            "live_actions_require_confirmation": self.live_actions_require_confirmation,
+            "broker_trading_enabled": self.broker_trading_enabled,
             "paused_reason": self.paused_reason,
             "last_pause_at_utc": self.last_pause_at_utc,
             "last_resume_at_utc": self.last_resume_at_utc,
@@ -130,6 +138,16 @@ class OperatorControlState:
                 default=True,
             ),
             execution_mode=_optional_text(payload.get("execution_mode")) or "paper",
+            live_actions_require_confirmation=_mapping_optional_bool(
+                payload,
+                "live_actions_require_confirmation",
+                default=True,
+            ),
+            broker_trading_enabled=_mapping_optional_bool(
+                payload,
+                "broker_trading_enabled",
+                default=False,
+            ),
             paused_reason=_optional_text(payload.get("paused_reason")),
             last_pause_at_utc=_optional_text(payload.get("last_pause_at_utc")),
             last_resume_at_utc=_optional_text(payload.get("last_resume_at_utc")),
@@ -149,6 +167,7 @@ class BrokerAdapterFactory(Protocol):
         broker_name: str,
         *,
         env_file: Path | None = None,
+        target: str | None = None,
     ) -> BrokerExecutionAdapter: ...
 
 
@@ -335,6 +354,7 @@ def append_operator_control_audit_record(
 class SubmitPendingOrderCommand:
     broker: str
     order_id: str
+    confirm_live_action: bool = False
     operator_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -344,7 +364,11 @@ class SubmitPendingOrderCommand:
             raise ValueError("order_id cannot be empty.")
 
     def to_dict(self) -> dict[str, Any]:
-        payload = {"broker": self.broker, "order_id": self.order_id}
+        payload = {
+            "broker": self.broker,
+            "order_id": self.order_id,
+            "confirm_live_action": self.confirm_live_action,
+        }
         if self.operator_id is not None:
             payload["operator_id"] = self.operator_id
         return payload
@@ -354,6 +378,11 @@ class SubmitPendingOrderCommand:
         return cls(
             broker=_required_text(payload.get("broker"), "broker"),
             order_id=_required_text(payload.get("order_id"), "order_id"),
+            confirm_live_action=_mapping_optional_bool(
+                payload,
+                "confirm_live_action",
+                default=False,
+            ),
             operator_id=_optional_text(payload.get("operator_id")),
         )
 
@@ -362,6 +391,7 @@ class SubmitPendingOrderCommand:
 class CancelPendingOrderCommand:
     broker: str
     order_id: str
+    confirm_live_action: bool = False
     operator_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -371,7 +401,11 @@ class CancelPendingOrderCommand:
             raise ValueError("order_id cannot be empty.")
 
     def to_dict(self) -> dict[str, Any]:
-        payload = {"broker": self.broker, "order_id": self.order_id}
+        payload = {
+            "broker": self.broker,
+            "order_id": self.order_id,
+            "confirm_live_action": self.confirm_live_action,
+        }
         if self.operator_id is not None:
             payload["operator_id"] = self.operator_id
         return payload
@@ -381,6 +415,11 @@ class CancelPendingOrderCommand:
         return cls(
             broker=_required_text(payload.get("broker"), "broker"),
             order_id=_required_text(payload.get("order_id"), "order_id"),
+            confirm_live_action=_mapping_optional_bool(
+                payload,
+                "confirm_live_action",
+                default=False,
+            ),
             operator_id=_optional_text(payload.get("operator_id")),
         )
 
@@ -392,6 +431,7 @@ class ReplacePendingOrderCommand:
     quantity: int | None = None
     limit_price: float | None = None
     stop_price: float | None = None
+    confirm_live_action: bool = False
     operator_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -421,6 +461,7 @@ class ReplacePendingOrderCommand:
             payload["limit_price"] = self.limit_price
         if self.stop_price is not None:
             payload["stop_price"] = self.stop_price
+        payload["confirm_live_action"] = self.confirm_live_action
         if self.operator_id is not None:
             payload["operator_id"] = self.operator_id
         return payload
@@ -433,6 +474,11 @@ class ReplacePendingOrderCommand:
             quantity=_mapping_optional_positive_int(payload, "quantity"),
             limit_price=_mapping_optional_positive_float(payload, "limit_price"),
             stop_price=_mapping_optional_positive_float(payload, "stop_price"),
+            confirm_live_action=_mapping_optional_bool(
+                payload,
+                "confirm_live_action",
+                default=False,
+            ),
             operator_id=_optional_text(payload.get("operator_id")),
         )
 
@@ -502,6 +548,88 @@ class ResumeExecutionCommand:
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ResumeExecutionCommand":
         return cls(
+            reason=_optional_text(payload.get("reason")),
+            operator_id=_optional_text(payload.get("operator_id")),
+        )
+
+
+@dataclass(frozen=True)
+class SetExecutionModeCommand:
+    execution_mode: str
+    reason: str | None = None
+    operator_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.execution_mode not in OPERATOR_EXECUTION_MODES:
+            raise ValueError(
+                "execution_mode must be one of "
+                f"{OPERATOR_EXECUTION_MODES}, got '{self.execution_mode}'."
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"execution_mode": self.execution_mode}
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        if self.operator_id is not None:
+            payload["operator_id"] = self.operator_id
+        return payload
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "SetExecutionModeCommand":
+        return cls(
+            execution_mode=_required_text(payload.get("execution_mode"), "execution_mode"),
+            reason=_optional_text(payload.get("reason")),
+            operator_id=_optional_text(payload.get("operator_id")),
+        )
+
+
+@dataclass(frozen=True)
+class SetLiveActionConfirmationCommand:
+    required: bool
+    reason: str | None = None
+    operator_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"required": self.required}
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        if self.operator_id is not None:
+            payload["operator_id"] = self.operator_id
+        return payload
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "SetLiveActionConfirmationCommand":
+        return cls(
+            required=_mapping_required_bool(payload, "required"),
+            reason=_optional_text(payload.get("reason")),
+            operator_id=_optional_text(payload.get("operator_id")),
+        )
+
+
+@dataclass(frozen=True)
+class SetBrokerTradingEnabledCommand:
+    enabled: bool
+    reason: str | None = None
+    operator_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"enabled": self.enabled}
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        if self.operator_id is not None:
+            payload["operator_id"] = self.operator_id
+        return payload
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> "SetBrokerTradingEnabledCommand":
+        return cls(
+            enabled=_mapping_required_bool(payload, "enabled"),
             reason=_optional_text(payload.get("reason")),
             operator_id=_optional_text(payload.get("operator_id")),
         )
@@ -583,6 +711,15 @@ class OperatorControlService:
     def pause_execution(self, command: PauseExecutionCommand) -> OperatorCommandResult:
         requested_at = _utc_now_isoformat(self._now_utc())
         load_result = self._load_safety_state_result()
+        if load_result.degraded:
+            return self._control_state_unavailable_result(
+                command_name="pause_execution",
+                command_payload=command.to_dict(),
+                operator_id=command.operator_id,
+                requested_at_utc=requested_at,
+                safety_state=load_result.state,
+                warnings=load_result.warnings,
+            )
         current_state = load_result.state
         if not current_state.execution_submission_enabled:
             return self._finalize_result(
@@ -661,6 +798,155 @@ class OperatorControlService:
             artifact_paths={"operator_control_state": str(state_path.resolve())},
         )
 
+    def set_execution_mode(
+        self,
+        command: SetExecutionModeCommand,
+    ) -> OperatorCommandResult:
+        requested_at = _utc_now_isoformat(self._now_utc())
+        load_result = self._load_safety_state_result()
+        if load_result.degraded:
+            return self._control_state_unavailable_result(
+                command_name="set_execution_mode",
+                command_payload=command.to_dict(),
+                operator_id=command.operator_id,
+                requested_at_utc=requested_at,
+                safety_state=load_result.state,
+                warnings=load_result.warnings,
+            )
+        current_state = load_result.state
+        if current_state.execution_mode == command.execution_mode:
+            return self._finalize_result(
+                command_name="set_execution_mode",
+                command_payload=command.to_dict(),
+                operator_id=command.operator_id,
+                requested_at_utc=requested_at,
+                status="no_op",
+                ok=True,
+                message=(
+                    f"Execution mode is already '{command.execution_mode}'."
+                ),
+                safety_state=current_state,
+            )
+        updated_state = replace(
+            current_state,
+            updated_at_utc=requested_at,
+            execution_mode=command.execution_mode,
+        )
+        state_path = self._safety_store.save(updated_state)
+        return self._finalize_result(
+            command_name="set_execution_mode",
+            command_payload=command.to_dict(),
+            operator_id=command.operator_id,
+            requested_at_utc=requested_at,
+            status="completed",
+            ok=True,
+            message=f"Execution mode set to '{command.execution_mode}'.",
+            safety_state=updated_state,
+            artifact_paths={"operator_control_state": str(state_path.resolve())},
+        )
+
+    def set_live_action_confirmation(
+        self,
+        command: SetLiveActionConfirmationCommand,
+    ) -> OperatorCommandResult:
+        requested_at = _utc_now_isoformat(self._now_utc())
+        load_result = self._load_safety_state_result()
+        if load_result.degraded:
+            return self._control_state_unavailable_result(
+                command_name="set_live_action_confirmation",
+                command_payload=command.to_dict(),
+                operator_id=command.operator_id,
+                requested_at_utc=requested_at,
+                safety_state=load_result.state,
+                warnings=load_result.warnings,
+            )
+        current_state = load_result.state
+        if current_state.live_actions_require_confirmation == command.required:
+            return self._finalize_result(
+                command_name="set_live_action_confirmation",
+                command_payload=command.to_dict(),
+                operator_id=command.operator_id,
+                requested_at_utc=requested_at,
+                status="no_op",
+                ok=True,
+                message=(
+                    "Live action confirmation is already "
+                    f"{'enabled' if command.required else 'disabled'}."
+                ),
+                safety_state=current_state,
+            )
+        updated_state = replace(
+            current_state,
+            updated_at_utc=requested_at,
+            live_actions_require_confirmation=command.required,
+        )
+        state_path = self._safety_store.save(updated_state)
+        return self._finalize_result(
+            command_name="set_live_action_confirmation",
+            command_payload=command.to_dict(),
+            operator_id=command.operator_id,
+            requested_at_utc=requested_at,
+            status="completed",
+            ok=True,
+            message=(
+                "Live action confirmation "
+                f"{'enabled' if command.required else 'disabled'}."
+            ),
+            safety_state=updated_state,
+            artifact_paths={"operator_control_state": str(state_path.resolve())},
+        )
+
+    def set_broker_trading_enabled(
+        self,
+        command: SetBrokerTradingEnabledCommand,
+    ) -> OperatorCommandResult:
+        requested_at = _utc_now_isoformat(self._now_utc())
+        load_result = self._load_safety_state_result()
+        if load_result.degraded:
+            return self._control_state_unavailable_result(
+                command_name="set_broker_trading_enabled",
+                command_payload=command.to_dict(),
+                operator_id=command.operator_id,
+                requested_at_utc=requested_at,
+                safety_state=load_result.state,
+                warnings=load_result.warnings,
+            )
+        current_state = load_result.state
+        if current_state.broker_trading_enabled == command.enabled:
+            return self._finalize_result(
+                command_name="set_broker_trading_enabled",
+                command_payload=command.to_dict(),
+                operator_id=command.operator_id,
+                requested_at_utc=requested_at,
+                status="no_op",
+                ok=True,
+                message=(
+                    "Broker trading is already "
+                    f"{'enabled' if command.enabled else 'disabled'}."
+                ),
+                safety_state=current_state,
+            )
+        updated_state = replace(
+            current_state,
+            updated_at_utc=requested_at,
+            broker_trading_enabled=command.enabled,
+        )
+        state_path = self._safety_store.save(updated_state)
+        return self._finalize_result(
+            command_name="set_broker_trading_enabled",
+            command_payload=command.to_dict(),
+            operator_id=command.operator_id,
+            requested_at_utc=requested_at,
+            status="completed",
+            ok=True,
+            message=(
+                "Broker trading "
+                f"{'enabled' if command.enabled else 'disabled'}."
+            ),
+            safety_state=updated_state,
+            artifact_paths={"operator_control_state": str(state_path.resolve())},
+        )
+
     def submit_pending_order(
         self,
         command: SubmitPendingOrderCommand,
@@ -676,18 +962,6 @@ class OperatorControlService:
                 requested_at_utc=requested_at,
                 safety_state=safety_state,
                 warnings=load_result.warnings,
-            )
-        if not safety_state.execution_submission_enabled:
-            return self._finalize_result(
-                command_name="submit_pending_order",
-                command_payload=command.to_dict(),
-                operator_id=command.operator_id,
-                requested_at_utc=requested_at,
-                status="rejected",
-                ok=False,
-                message="Execution submissions are paused.",
-                error_code="execution_paused",
-                safety_state=safety_state,
             )
         starting_state = self._pending_order_store.load()
         record = starting_state.orders.get(command.order_id)
@@ -732,10 +1006,22 @@ class OperatorControlService:
                 error_code="pending_order_already_submitted",
                 safety_state=safety_state,
             )
+        policy_rejection = self._reject_if_broker_mutation_not_allowed(
+            command_name="submit_pending_order",
+            command_payload=command.to_dict(),
+            operator_id=command.operator_id,
+            requested_at_utc=requested_at,
+            safety_state=safety_state,
+            mutation_kind="submit",
+            confirm_live_action=command.confirm_live_action,
+            action_label="submission",
+        )
+        if policy_rejection is not None:
+            return policy_rejection
         try:
-            adapter = self._broker_adapter_factory(
+            adapter = self._create_broker_adapter_for_policy(
                 command.broker,
-                env_file=self.env_file,
+                safety_state=safety_state,
             )
         except (BrokerExecutionError, TypeError) as exc:
             return self._finalize_result(
@@ -866,10 +1152,22 @@ class OperatorControlService:
                 error_code="pending_order_missing_broker_id",
                 safety_state=safety_state,
             )
+        policy_rejection = self._reject_if_broker_mutation_not_allowed(
+            command_name="cancel_pending_order",
+            command_payload=command.to_dict(),
+            operator_id=command.operator_id,
+            requested_at_utc=requested_at,
+            safety_state=safety_state,
+            mutation_kind="cancel",
+            confirm_live_action=command.confirm_live_action,
+            action_label="cancel",
+        )
+        if policy_rejection is not None:
+            return policy_rejection
         try:
-            adapter = self._broker_adapter_factory(
+            adapter = self._create_broker_adapter_for_policy(
                 command.broker,
-                env_file=self.env_file,
+                safety_state=safety_state,
             )
             update = adapter.cancel_order(record.broker_order_id)
         except (BrokerExecutionError, TypeError) as exc:
@@ -1016,6 +1314,18 @@ class OperatorControlService:
                 error_code="pending_order_missing_broker_id",
                 safety_state=safety_state,
             )
+        policy_rejection = self._reject_if_broker_mutation_not_allowed(
+            command_name="replace_pending_order",
+            command_payload=command.to_dict(),
+            operator_id=command.operator_id,
+            requested_at_utc=requested_at,
+            safety_state=safety_state,
+            mutation_kind="replace",
+            confirm_live_action=command.confirm_live_action,
+            action_label="replacement",
+        )
+        if policy_rejection is not None:
+            return policy_rejection
         replacement_local_order_id = _replacement_pending_order_id(
             existing,
             quantity=command.quantity,
@@ -1023,9 +1333,9 @@ class OperatorControlService:
             stop_price=command.stop_price,
         )
         try:
-            adapter = self._broker_adapter_factory(
+            adapter = self._create_broker_adapter_for_policy(
                 command.broker,
-                env_file=self.env_file,
+                safety_state=safety_state,
             )
             replacement_update = adapter.replace_order(
                 existing.broker_order_id,
@@ -1141,9 +1451,9 @@ class OperatorControlService:
                 safety_state=safety_state,
             )
         try:
-            adapter = self._broker_adapter_factory(
+            adapter = self._create_broker_adapter_for_policy(
                 command.broker,
-                env_file=self.env_file,
+                safety_state=safety_state,
             )
         except (BrokerExecutionError, TypeError) as exc:
             return self._finalize_result(
@@ -1239,10 +1549,16 @@ class OperatorControlService:
         }
 
     def safety(self) -> dict[str, Any]:
+        return self._policy_payload(endpoint="control_safety")
+
+    def execution_policy(self) -> dict[str, Any]:
+        return self._policy_payload(endpoint="control_execution_policy")
+
+    def _policy_payload(self, *, endpoint: str) -> dict[str, Any]:
         load_result = self._load_safety_state_result()
         state = load_result.state
         return {
-            "endpoint": "control_safety",
+            "endpoint": endpoint,
             "available": True,
             "not_available_reason": None,
             "artifact_paths": {
@@ -1253,11 +1569,84 @@ class OperatorControlService:
             "data": {
                 "control_state_readable": not load_result.degraded,
                 "safety_state": state.to_dict(),
+                "policy_summary": _execution_policy_summary(state),
             },
         }
 
     def _load_safety_state_result(self) -> _OperatorControlStateLoadResult:
         return _load_operator_control_state_result(self._safety_store.path)
+
+    def _create_broker_adapter_for_policy(
+        self,
+        broker_name: str,
+        *,
+        safety_state: OperatorControlState,
+    ) -> BrokerExecutionAdapter:
+        return _call_broker_adapter_factory(
+            self._broker_adapter_factory,
+            broker_name,
+            env_file=self.env_file,
+            target=safety_state.execution_mode,
+        )
+
+    def _reject_if_broker_mutation_not_allowed(
+        self,
+        *,
+        command_name: str,
+        command_payload: Mapping[str, Any],
+        operator_id: str | None,
+        requested_at_utc: str,
+        safety_state: OperatorControlState,
+        mutation_kind: str,
+        confirm_live_action: bool,
+        action_label: str,
+    ) -> OperatorCommandResult | None:
+        if _pause_blocks_broker_mutation(mutation_kind) and (
+            not safety_state.execution_submission_enabled
+        ):
+            return self._finalize_result(
+                command_name=command_name,
+                command_payload=command_payload,
+                operator_id=operator_id,
+                requested_at_utc=requested_at_utc,
+                status="rejected",
+                ok=False,
+                message="Execution submissions are paused.",
+                error_code="execution_paused",
+                safety_state=safety_state,
+            )
+        if safety_state.execution_mode != "live":
+            return None
+        if not safety_state.broker_trading_enabled:
+            return self._finalize_result(
+                command_name=command_name,
+                command_payload=command_payload,
+                operator_id=operator_id,
+                requested_at_utc=requested_at_utc,
+                status="rejected",
+                ok=False,
+                message="Live broker trading is disabled by execution policy.",
+                error_code="live_broker_trading_disabled",
+                safety_state=safety_state,
+            )
+        # This is an operator intent assertion carried by the caller UI/CLI,
+        # not a stronger proof of confirmation.
+        if safety_state.live_actions_require_confirmation and not confirm_live_action:
+            return self._finalize_result(
+                command_name=command_name,
+                command_payload=command_payload,
+                operator_id=operator_id,
+                requested_at_utc=requested_at_utc,
+                status="rejected",
+                ok=False,
+                message=(
+                    f"Live {action_label} requires confirm_live_action=true "
+                    "while live confirmation is enabled."
+                ),
+                error_code="live_confirmation_required",
+                safety_state=safety_state,
+            )
+        return None
 
     def _control_state_unavailable_result(
         self,
@@ -1340,8 +1729,15 @@ class OperatorControlService:
                 audit_record_id=audit_record.audit_record_id,
             )
         except OSError as exc:
-            LOGGER.warning("Failed to append operator control audit log at %s: %s", audit_path, exc)
-            return result
+            warning_message = (
+                f"Failed to append operator control audit log at "
+                f"{audit_path.resolve()}: {exc}"
+            )
+            LOGGER.warning(warning_message)
+            return replace(
+                result,
+                warnings=result.warnings + (warning_message,),
+            )
 
 
 class OperatorControlHttpServer(ThreadingHTTPServer):
@@ -1443,6 +1839,7 @@ def operator_control_response_for_request(
         routes: dict[str, Callable[[], dict[str, Any]]] = {
             "/control": control_service.control_index,
             "/control/safety": control_service.safety,
+            "/control/execution/policy": control_service.execution_policy,
         }
         handler = routes.get(normalized_path)
         if handler is None:
@@ -1487,6 +1884,18 @@ def operator_control_response_for_request(
         elif normalized_path == "/control/execution/resume":
             result = control_service.resume_execution(
                 ResumeExecutionCommand.from_mapping(payload)
+            )
+        elif normalized_path == "/control/execution/mode":
+            result = control_service.set_execution_mode(
+                SetExecutionModeCommand.from_mapping(payload)
+            )
+        elif normalized_path == "/control/execution/live-confirmation":
+            result = control_service.set_live_action_confirmation(
+                SetLiveActionConfirmationCommand.from_mapping(payload)
+            )
+        elif normalized_path == "/control/execution/broker-trading":
+            result = control_service.set_broker_trading_enabled(
+                SetBrokerTradingEnabledCommand.from_mapping(payload)
             )
         elif normalized_path == "/control/orders/submit":
             result = control_service.submit_pending_order(
@@ -1967,6 +2376,38 @@ def _artifact_paths(**paths: Path | str | None) -> dict[str, str]:
     }
 
 
+def _execution_policy_summary(state: OperatorControlState) -> dict[str, Any]:
+    return {
+        "execution_mode": state.execution_mode,
+        "execution_submission_enabled": state.execution_submission_enabled,
+        "live_actions_require_confirmation": state.live_actions_require_confirmation,
+        "broker_trading_enabled": state.broker_trading_enabled,
+        "is_live_mode": state.execution_mode == "live",
+        "live_broker_mutations_allowed": (
+            state.execution_mode != "live" or state.broker_trading_enabled
+        ),
+    }
+
+
+def _call_broker_adapter_factory(
+    factory: BrokerAdapterFactory,
+    broker_name: str,
+    *,
+    env_file: Path | None,
+    target: str | None,
+) -> BrokerExecutionAdapter:
+    return factory(
+        broker_name,
+        env_file=env_file,
+        target=target,
+    )
+
+
+def _pause_blocks_broker_mutation(mutation_kind: str) -> bool:
+    # Pause is intentionally a submission stop, not a risk-reduction stop.
+    return mutation_kind == "submit"
+
+
 def _decode_json_mapping(raw_body: bytes) -> dict[str, Any]:
     if not raw_body:
         return {}
@@ -2024,6 +2465,12 @@ def _mapping_optional_bool(
     if not isinstance(value, bool):
         raise ValueError(f"{field_name} must be a boolean.")
     return value
+
+
+def _mapping_required_bool(payload: Mapping[str, Any], field_name: str) -> bool:
+    if field_name not in payload:
+        raise ValueError(f"{field_name} is required.")
+    return _mapping_optional_bool(payload, field_name, default=False)
 
 
 def _mapping_optional_positive_float(payload: Mapping[str, Any], field_name: str) -> float | None:

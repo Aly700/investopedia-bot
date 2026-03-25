@@ -17,6 +17,9 @@ from bot.api.control_api import (
     PauseExecutionCommand,
     ReplacePendingOrderCommand,
     ResumeExecutionCommand,
+    SetBrokerTradingEnabledCommand,
+    SetExecutionModeCommand,
+    SetLiveActionConfirmationCommand,
     SubmitPendingOrderCommand,
     default_operator_control_audit_log_path,
     load_operator_control_audit_records,
@@ -139,7 +142,7 @@ def test_operator_control_service_submit_pending_order_executes_and_writes_audit
     )
     service = OperatorControlService(
         project_root=tmp_path,
-        broker_adapter_factory=lambda broker, env_file: adapter,
+        broker_adapter_factory=lambda broker, env_file, target=None: adapter,
         now_utc=lambda: datetime(2024, 1, 5, 15, 1, tzinfo=timezone.utc),
     )
 
@@ -156,6 +159,8 @@ def test_operator_control_service_submit_pending_order_executes_and_writes_audit
     assert result.ok is True
     assert result.status == "completed"
     assert result.data["submitted_count"] == 1
+    assert result.safety_state is not None
+    assert result.safety_state.execution_mode == "paper"
     assert persisted.orders["order_aapl_1"].broker_order_id == "alpaca-ord-1"
     assert events[-1].event_type == "broker_submitted"
     assert result.audit_record_id == audit_records[-1].audit_record_id
@@ -164,7 +169,7 @@ def test_operator_control_service_submit_pending_order_executes_and_writes_audit
     assert "operator_control_audit_log" in result.artifact_paths
 
 
-def test_operator_control_service_submit_pending_order_accepts_keyword_only_factory(
+def test_operator_control_service_rejects_factory_without_target_support(
     tmp_path: Path,
 ) -> None:
     PendingOrderStateStore(tmp_path).save(
@@ -215,11 +220,10 @@ def test_operator_control_service_submit_pending_order_accepts_keyword_only_fact
         SubmitPendingOrderCommand(broker="alpaca", order_id="order_aapl_1")
     )
 
-    assert result.ok is True
-    assert result.status == "completed"
-    assert PendingOrderStateStore(tmp_path).load().orders["order_aapl_1"].broker_order_id == (
-        "alpaca-ord-1"
-    )
+    assert result.ok is False
+    assert result.status == "failed"
+    assert result.error_code == "broker_unavailable"
+    assert "unexpected keyword argument 'target'" in result.message
 
 
 def test_operator_control_service_pause_and_resume_execution_updates_safety_state(
@@ -247,6 +251,204 @@ def test_operator_control_service_pause_and_resume_execution_updates_safety_stat
     assert resume_result.status == "completed"
     assert persisted_state.execution_submission_enabled is True
     assert persisted_state.paused_reason is None
+
+
+def test_operator_control_service_policy_changes_persist_and_reload(
+    tmp_path: Path,
+) -> None:
+    service = OperatorControlService(
+        project_root=tmp_path,
+        now_utc=lambda: datetime(2024, 1, 5, 15, 0, tzinfo=timezone.utc),
+    )
+
+    mode_result = service.set_execution_mode(
+        SetExecutionModeCommand(execution_mode="live")
+    )
+    confirmation_result = service.set_live_action_confirmation(
+        SetLiveActionConfirmationCommand(required=False)
+    )
+    trading_result = service.set_broker_trading_enabled(
+        SetBrokerTradingEnabledCommand(enabled=True)
+    )
+
+    persisted_state = OperatorControlStateStore(tmp_path).load()
+
+    assert mode_result.ok is True
+    assert mode_result.status == "completed"
+    assert confirmation_result.ok is True
+    assert trading_result.ok is True
+    assert persisted_state.execution_mode == "live"
+    assert persisted_state.live_actions_require_confirmation is False
+    assert persisted_state.broker_trading_enabled is True
+
+
+def test_operator_control_service_paper_mode_requests_paper_broker_target(
+    tmp_path: Path,
+) -> None:
+    PendingOrderStateStore(tmp_path).save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+            )
+        )
+    )
+    adapter = FakeBrokerAdapter(
+        placed_update=BrokerOrderUpdate(
+            broker_name="alpaca",
+            broker_order_id="alpaca-ord-1",
+            client_order_id="order_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=10,
+            filled_quantity=0,
+            status="accepted",
+        )
+    )
+    captured: dict[str, str | None] = {}
+
+    def target_aware_factory(
+        broker_name: str,
+        *,
+        env_file: Path | None = None,
+        target: str | None = None,
+    ) -> FakeBrokerAdapter:
+        assert broker_name == "alpaca"
+        assert env_file is None
+        captured["target"] = target
+        return adapter
+
+    service = OperatorControlService(
+        project_root=tmp_path,
+        broker_adapter_factory=target_aware_factory,
+    )
+
+    result = service.submit_pending_order(
+        SubmitPendingOrderCommand(broker="alpaca", order_id="order_aapl_1")
+    )
+
+    assert result.ok is True
+    assert captured["target"] == "paper"
+
+
+def test_operator_control_service_live_mode_requests_live_broker_target(
+    tmp_path: Path,
+) -> None:
+    PendingOrderStateStore(tmp_path).save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+            )
+        )
+    )
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_mode="live",
+            broker_trading_enabled=True,
+            live_actions_require_confirmation=False,
+        )
+    )
+    adapter = FakeBrokerAdapter(
+        placed_update=BrokerOrderUpdate(
+            broker_name="alpaca",
+            broker_order_id="alpaca-ord-1",
+            client_order_id="order_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=10,
+            filled_quantity=0,
+            status="accepted",
+        )
+    )
+    captured: dict[str, str | None] = {}
+
+    def target_aware_factory(
+        broker_name: str,
+        *,
+        env_file: Path | None = None,
+        target: str | None = None,
+    ) -> FakeBrokerAdapter:
+        assert broker_name == "alpaca"
+        assert env_file is None
+        captured["target"] = target
+        return adapter
+
+    service = OperatorControlService(
+        project_root=tmp_path,
+        broker_adapter_factory=target_aware_factory,
+    )
+
+    result = service.submit_pending_order(
+        SubmitPendingOrderCommand(broker="alpaca", order_id="order_aapl_1")
+    )
+
+    assert result.ok is True
+    assert captured["target"] == "live"
+
+
+def test_operator_control_service_rejects_env_target_mismatch_against_policy(
+    tmp_path: Path,
+) -> None:
+    PendingOrderStateStore(tmp_path).save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+            )
+        )
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            (
+                "ALPACA_API_KEY_ID=test-key",
+                "ALPACA_SECRET_KEY=test-secret",
+                "ALPACA_BROKER_BASE_URL=https://api.alpaca.markets",
+            )
+        ),
+        encoding="utf-8",
+    )
+    service = OperatorControlService(
+        project_root=tmp_path,
+        env_file=env_file,
+    )
+
+    result = service.submit_pending_order(
+        SubmitPendingOrderCommand(broker="alpaca", order_id="order_aapl_1")
+    )
+
+    assert result.ok is False
+    assert result.status == "failed"
+    assert result.error_code == "broker_unavailable"
+    assert "Execution policy requires the Alpaca paper target" in result.message
 
 
 def test_operator_control_service_rejects_submit_when_paused(tmp_path: Path) -> None:
@@ -289,7 +491,7 @@ def test_operator_control_service_rejects_submit_when_paused(tmp_path: Path) -> 
     )
     service = OperatorControlService(
         project_root=tmp_path,
-        broker_adapter_factory=lambda broker, env_file: adapter,
+        broker_adapter_factory=lambda broker, env_file, target=None: adapter,
     )
 
     result = service.submit_pending_order(
@@ -299,6 +501,232 @@ def test_operator_control_service_rejects_submit_when_paused(tmp_path: Path) -> 
     assert result.ok is False
     assert result.status == "rejected"
     assert result.error_code == "execution_paused"
+    assert adapter.place_order_calls == 0
+
+
+def test_operator_control_service_cancel_allowed_when_execution_submissions_paused(
+    tmp_path: Path,
+) -> None:
+    PendingOrderStateStore(tmp_path).save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+                broker_order_id="alpaca-ord-1",
+                broker_status="accepted",
+            )
+        )
+    )
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_submission_enabled=False,
+            paused_reason="operator pause",
+        )
+    )
+    adapter = FakeBrokerAdapter(
+        cancel_update=BrokerOrderUpdate(
+            broker_name="alpaca",
+            broker_order_id="alpaca-ord-1",
+            client_order_id="order_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=10,
+            filled_quantity=0,
+            status="cancelled",
+        )
+    )
+    service = OperatorControlService(
+        project_root=tmp_path,
+        broker_adapter_factory=lambda broker, env_file=None, target=None: adapter,
+    )
+
+    result = service.cancel_pending_order(
+        CancelPendingOrderCommand(broker="alpaca", order_id="order_aapl_1")
+    )
+
+    assert result.ok is True
+    assert result.status == "completed"
+    assert adapter.cancelled_order_ids == ["alpaca-ord-1"]
+
+
+def test_operator_control_service_replace_allowed_when_execution_submissions_paused(
+    tmp_path: Path,
+) -> None:
+    PendingOrderStateStore(tmp_path).save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+                broker_order_id="alpaca-ord-1",
+                broker_status="accepted",
+            )
+        )
+    )
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_submission_enabled=False,
+            paused_reason="operator pause",
+        )
+    )
+    adapter = FakeBrokerAdapter(
+        replace_update=BrokerOrderUpdate(
+            broker_name="alpaca",
+            broker_order_id="alpaca-ord-2",
+            client_order_id="placeholder",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=12,
+            filled_quantity=0,
+            status="accepted",
+            limit_price=101.0,
+        )
+    )
+    service = OperatorControlService(
+        project_root=tmp_path,
+        broker_adapter_factory=lambda broker, env_file=None, target=None: adapter,
+    )
+
+    result = service.replace_pending_order(
+        ReplacePendingOrderCommand(
+            broker="alpaca",
+            order_id="order_aapl_1",
+            quantity=12,
+            limit_price=101.0,
+        )
+    )
+
+    assert result.ok is True
+    assert result.status == "completed"
+    assert adapter.replace_requests[0][0] == "alpaca-ord-1"
+
+
+def test_operator_control_service_rejects_live_submit_without_confirmation(
+    tmp_path: Path,
+) -> None:
+    PendingOrderStateStore(tmp_path).save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+            )
+        )
+    )
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_mode="live",
+            broker_trading_enabled=True,
+            live_actions_require_confirmation=True,
+        )
+    )
+    adapter = FakeBrokerAdapter(
+        placed_update=BrokerOrderUpdate(
+            broker_name="alpaca",
+            broker_order_id="alpaca-ord-1",
+            client_order_id="order_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=10,
+            filled_quantity=0,
+            status="accepted",
+        )
+    )
+    service = OperatorControlService(
+        project_root=tmp_path,
+        broker_adapter_factory=lambda broker, env_file=None, target=None: adapter,
+    )
+
+    result = service.submit_pending_order(
+        SubmitPendingOrderCommand(broker="alpaca", order_id="order_aapl_1")
+    )
+
+    assert result.ok is False
+    assert result.status == "rejected"
+    assert result.error_code == "live_confirmation_required"
+    assert adapter.place_order_calls == 0
+
+
+def test_operator_control_service_rejects_live_submit_when_broker_trading_disabled(
+    tmp_path: Path,
+) -> None:
+    PendingOrderStateStore(tmp_path).save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+            )
+        )
+    )
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_mode="live",
+            broker_trading_enabled=False,
+            live_actions_require_confirmation=False,
+        )
+    )
+    adapter = FakeBrokerAdapter(
+        placed_update=BrokerOrderUpdate(
+            broker_name="alpaca",
+            broker_order_id="alpaca-ord-1",
+            client_order_id="order_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=10,
+            filled_quantity=0,
+            status="accepted",
+        )
+    )
+    service = OperatorControlService(
+        project_root=tmp_path,
+        broker_adapter_factory=lambda broker, env_file=None, target=None: adapter,
+    )
+
+    result = service.submit_pending_order(
+        SubmitPendingOrderCommand(broker="alpaca", order_id="order_aapl_1")
+    )
+
+    assert result.ok is False
+    assert result.status == "rejected"
+    assert result.error_code == "live_broker_trading_disabled"
     assert adapter.place_order_calls == 0
 
 
@@ -345,7 +773,7 @@ def test_operator_control_service_fails_closed_when_control_state_has_string_boo
     )
     service = OperatorControlService(
         project_root=tmp_path,
-        broker_adapter_factory=lambda broker, env_file=None: adapter,
+        broker_adapter_factory=lambda broker, env_file=None, target=None: adapter,
     )
 
     result = service.submit_pending_order(
@@ -358,6 +786,21 @@ def test_operator_control_service_fails_closed_when_control_state_has_string_boo
     assert result.safety_state is not None
     assert result.safety_state.execution_submission_enabled is False
     assert adapter.place_order_calls == 0
+
+
+def test_operator_control_service_pause_fails_closed_when_control_state_file_is_malformed(
+    tmp_path: Path,
+) -> None:
+    state_path = OperatorControlStateStore(tmp_path).path
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{not-json", encoding="utf-8")
+    service = OperatorControlService(project_root=tmp_path)
+
+    result = service.pause_execution(PauseExecutionCommand(reason="maintenance"))
+
+    assert result.ok is False
+    assert result.status == "failed"
+    assert result.error_code == "control_state_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -420,7 +863,7 @@ def test_operator_control_service_fails_closed_when_control_state_file_is_malfor
     )
     service = OperatorControlService(
         project_root=tmp_path,
-        broker_adapter_factory=lambda broker, env_file=None: adapter,
+        broker_adapter_factory=lambda broker, env_file=None, target=None: adapter,
     )
 
     command = command_builder()
@@ -538,7 +981,7 @@ def test_operator_control_service_cancel_without_snapshot_returns_transitional_r
     adapter = FakeBrokerAdapter(cancel_update=None)
     service = OperatorControlService(
         project_root=tmp_path,
-        broker_adapter_factory=lambda broker, env_file=None: adapter,
+        broker_adapter_factory=lambda broker, env_file=None, target=None: adapter,
     )
 
     result = service.cancel_pending_order(
@@ -637,7 +1080,7 @@ def test_operator_control_service_force_broker_sync_reconciles_updates(
     )
     service = OperatorControlService(
         project_root=tmp_path,
-        broker_adapter_factory=lambda broker, env_file: adapter,
+        broker_adapter_factory=lambda broker, env_file, target=None: adapter,
     )
 
     result = service.force_broker_sync(ForceBrokerSyncCommand(broker="alpaca"))
@@ -646,6 +1089,50 @@ def test_operator_control_service_force_broker_sync_reconciles_updates(
     assert result.status == "completed"
     assert result.data["matched_update_count"] == 1
     assert store.load().orders["order_aapl_1"].status == "filled"
+
+
+def test_operator_control_service_force_broker_sync_requires_target_aware_factory(
+    tmp_path: Path,
+) -> None:
+    store = PendingOrderStateStore(tmp_path)
+    store.save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+                broker_order_id="alpaca-ord-1",
+                client_order_id="order_aapl_1",
+                broker_status="accepted",
+            )
+        )
+    )
+
+    def keyword_only_factory(
+        broker_name: str,
+        *,
+        env_file: Path | None = None,
+    ) -> FakeBrokerAdapter:
+        raise AssertionError(f"Factory should not be called without target support: {broker_name}")
+
+    service = OperatorControlService(
+        project_root=tmp_path,
+        broker_adapter_factory=keyword_only_factory,
+    )
+
+    result = service.force_broker_sync(ForceBrokerSyncCommand(broker="alpaca"))
+
+    assert result.ok is False
+    assert result.status == "failed"
+    assert result.error_code == "broker_unavailable"
+    assert "unexpected keyword argument 'target'" in result.message
 
 
 def test_operator_control_service_returns_clear_failure_when_broker_sync_unavailable(
@@ -674,7 +1161,7 @@ def test_operator_control_service_returns_clear_failure_when_broker_sync_unavail
     adapter = FakeBrokerAdapter(get_order_error=BrokerRequestError("broker unavailable"))
     service = OperatorControlService(
         project_root=tmp_path,
-        broker_adapter_factory=lambda broker, env_file: adapter,
+        broker_adapter_factory=lambda broker, env_file, target=None: adapter,
     )
 
     result = service.force_broker_sync(ForceBrokerSyncCommand(broker="alpaca"))
@@ -719,7 +1206,7 @@ def test_operator_control_response_for_request_returns_structured_submit_result(
     )
     service = OperatorControlService(
         project_root=tmp_path,
-        broker_adapter_factory=lambda broker, env_file: adapter,
+        broker_adapter_factory=lambda broker, env_file, target=None: adapter,
     )
 
     status, payload = operator_control_response_for_request(
@@ -735,7 +1222,7 @@ def test_operator_control_response_for_request_returns_structured_submit_result(
     assert payload["status"] == "completed"
 
 
-def test_operator_control_response_for_request_supports_keyword_only_factory_path(
+def test_operator_control_response_for_request_rejects_factory_without_target_support(
     tmp_path: Path,
 ) -> None:
     PendingOrderStateStore(tmp_path).save(
@@ -789,9 +1276,10 @@ def test_operator_control_response_for_request_supports_keyword_only_factory_pat
         body=json.dumps({"broker": "alpaca", "order_id": "order_aapl_1"}).encode("utf-8"),
     )
 
-    assert status == HTTPStatus.OK
-    assert payload["ok"] is True
-    assert payload["status"] == "completed"
+    assert status == HTTPStatus.BAD_GATEWAY
+    assert payload["ok"] is False
+    assert payload["error_code"] == "broker_unavailable"
+    assert "unexpected keyword argument 'target'" in payload["message"]
 
 
 def test_operator_control_response_for_request_returns_structured_failure_for_factory_error(
@@ -882,6 +1370,45 @@ def test_operator_control_response_for_request_returns_readable_safety_state_by_
     assert payload["available"] is True
     assert payload["data"]["control_state_readable"] is True
     assert payload["data"]["safety_state"]["execution_submission_enabled"] is True
+    assert payload["data"]["safety_state"]["execution_mode"] == "paper"
+    assert payload["data"]["safety_state"]["live_actions_require_confirmation"] is True
+    assert payload["data"]["safety_state"]["broker_trading_enabled"] is False
+    assert payload["data"]["policy_summary"]["is_live_mode"] is False
+
+
+def test_operator_control_response_for_request_returns_execution_policy_endpoint(
+    tmp_path: Path,
+) -> None:
+    service = OperatorControlService(project_root=tmp_path)
+
+    status, payload = operator_control_response_for_request(
+        control_service=service,
+        method="GET",
+        path="/control/execution/policy",
+        body=None,
+    )
+
+    assert status == HTTPStatus.OK
+    assert payload["endpoint"] == "control_execution_policy"
+    assert payload["data"]["policy_summary"]["execution_mode"] == "paper"
+
+
+def test_operator_control_response_for_request_sets_execution_mode(
+    tmp_path: Path,
+) -> None:
+    service = OperatorControlService(project_root=tmp_path)
+
+    status, payload = operator_control_response_for_request(
+        control_service=service,
+        method="POST",
+        path="/control/execution/mode",
+        body=json.dumps({"execution_mode": "live"}).encode("utf-8"),
+    )
+
+    assert status == HTTPStatus.OK
+    assert payload["ok"] is True
+    assert payload["status"] == "completed"
+    assert payload["safety_state"]["execution_mode"] == "live"
 
 
 def test_operator_control_response_for_request_returns_structured_safety_when_state_is_malformed(

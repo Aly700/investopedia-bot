@@ -11,15 +11,20 @@ import bot.main as main_module
 from bot.broker.execution import (
     AlpacaBrokerCredentials,
     AlpacaBrokerExecutionAdapter,
+    BrokerConfigurationError,
     BrokerOrderRequest,
     BrokerRequestError,
     BrokerOrderUpdate,
     BrokerReplaceOrderRequest,
+    DEFAULT_ALPACA_LIVE_BROKER_BASE_URL,
+    DEFAULT_ALPACA_PAPER_BROKER_BASE_URL,
+    create_broker_execution_adapter,
 )
 from bot.broker.reconciliation import (
     reconcile_broker_order_updates,
     submit_pending_orders_via_broker,
 )
+from bot.api.control_api import OperatorControlState, OperatorControlStateStore
 from bot.config import load_app_config
 from bot.data.pending_orders import (
     PendingOrderRecord,
@@ -206,6 +211,50 @@ def test_alpaca_broker_adapter_normalizes_place_order_request_and_response(
     assert update.side == "BUY"
     assert update.order_type == "LIMIT"
     assert update.quantity == 10
+
+
+def test_create_broker_execution_adapter_forces_paper_target() -> None:
+    adapter = create_broker_execution_adapter(
+        "alpaca",
+        environ={
+            "ALPACA_API_KEY_ID": "test-key",
+            "ALPACA_SECRET_KEY": "test-secret",
+        },
+        target="paper",
+    )
+
+    assert isinstance(adapter, AlpacaBrokerExecutionAdapter)
+    assert adapter.credentials.base_url == DEFAULT_ALPACA_PAPER_BROKER_BASE_URL
+
+
+def test_create_broker_execution_adapter_forces_live_target() -> None:
+    adapter = create_broker_execution_adapter(
+        "alpaca",
+        environ={
+            "ALPACA_API_KEY_ID": "test-key",
+            "ALPACA_SECRET_KEY": "test-secret",
+        },
+        target="live",
+    )
+
+    assert isinstance(adapter, AlpacaBrokerExecutionAdapter)
+    assert adapter.credentials.base_url == DEFAULT_ALPACA_LIVE_BROKER_BASE_URL
+
+
+def test_create_broker_execution_adapter_rejects_target_env_mismatch() -> None:
+    with pytest.raises(
+        BrokerConfigurationError,
+        match="Execution policy requires the Alpaca paper target",
+    ):
+        create_broker_execution_adapter(
+            "alpaca",
+            environ={
+                "ALPACA_API_KEY_ID": "test-key",
+                "ALPACA_SECRET_KEY": "test-secret",
+                "ALPACA_BROKER_BASE_URL": DEFAULT_ALPACA_LIVE_BROKER_BASE_URL,
+            },
+            target="paper",
+        )
 
 
 def test_submit_pending_orders_via_broker_updates_state_with_broker_ids() -> None:
@@ -684,6 +733,80 @@ def test_handle_submit_broker_orders_routes_notification_events(
     assert payloads[-1]["notification_delivery"]["delivered_count"] == 1
 
 
+def test_handle_submit_broker_orders_rejects_when_live_policy_blocks_trading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    store = PendingOrderStateStore(tmp_path)
+    store.save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+            )
+        )
+    )
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_mode="live",
+            broker_trading_enabled=False,
+            live_actions_require_confirmation=False,
+        )
+    )
+    adapter = FakeBrokerAdapter(
+        placed_update=BrokerOrderUpdate(
+            broker_name="alpaca",
+            broker_order_id="alpaca-ord-1",
+            client_order_id="order_aapl_1",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=10,
+            filled_quantity=0,
+            status="accepted",
+        )
+    )
+    payloads: list[dict[str, object]] = []
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir=None: config)
+    monkeypatch.setattr(
+        main_module,
+        "_create_broker_adapter",
+        lambda broker, env_file=None: adapter,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_print_structured",
+        lambda payload, output_format: payloads.append(payload),
+    )
+
+    args = SimpleNamespace(
+        config_dir=config.config_dir,
+        env_file=None,
+        broker="alpaca",
+        order_ids=None,
+        format="json",
+        confirm_live_action=False,
+    )
+
+    assert main_module._handle_submit_broker_orders(args) == 0
+
+    assert adapter.placed_requests == []
+    assert payloads[-1]["submitted_count"] == 0
+    assert "disabled by execution policy" in payloads[-1]["warnings"][0]
+    assert payloads[-1]["order_results"][0]["error_code"] == "live_broker_trading_disabled"
+
+
 def test_handle_sync_broker_orders_reconciles_fill_into_pending_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -752,6 +875,54 @@ def test_handle_sync_broker_orders_reconciles_fill_into_pending_state(
     assert persisted_state.orders["order_aapl_1"].status == "filled"
     assert any(event.event_type == "executed" for event in events)
     assert payloads[-1]["matched_update_count"] == 1
+
+
+def test_handle_sync_broker_orders_uses_policy_execution_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_mode="live",
+        )
+    )
+    adapter = FakeBrokerAdapter(sync_updates={})
+    payloads: list[dict[str, object]] = []
+    captured: dict[str, str | None] = {}
+
+    def target_aware_create_broker_adapter(
+        broker: str,
+        env_file: Path | None = None,
+        target: str | None = None,
+    ) -> FakeBrokerAdapter:
+        assert broker == "alpaca"
+        assert env_file is None
+        captured["target"] = target
+        return adapter
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir=None: config)
+    monkeypatch.setattr(main_module, "_create_broker_adapter", target_aware_create_broker_adapter)
+    monkeypatch.setattr(
+        main_module,
+        "_print_structured",
+        lambda payload, output_format: payloads.append(payload),
+    )
+
+    args = SimpleNamespace(
+        config_dir=config.config_dir,
+        env_file=None,
+        broker="alpaca",
+        order_ids=None,
+        format="json",
+    )
+
+    assert main_module._handle_sync_broker_orders(args) == 0
+
+    assert captured["target"] == "live"
+    assert payloads[-1]["ok"] is True
+    assert payloads[-1]["status"] == "no_op"
 
 
 def test_handle_sync_broker_orders_uses_open_order_scan_to_recover_missing_local_broker_id(
@@ -862,6 +1033,50 @@ def test_handle_sync_broker_orders_surfaces_unmatched_broker_open_orders(
     assert "could not be matched" in payloads[-1]["warnings"][0]
 
 
+def test_handle_sync_broker_orders_fails_closed_when_control_state_is_malformed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    state_path = OperatorControlStateStore(tmp_path).path
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{not-json", encoding="utf-8")
+    payloads: list[dict[str, object]] = []
+    create_calls = 0
+
+    def target_aware_create_broker_adapter(
+        broker: str,
+        env_file: Path | None = None,
+        target: str | None = None,
+    ) -> FakeBrokerAdapter:
+        nonlocal create_calls
+        create_calls += 1
+        raise AssertionError(f"Broker adapter should not be created for {broker}/{target}.")
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir=None: config)
+    monkeypatch.setattr(main_module, "_create_broker_adapter", target_aware_create_broker_adapter)
+    monkeypatch.setattr(
+        main_module,
+        "_print_structured",
+        lambda payload, output_format: payloads.append(payload),
+    )
+
+    args = SimpleNamespace(
+        config_dir=config.config_dir,
+        env_file=None,
+        broker="alpaca",
+        order_ids=None,
+        format="json",
+    )
+
+    assert main_module._handle_sync_broker_orders(args) == 0
+
+    assert create_calls == 0
+    assert payloads[-1]["ok"] is False
+    assert payloads[-1]["status"] == "failed"
+    assert payloads[-1]["error_code"] == "control_state_unavailable"
+
+
 def test_handle_cancel_broker_order_marks_order_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -924,6 +1139,69 @@ def test_handle_cancel_broker_order_marks_order_cancelled(
     assert persisted_state.orders["order_aapl_1"].status == "cancelled"
     assert adapter.cancelled_order_ids == ["alpaca-ord-1"]
     assert payloads[-1]["order_id"] == "order_aapl_1"
+
+
+def test_handle_cancel_broker_order_requires_live_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    store = PendingOrderStateStore(tmp_path)
+    store.save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+                broker_order_id="alpaca-ord-1",
+                broker_status="accepted",
+            )
+        )
+    )
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_mode="live",
+            broker_trading_enabled=True,
+            live_actions_require_confirmation=True,
+        )
+    )
+    adapter = FakeBrokerAdapter(cancel_update=None)
+    payloads: list[dict[str, object]] = []
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir=None: config)
+    monkeypatch.setattr(
+        main_module,
+        "_create_broker_adapter",
+        lambda broker, env_file=None: adapter,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_print_structured",
+        lambda payload, output_format: payloads.append(payload),
+    )
+
+    args = SimpleNamespace(
+        config_dir=config.config_dir,
+        env_file=None,
+        broker="alpaca",
+        order_id="order_aapl_1",
+        format="json",
+        confirm_live_action=False,
+    )
+
+    assert main_module._handle_cancel_broker_order(args) == 0
+
+    assert adapter.cancelled_order_ids == []
+    assert payloads[-1]["status"] == "rejected"
+    assert payloads[-1]["error_code"] == "live_confirmation_required"
 
 
 def test_handle_cancel_broker_order_marks_order_pending_cancel_when_snapshot_missing(
@@ -1047,6 +1325,85 @@ def test_handle_replace_broker_order_transfers_reservation(
     assert payloads[-1]["replaced_order_id"] == "order_aapl_1"
 
 
+def test_handle_replace_broker_order_requires_live_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    store = PendingOrderStateStore(tmp_path)
+    store.save(
+        _pending_order_state(
+            PendingOrderRecord(
+                order_id="order_aapl_1",
+                symbol="AAPL",
+                side="BUY",
+                order_type="LIMIT",
+                created_at="2024-01-05T15:00:00+00:00",
+                status="pending",
+                requested_quantity=10,
+                requested_price=100.0,
+                reserved_notional=1_000.0,
+                reserved_slot=True,
+                broker_order_id="alpaca-ord-1",
+                broker_status="accepted",
+            )
+        )
+    )
+    OperatorControlStateStore(tmp_path).save(
+        OperatorControlState(
+            updated_at_utc="2024-01-05T15:00:00+00:00",
+            execution_mode="live",
+            broker_trading_enabled=True,
+            live_actions_require_confirmation=True,
+        )
+    )
+    adapter = FakeBrokerAdapter(
+        replace_update=BrokerOrderUpdate(
+            broker_name="alpaca",
+            broker_order_id="alpaca-ord-2",
+            client_order_id="placeholder",
+            symbol="AAPL",
+            side="BUY",
+            order_type="LIMIT",
+            quantity=12,
+            filled_quantity=0,
+            status="accepted",
+            limit_price=101.0,
+        )
+    )
+    payloads: list[dict[str, object]] = []
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir=None: config)
+    monkeypatch.setattr(
+        main_module,
+        "_create_broker_adapter",
+        lambda broker, env_file=None: adapter,
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_print_structured",
+        lambda payload, output_format: payloads.append(payload),
+    )
+
+    args = SimpleNamespace(
+        config_dir=config.config_dir,
+        env_file=None,
+        broker="alpaca",
+        order_id="order_aapl_1",
+        quantity=12,
+        limit_price=101.0,
+        stop_price=None,
+        format="json",
+        confirm_live_action=False,
+    )
+
+    assert main_module._handle_replace_broker_order(args) == 0
+
+    assert adapter.replace_requests == []
+    assert payloads[-1]["status"] == "rejected"
+    assert payloads[-1]["error_code"] == "live_confirmation_required"
+
+
 def test_handle_sync_broker_orders_warns_when_broker_update_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1091,6 +1448,47 @@ def test_handle_sync_broker_orders_warns_when_broker_update_is_unavailable(
     assert main_module._handle_sync_broker_orders(args) == 0
     assert "broker temporarily unavailable" in payloads[-1]["warnings"][0]
     assert store.load() == starting_state
+
+
+def test_handle_sync_broker_orders_rejects_env_target_mismatch_against_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            (
+                "ALPACA_API_KEY_ID=test-key",
+                "ALPACA_SECRET_KEY=test-secret",
+                "ALPACA_BROKER_BASE_URL=https://api.alpaca.markets",
+            )
+        ),
+        encoding="utf-8",
+    )
+    payloads: list[dict[str, object]] = []
+
+    monkeypatch.setattr(main_module, "load_app_config", lambda config_dir=None: config)
+    monkeypatch.setattr(
+        main_module,
+        "_print_structured",
+        lambda payload, output_format: payloads.append(payload),
+    )
+
+    args = SimpleNamespace(
+        config_dir=config.config_dir,
+        env_file=env_file,
+        broker="alpaca",
+        order_ids=None,
+        format="json",
+    )
+
+    assert main_module._handle_sync_broker_orders(args) == 0
+
+    assert payloads[-1]["ok"] is False
+    assert payloads[-1]["status"] == "failed"
+    assert payloads[-1]["error_code"] == "broker_unavailable"
+    assert "Execution policy requires the Alpaca paper target" in payloads[-1]["message"]
 
 
 def _pending_order_state(*records: PendingOrderRecord):

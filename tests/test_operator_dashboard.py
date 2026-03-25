@@ -207,6 +207,9 @@ def test_dashboard_app_asset_references_internal_api_endpoints() -> None:
     assert 'controlSafety: "/control/safety"' in javascript
     assert 'pauseExecution: "/control/execution/pause"' in javascript
     assert 'resumeExecution: "/control/execution/resume"' in javascript
+    assert 'setExecutionMode: "/control/execution/mode"' in javascript
+    assert 'setLiveConfirmation: "/control/execution/live-confirmation"' in javascript
+    assert 'setBrokerTrading: "/control/execution/broker-trading"' in javascript
     assert 'submitOrder: "/control/orders/submit"' in javascript
     assert 'cancelOrder: "/control/orders/cancel"' in javascript
     assert 'replaceOrder: "/control/orders/replace"' in javascript
@@ -291,6 +294,10 @@ def test_dashboard_app_asset_renders_replace_editor_form_and_force_sync_control(
     assert "replace-limit-price" in javascript
     assert "replace-stop-price" in javascript
     assert "Force broker sync" in javascript
+    assert "Switch to live" in javascript
+    assert "Switch to paper" in javascript
+    assert "Enable live trading" in javascript
+    assert "Require live confirm" in javascript
     assert 'action: "submit-replace-order"' in javascript
     assert "Only changed fields will be sent to the backend replacement request." in javascript
 
@@ -821,6 +828,144 @@ def test_dashboard_runtime_replace_without_changes_does_not_send_unchanged_field
           "Change at least one replacement field before submitting the order amendment."
         ) {
           throw new Error(`Unexpected local rejection message: ${state.lastControlResult.payload.message}`);
+        }
+        """,
+    )
+
+
+def test_dashboard_runtime_live_submit_sends_confirmation_flag_when_required(
+    tmp_path: Path,
+) -> None:
+    _run_dashboard_app_runtime_test(
+        tmp_path,
+        test_body="""
+        function endpointPayload(path) {
+          if (path === "/control/safety") {
+            return {
+              available: true,
+              warnings: [],
+              data: {
+                control_state_readable: true,
+                safety_state: {
+                  execution_submission_enabled: true,
+                  execution_mode: "live",
+                  live_actions_require_confirmation: true,
+                  broker_trading_enabled: true,
+                },
+                policy_summary: {
+                  execution_mode: "live",
+                  execution_submission_enabled: true,
+                  live_actions_require_confirmation: true,
+                  broker_trading_enabled: true,
+                  is_live_mode: true,
+                  live_broker_mutations_allowed: true,
+                },
+              },
+            };
+          }
+          if (path === "/pending-orders") {
+            return {
+              available: true,
+              warnings: [],
+              data: {
+                active_order_count: 1,
+                active_orders: [
+                  {
+                    order_id: "order_aapl_1",
+                    symbol: "AAPL",
+                    side: "BUY",
+                    status: "pending",
+                    broker_status: null,
+                    broker_order_id: null,
+                    broker_name: "alpaca",
+                    requested_quantity: 10,
+                    requested_price: 100,
+                    reserved_notional: 1000,
+                  },
+                ],
+                summary: {
+                  capacity_reserving_buy_order_count: 1,
+                  reserved_notional: 1000,
+                  pending_fill_notional: 0,
+                  reserved_slot_count: 1,
+                  position_context_available: true,
+                  available_slots: 3,
+                },
+              },
+            };
+          }
+          return {
+            available: false,
+            not_available_reason: "not-ready",
+            warnings: [],
+            data: {},
+          };
+        }
+
+        state.currentResults = {
+          health: {
+            ok: true,
+            payload: endpointPayload("/health"),
+          },
+          marketState: {
+            ok: true,
+            payload: endpointPayload("/market-state"),
+          },
+          marketTransitions: {
+            ok: true,
+            payload: endpointPayload("/market-state/transitions"),
+          },
+          portfolio: {
+            ok: true,
+            payload: endpointPayload("/portfolio"),
+          },
+          analytics: {
+            ok: true,
+            payload: endpointPayload("/analytics/trade-review"),
+          },
+          controlSafety: {
+            ok: true,
+            payload: endpointPayload("/control/safety"),
+          },
+          pendingOrders: {
+            ok: true,
+            payload: endpointPayload("/pending-orders"),
+          },
+        };
+
+        let confirmCalls = 0;
+        context.window.confirm = () => {
+          confirmCalls += 1;
+          return true;
+        };
+
+        fetchImpl = async (path, options = {}) => {
+          const method = options.method || "GET";
+          if (method === "POST") {
+            return jsonResponse({
+              command_name: "submit_pending_order",
+              ok: true,
+              status: "completed",
+              message: "Submitted.",
+              warnings: [],
+              data: {},
+            });
+          }
+          return jsonResponse(endpointPayload(path));
+        };
+
+        await handleControlAction("submit-order", "order_aapl_1");
+
+        const postCalls = fetchCalls.filter((call) => call.method === "POST");
+        if (postCalls.length !== 1) {
+          throw new Error(`Expected one live submit request, saw ${postCalls.length}.`);
+        }
+        const payload = JSON.parse(postCalls[0].body);
+        if (payload.confirm_live_action !== true) {
+          throw new Error(`Expected confirm_live_action=true, saw ${postCalls[0].body}`);
+        }
+        if (confirmCalls !== 1) {
+          throw new Error(`Expected one confirmation prompt, saw ${confirmCalls}.`);
         }
         """,
     )

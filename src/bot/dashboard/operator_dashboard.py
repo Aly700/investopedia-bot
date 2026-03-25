@@ -864,6 +864,9 @@ const ENDPOINTS = {
 const CONTROL_ENDPOINTS = {
   pauseExecution: "/control/execution/pause",
   resumeExecution: "/control/execution/resume",
+  setExecutionMode: "/control/execution/mode",
+  setLiveConfirmation: "/control/execution/live-confirmation",
+  setBrokerTrading: "/control/execution/broker-trading",
   submitOrder: "/control/orders/submit",
   cancelOrder: "/control/orders/cancel",
   replaceOrder: "/control/orders/replace",
@@ -1039,6 +1042,10 @@ function controlSafetySnapshot(result) {
     readable: false,
     executionEnabled: null,
     executionMode: "unknown",
+    isLiveMode: false,
+    liveConfirmationRequired: null,
+    brokerTradingEnabled: null,
+    liveBrokerMutationsAllowed: false,
     pausedReason: null,
     warnings: [],
     fetchError: result && !result.ok ? result.error : null,
@@ -1050,6 +1057,24 @@ function controlSafetySnapshot(result) {
   const payload = asObject(result.payload);
   const data = asObject(payload.data);
   const safetyState = asObject(data.safety_state);
+  const policySummary = asObject(data.policy_summary);
+  const executionMode = safetyState.execution_mode || "unknown";
+  const isLiveMode =
+    typeof policySummary.is_live_mode === "boolean"
+      ? policySummary.is_live_mode
+      : executionMode === "live";
+  const brokerTradingEnabled =
+    typeof safetyState.broker_trading_enabled === "boolean"
+      ? safetyState.broker_trading_enabled
+      : typeof policySummary.broker_trading_enabled === "boolean"
+        ? policySummary.broker_trading_enabled
+        : null;
+  const liveConfirmationRequired =
+    typeof safetyState.live_actions_require_confirmation === "boolean"
+      ? safetyState.live_actions_require_confirmation
+      : typeof policySummary.live_actions_require_confirmation === "boolean"
+        ? policySummary.live_actions_require_confirmation
+        : null;
   return {
     available: payload.available === true,
     readable: data.control_state_readable !== false,
@@ -1057,7 +1082,14 @@ function controlSafetySnapshot(result) {
       typeof safetyState.execution_submission_enabled === "boolean"
         ? safetyState.execution_submission_enabled
         : null,
-    executionMode: safetyState.execution_mode || "unknown",
+    executionMode,
+    isLiveMode,
+    liveConfirmationRequired,
+    brokerTradingEnabled,
+    liveBrokerMutationsAllowed:
+      typeof policySummary.live_broker_mutations_allowed === "boolean"
+        ? policySummary.live_broker_mutations_allowed
+        : !isLiveMode || brokerTradingEnabled === true,
     pausedReason: safetyState.paused_reason || null,
     warnings: asArray(payload.warnings),
     fetchError: payload.available ? null : payload.not_available_reason || "control_safety_unavailable",
@@ -1265,6 +1297,17 @@ function renderHealth(result, controlResult) {
           : "Execution submissions are paused."
       );
     }
+    if (control.isLiveMode) {
+      warningNotes.push("Live execution mode is active.");
+      if (control.liveConfirmationRequired === true) {
+        warningNotes.push("Live broker mutations require explicit confirmation.");
+      }
+      if (control.brokerTradingEnabled !== true) {
+        warningNotes.push(
+          "Live broker trading is disabled. Submit, cancel, and replace actions are blocked."
+        );
+      }
+    }
   }
 
   const pauseDisabled =
@@ -1278,6 +1321,38 @@ function renderHealth(result, controlResult) {
     !control.readable ||
     control.executionEnabled !== false;
   const syncDisabled = state.actionInFlight || !control.available || !control.readable;
+  const setPaperDisabled =
+    state.actionInFlight ||
+    !control.available ||
+    !control.readable ||
+    control.executionMode === "paper";
+  const setLiveDisabled =
+    state.actionInFlight ||
+    !control.available ||
+    !control.readable ||
+    control.executionMode === "live";
+  const enableLiveTradingDisabled =
+    state.actionInFlight ||
+    !control.available ||
+    !control.readable ||
+    !control.isLiveMode ||
+    control.brokerTradingEnabled === true;
+  const disableLiveTradingDisabled =
+    state.actionInFlight ||
+    !control.available ||
+    !control.readable ||
+    !control.isLiveMode ||
+    control.brokerTradingEnabled !== true;
+  const requireLiveConfirmDisabled =
+    state.actionInFlight ||
+    !control.available ||
+    !control.readable ||
+    control.liveConfirmationRequired === true;
+  const disableLiveConfirmDisabled =
+    state.actionInFlight ||
+    !control.available ||
+    !control.readable ||
+    control.liveConfirmationRequired === false;
 
   element.innerHTML = `
     ${renderMetricGrid([
@@ -1291,6 +1366,8 @@ function renderHealth(result, controlResult) {
       ["Last successful cycle", formatDateTime(status.last_successful_flush_at_utc)],
       ["Execution submissions", control.executionEnabled === null ? "Unavailable" : control.executionEnabled ? "Enabled" : "Paused"],
       ["Execution mode", formatControlStatus(control.executionMode)],
+      ["Live confirmation", control.liveConfirmationRequired === null ? "Unavailable" : control.liveConfirmationRequired ? "Required" : "Not required"],
+      ["Broker trading", control.brokerTradingEnabled === null ? "Unavailable" : control.brokerTradingEnabled ? "Enabled" : "Disabled"],
     ])}
     ${renderNotes(errorNotes, "bad")}
     ${renderNotes(warningNotes, warningNotes.length ? "warn" : "neutral")}
@@ -1314,6 +1391,42 @@ function renderHealth(result, controlResult) {
           tone: "neutral",
           action: "force-broker-sync",
           disabled: syncDisabled,
+        })}
+        ${renderActionButton({
+          label: "Switch to paper",
+          tone: "neutral",
+          action: "set-paper-mode",
+          disabled: setPaperDisabled,
+        })}
+        ${renderActionButton({
+          label: "Switch to live",
+          tone: "bad",
+          action: "set-live-mode",
+          disabled: setLiveDisabled,
+        })}
+        ${renderActionButton({
+          label: "Require live confirm",
+          tone: "warn",
+          action: "require-live-confirmation",
+          disabled: requireLiveConfirmDisabled,
+        })}
+        ${renderActionButton({
+          label: "Skip live confirm",
+          tone: "neutral",
+          action: "disable-live-confirmation",
+          disabled: disableLiveConfirmDisabled,
+        })}
+        ${renderActionButton({
+          label: "Enable live trading",
+          tone: "bad",
+          action: "enable-live-broker-trading",
+          disabled: enableLiveTradingDisabled,
+        })}
+        ${renderActionButton({
+          label: "Disable live trading",
+          tone: "neutral",
+          action: "disable-live-broker-trading",
+          disabled: disableLiveTradingDisabled,
         })}
       </div>
     </div>
@@ -1427,7 +1540,10 @@ function renderPortfolio(result) {
 
 function renderPendingOrderActions(order, control) {
   const isActiveOrder = order.status === "pending" || order.status === "partially_filled";
-  const controlBlocked = !control.available || !control.readable;
+  const controlBlocked =
+    !control.available ||
+    !control.readable ||
+    (control.isLiveMode && control.brokerTradingEnabled !== true);
   const submitDisabled =
     state.actionInFlight ||
     controlBlocked ||
@@ -1538,10 +1654,21 @@ function renderPendingOrders(result, controlResult) {
   } else if (control.executionEnabled === false) {
     controlNotes.push("Execution submissions are paused. Submit actions are disabled.");
   }
+  if (control.isLiveMode && control.liveConfirmationRequired === true) {
+    controlNotes.push(
+      "Live broker mutations require explicit confirmation before the backend request is sent."
+    );
+  }
+  if (control.isLiveMode && control.brokerTradingEnabled !== true) {
+    controlNotes.push(
+      "Live broker trading is disabled. Submit, cancel, and replace actions are blocked."
+    );
+  }
   let replaceOrder = activeOrders.find((order) => order.order_id === state.replaceEditorOrderId) || null;
   const replaceEditorBlocked =
     !control.available ||
     !control.readable ||
+    (control.isLiveMode && control.brokerTradingEnabled !== true) ||
     (replaceOrder && replaceOrder.broker_status === "pending_cancel");
   if ((!replaceOrder || replaceEditorBlocked) && state.replaceEditorOrderId) {
     state.replaceEditorOrderId = null;
@@ -1822,6 +1949,9 @@ async function executeControlAction(path, payload) {
 }
 
 async function handleControlAction(action, orderId) {
+  const control = controlSafetySnapshot(
+    state.currentResults ? state.currentResults.controlSafety : null
+  );
   if (action === "pause-execution") {
     await executeControlAction(CONTROL_ENDPOINTS.pauseExecution, {});
     return;
@@ -1833,6 +1963,48 @@ async function handleControlAction(action, orderId) {
   if (action === "force-broker-sync") {
     await executeControlAction(CONTROL_ENDPOINTS.forceBrokerSync, {
       broker: resolveControlBroker(),
+    });
+    return;
+  }
+  if (action === "set-paper-mode") {
+    await executeControlAction(CONTROL_ENDPOINTS.setExecutionMode, {
+      execution_mode: "paper",
+    });
+    return;
+  }
+  if (action === "set-live-mode") {
+    if (!window.confirm("Switch execution mode to LIVE?")) {
+      return;
+    }
+    await executeControlAction(CONTROL_ENDPOINTS.setExecutionMode, {
+      execution_mode: "live",
+    });
+    return;
+  }
+  if (action === "require-live-confirmation") {
+    await executeControlAction(CONTROL_ENDPOINTS.setLiveConfirmation, {
+      required: true,
+    });
+    return;
+  }
+  if (action === "disable-live-confirmation") {
+    await executeControlAction(CONTROL_ENDPOINTS.setLiveConfirmation, {
+      required: false,
+    });
+    return;
+  }
+  if (action === "enable-live-broker-trading") {
+    if (!window.confirm("Enable LIVE broker trading?")) {
+      return;
+    }
+    await executeControlAction(CONTROL_ENDPOINTS.setBrokerTrading, {
+      enabled: true,
+    });
+    return;
+  }
+  if (action === "disable-live-broker-trading") {
+    await executeControlAction(CONTROL_ENDPOINTS.setBrokerTrading, {
+      enabled: false,
     });
     return;
   }
@@ -1850,23 +2022,41 @@ async function handleControlAction(action, orderId) {
   }
 
   if (action === "submit-order") {
-    if (!window.confirm(`Submit pending order ${order.order_id} for ${order.symbol}?`)) {
+    const confirmMessage = control.isLiveMode && control.liveConfirmationRequired
+      ? `Submit LIVE pending order ${order.order_id} for ${order.symbol}?`
+      : `Submit pending order ${order.order_id} for ${order.symbol}?`;
+    if (!window.confirm(confirmMessage)) {
       return;
     }
-    await executeControlAction(CONTROL_ENDPOINTS.submitOrder, {
+    const payload = {
       broker: resolveControlBroker(order),
       order_id: order.order_id,
+    };
+    if (control.isLiveMode && control.liveConfirmationRequired) {
+      payload.confirm_live_action = true;
+    }
+    await executeControlAction(CONTROL_ENDPOINTS.submitOrder, {
+      ...payload,
     });
     return;
   }
 
   if (action === "cancel-order") {
-    if (!window.confirm(`Cancel broker order for ${order.order_id} (${order.symbol})?`)) {
+    const confirmMessage = control.isLiveMode && control.liveConfirmationRequired
+      ? `Cancel LIVE broker order for ${order.order_id} (${order.symbol})?`
+      : `Cancel broker order for ${order.order_id} (${order.symbol})?`;
+    if (!window.confirm(confirmMessage)) {
       return;
     }
-    await executeControlAction(CONTROL_ENDPOINTS.cancelOrder, {
+    const payload = {
       broker: resolveControlBroker(order),
       order_id: order.order_id,
+    };
+    if (control.isLiveMode && control.liveConfirmationRequired) {
+      payload.confirm_live_action = true;
+    }
+    await executeControlAction(CONTROL_ENDPOINTS.cancelOrder, {
+      ...payload,
     });
     return;
   }
@@ -1926,6 +2116,16 @@ async function handleControlAction(action, orderId) {
         "replace_pending_order"
       );
       return;
+    }
+    if (
+      control.isLiveMode &&
+      control.liveConfirmationRequired &&
+      !window.confirm(`Replace LIVE broker order ${order.order_id} for ${order.symbol}?`)
+    ) {
+      return;
+    }
+    if (control.isLiveMode && control.liveConfirmationRequired) {
+      payload.confirm_live_action = true;
     }
     state.replaceEditorOrderId = null;
     await executeControlAction(CONTROL_ENDPOINTS.replaceOrder, payload);

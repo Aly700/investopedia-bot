@@ -17,7 +17,10 @@ from bot.data.pending_orders import PendingOrderRecord
 
 
 DEFAULT_BROKER_TIMEOUT_SECONDS = 30
-DEFAULT_ALPACA_BROKER_BASE_URL = "https://paper-api.alpaca.markets"
+DEFAULT_ALPACA_PAPER_BROKER_BASE_URL = "https://paper-api.alpaca.markets"
+DEFAULT_ALPACA_LIVE_BROKER_BASE_URL = "https://api.alpaca.markets"
+DEFAULT_ALPACA_BROKER_BASE_URL = DEFAULT_ALPACA_PAPER_BROKER_BASE_URL
+BROKER_EXECUTION_TARGETS = ("paper", "live")
 BROKER_ORDER_TYPES = ("MARKET", "LIMIT", "STOP_LIMIT")
 BROKER_ORDER_SIDES = ("BUY", "SELL")
 BROKER_ORDER_STATUSES = (
@@ -358,6 +361,7 @@ def create_broker_execution_adapter(
     env_file: Path | None = None,
     environ: Mapping[str, str] | None = None,
     timeout_seconds: int = DEFAULT_BROKER_TIMEOUT_SECONDS,
+    target: str | None = None,
 ) -> BrokerExecutionAdapter:
     """Return a configured broker adapter."""
 
@@ -370,6 +374,7 @@ def create_broker_execution_adapter(
         env_file=env_file,
         environ=environ,
         timeout_seconds=timeout_seconds,
+        target=target,
     )
 
 
@@ -403,6 +408,7 @@ class AlpacaBrokerExecutionAdapter(BrokerExecutionAdapter):
         env_file: Path | None = None,
         environ: Mapping[str, str] | None = None,
         timeout_seconds: int = DEFAULT_BROKER_TIMEOUT_SECONDS,
+        target: str | None = None,
     ) -> "AlpacaBrokerExecutionAdapter":
         merged = _read_env_file(env_file)
         merged.update(dict(environ or os.environ))
@@ -414,11 +420,26 @@ class AlpacaBrokerExecutionAdapter(BrokerExecutionAdapter):
             _clean_optional_text(merged.get("ALPACA_BROKER_SECRET_KEY"))
             or _clean_optional_text(merged.get("ALPACA_SECRET_KEY"))
         )
-        base_url = (
+        configured_base_url = (
             _clean_optional_text(merged.get("ALPACA_BROKER_BASE_URL"))
             or _clean_optional_text(merged.get("ALPACA_BASE_URL"))
-            or DEFAULT_ALPACA_BROKER_BASE_URL
         )
+        resolved_target = _normalized_broker_execution_target(target)
+        if resolved_target is None:
+            base_url = configured_base_url or DEFAULT_ALPACA_BROKER_BASE_URL
+        else:
+            expected_base_url = _alpaca_base_url_for_target(resolved_target)
+            if (
+                configured_base_url is not None
+                and configured_base_url.rstrip("/") != expected_base_url
+            ):
+                raise BrokerConfigurationError(
+                    "Execution policy requires the Alpaca "
+                    f"{resolved_target} target ({expected_base_url}), but the "
+                    "environment configured "
+                    f"{configured_base_url.rstrip('/')}."
+                )
+            base_url = expected_base_url
         if api_key is None or secret_key is None:
             raise BrokerConfigurationError(
                 "Alpaca broker credentials are missing. Set ALPACA_API_KEY_ID and "
@@ -780,6 +801,26 @@ def _clean_optional_text(value: object) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+def _normalized_broker_execution_target(target: str | None) -> str | None:
+    if target is None:
+        return None
+    cleaned = target.strip().lower()
+    if cleaned not in BROKER_EXECUTION_TARGETS:
+        expected = ", ".join(BROKER_EXECUTION_TARGETS)
+        raise ValueError(
+            f"target must be one of {expected}, got '{target}'."
+        )
+    return cleaned
+
+
+def _alpaca_base_url_for_target(target: str) -> str:
+    if target == "paper":
+        return DEFAULT_ALPACA_PAPER_BROKER_BASE_URL
+    if target == "live":
+        return DEFAULT_ALPACA_LIVE_BROKER_BASE_URL
+    raise ValueError(f"Unsupported Alpaca broker target '{target}'.")
 
 
 def _format_price(value: float) -> str:
