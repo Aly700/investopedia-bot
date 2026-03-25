@@ -258,6 +258,13 @@ from bot.service.local_staging_runtime import (
     LocalStagingRuntimeConfig,
     create_local_staging_runtime,
 )
+from bot.service.paper_validation import (
+    build_local_paper_validation_profile,
+    build_local_paper_validation_runtime_config,
+    build_local_paper_validation_summary,
+    create_local_paper_validation_runtime,
+    write_local_paper_validation_summary,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -1245,6 +1252,126 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dashboard polling cadence in seconds.",
     )
     run_local_staging_runtime_parser.set_defaults(handler=_handle_run_local_staging_runtime)
+
+    run_local_paper_validation_parser = subparsers.add_parser(
+        "run-local-paper-validation",
+        help="Launch the isolated always-on paper-validation runtime profile.",
+    )
+    _add_live_market_service_arguments(
+        run_local_paper_validation_parser,
+        output_dir_help=(
+            "Optional archive directory for live report outputs. Defaults to "
+            "<validation-root>/archive/live_market/<as-of-date>."
+        ),
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--validation-root",
+        type=Path,
+        default=None,
+        help="Optional isolated root for the local paper-validation profile.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--preserve-existing-safety-state",
+        action="store_true",
+        help="Do not reset the validation safety state to the forced paper profile on startup.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--internal-api-host",
+        default="127.0.0.1",
+        help="Bind host for the local paper-validation internal API.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--internal-api-port",
+        type=int,
+        default=8765,
+        help="Bind port for the local paper-validation internal API.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--control-api-host",
+        default="127.0.0.1",
+        help="Bind host for the local paper-validation operator control API.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--control-api-port",
+        type=int,
+        default=8766,
+        help="Bind port for the local paper-validation operator control API.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--dashboard-host",
+        default="127.0.0.1",
+        help="Bind host for the local paper-validation dashboard.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8780,
+        help="Bind port for the local paper-validation dashboard.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--dashboard-refresh-seconds",
+        type=int,
+        default=5,
+        help="Dashboard polling cadence in seconds.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--active-log-filename",
+        default="local_paper_validation.log",
+        help="Active runtime log filename under the profile logs directory.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--log-rotate-max-bytes",
+        type=int,
+        default=250_000,
+        help="Rotate the active paper-validation log after this many bytes.",
+    )
+    run_local_paper_validation_parser.add_argument(
+        "--log-rotate-backup-count",
+        type=int,
+        default=5,
+        help="Maximum archived paper-validation log files to keep.",
+    )
+    run_local_paper_validation_parser.set_defaults(
+        handler=_handle_run_local_paper_validation
+    )
+
+    summarize_local_paper_validation_parser = subparsers.add_parser(
+        "summarize-local-paper-validation",
+        help="Write a checkpoint and operational review summary for the paper-validation runtime.",
+    )
+    summarize_local_paper_validation_parser.add_argument(
+        "--validation-root",
+        type=Path,
+        default=None,
+        help="Optional isolated root for the local paper-validation profile.",
+    )
+    summarize_local_paper_validation_parser.add_argument(
+        "--as-of",
+        type=_parse_iso_date,
+        default=date.today(),
+        help="Right edge date for the validation review window.",
+    )
+    summarize_local_paper_validation_parser.add_argument(
+        "--window-days",
+        type=int,
+        default=1,
+        help="Number of recent days to include in the validation review window.",
+    )
+    summarize_local_paper_validation_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for the validation summary outputs.",
+    )
+    summarize_local_paper_validation_parser.add_argument(
+        "--format",
+        choices=("yaml", "json"),
+        default="yaml",
+        help="Console summary output format.",
+    )
+    summarize_local_paper_validation_parser.set_defaults(
+        handler=_handle_summarize_local_paper_validation
+    )
 
     serve_internal_api_parser = subparsers.add_parser(
         "serve-internal-api",
@@ -3071,7 +3198,7 @@ def _handle_run_local_staging_runtime(args: argparse.Namespace) -> int:
     )
     try:
         runtime.start(max_iterations=args.max_iterations)
-        runtime.wait_for_supervisor()
+        runtime.wait_for_stack()
     except KeyboardInterrupt:
         LOGGER.info("Stopping local staging runtime.")
     except RuntimeError as exc:
@@ -3114,6 +3241,132 @@ def _handle_run_local_staging_runtime(args: argparse.Namespace) -> int:
             if bundle is not None
             else {}
         ),
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_run_local_paper_validation(args: argparse.Namespace) -> int:
+    profile = build_local_paper_validation_profile(
+        project_root=args.config_dir.resolve().parent,
+        validation_root=args.validation_root,
+    )
+    runtime_config = build_local_paper_validation_runtime_config(
+        profile=profile,
+        source_config_dir=args.config_dir,
+        source_env_file=args.env_file,
+        internal_api_host=args.internal_api_host,
+        internal_api_port=args.internal_api_port,
+        control_api_host=args.control_api_host,
+        control_api_port=args.control_api_port,
+        dashboard_host=args.dashboard_host,
+        dashboard_port=args.dashboard_port,
+        dashboard_refresh_seconds=args.dashboard_refresh_seconds,
+        active_log_filename=args.active_log_filename,
+        log_rotate_max_bytes=args.log_rotate_max_bytes,
+        log_rotate_backup_count=args.log_rotate_backup_count,
+    )
+    bundle_holder: dict[str, _LiveMarketServiceBundle] = {}
+    try:
+        runtime = create_local_paper_validation_runtime(
+            runtime_config=runtime_config,
+            validation_root=profile.validation_root,
+            reset_safety_state=not args.preserve_existing_safety_state,
+            supervisor_factory=lambda config, paths: _capture_staging_supervisor(
+                bundle_holder,
+                _build_live_market_service_bundle(
+                    args,
+                    config=config,
+                    env_file=paths.env_file,
+                    output_dir=(
+                        args.output_dir
+                        or profile.default_live_output_dir(as_of_date=args.as_of)
+                    ).resolve(),
+                ),
+            ),
+        )
+    except OSError as exc:
+        raise ValueError(f"Failed to initialize local paper validation runtime: {exc}") from exc
+
+    runtime.configure_logging(level=args.log_level, json_logs=args.json_logs)
+    LOGGER.info(
+        "Starting local paper validation runtime: internal_api=%s control_api=%s dashboard=%s",
+        runtime.internal_api_url,
+        runtime.control_api_url,
+        runtime.dashboard_url,
+    )
+    runtime_failure: RuntimeError | None = None
+    try:
+        runtime.start(max_iterations=args.max_iterations)
+        runtime.wait_for_stack()
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping local paper validation runtime.")
+    except RuntimeError as exc:
+        runtime_failure = exc
+    finally:
+        runtime.stop()
+
+    review_paths = runtime.write_review_summary(
+        as_of_date=args.as_of,
+        window_days=1,
+    )
+    if runtime_failure is not None:
+        raise ValueError(str(runtime_failure)) from runtime_failure
+    bundle = bundle_holder.get("live_market_bundle")
+    supervisor_status = runtime.last_supervisor_result
+    payload = {
+        "command": "run-local-paper-validation",
+        "validation_profile": profile.to_dict(),
+        "as_of_date": args.as_of.isoformat(),
+        "websocket_url": args.websocket_url,
+        "transport_name": args.transport_name,
+        "portfolio_file": (
+            str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
+        ),
+        "include_intraday_review": bool(args.include_intraday_review),
+        "notifications_enabled": (
+            bundle.notification_router is not None if bundle is not None else False
+        ),
+        "status": (
+            supervisor_status.to_dict()
+            if hasattr(supervisor_status, "to_dict")
+            else supervisor_status
+        ),
+        "outputs": (
+            dict(sorted(bundle.latest_outputs.items()))
+            if bundle is not None
+            else {}
+        ),
+        "review_outputs": {
+            label: str(path.resolve()) for label, path in sorted(review_paths.items())
+        },
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0
+
+
+def _handle_summarize_local_paper_validation(args: argparse.Namespace) -> int:
+    profile = build_local_paper_validation_profile(
+        project_root=args.config_dir.resolve().parent,
+        validation_root=args.validation_root,
+    )
+    summary = build_local_paper_validation_summary(
+        profile,
+        as_of_date=args.as_of,
+        window_days=args.window_days,
+    )
+    review_output_dir = (
+        args.output_dir
+        or profile.default_review_output_dir(as_of_date=args.as_of)
+    ).resolve()
+    written_paths = write_local_paper_validation_summary(
+        summary,
+        output_dir=review_output_dir,
+    )
+    payload = summary.to_dict()
+    payload["command"] = "summarize-local-paper-validation"
+    payload["review_outputs"] = {
+        label: str(path.resolve()) for label, path in sorted(written_paths.items())
     }
     _print_structured(payload, output_format=args.format)
     return 0

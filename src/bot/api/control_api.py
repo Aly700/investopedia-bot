@@ -190,13 +190,42 @@ def default_operator_control_state_path(project_root: Path) -> Path:
     return _OPERATOR_CONTROL_STATE_PATH.resolve(project_root)
 
 
+def initialize_operator_control_state_if_missing(
+    project_root: Path,
+    *,
+    state: OperatorControlState | None = None,
+) -> Path:
+    """Persist a default control-state artifact when one does not yet exist."""
+
+    store = OperatorControlStateStore(project_root)
+    if store.path.exists():
+        return store.path.resolve()
+    return store.save(state or OperatorControlState())
+
+
 def load_operator_control_state(path: Path) -> OperatorControlState:
     return _load_operator_control_state_result(path).state
 
 
-def _load_operator_control_state_result(path: Path) -> _OperatorControlStateLoadResult:
+def _load_operator_control_state_result(
+    path: Path,
+    *,
+    fail_closed_if_missing: bool = False,
+) -> _OperatorControlStateLoadResult:
     resolved_path = path.resolve()
     if not resolved_path.exists():
+        if fail_closed_if_missing:
+            LOGGER.warning(
+                "Operator control state at %s is missing; execution submissions are paused for safety.",
+                resolved_path,
+            )
+            return _operator_control_state_unavailable_result(
+                resolved_path,
+                warning=(
+                    f"Operator control state at {resolved_path} is missing. "
+                    "Execution submissions are paused for safety."
+                ),
+            )
         return _OperatorControlStateLoadResult(state=OperatorControlState())
     try:
         payload = json.loads(resolved_path.read_text(encoding="utf-8"))
@@ -211,19 +240,30 @@ def _load_operator_control_state_result(path: Path) -> _OperatorControlStateLoad
             resolved_path,
             exc,
         )
-        return _OperatorControlStateLoadResult(
-            state=OperatorControlState(
-                execution_submission_enabled=False,
-                paused_reason=(
-                    "Operator control state is unreadable; execution submissions are "
-                    "paused for safety."
-                ),
+        return _operator_control_state_unavailable_result(
+            resolved_path,
+            warning=(
+                f"Operator control state at {resolved_path} could not be loaded: {exc}"
             ),
-            warnings=(
-                f"Operator control state at {resolved_path} could not be loaded: {exc}",
-            ),
-            degraded=True,
         )
+
+
+def _operator_control_state_unavailable_result(
+    resolved_path: Path,
+    *,
+    warning: str,
+) -> _OperatorControlStateLoadResult:
+    return _OperatorControlStateLoadResult(
+        state=OperatorControlState(
+            execution_submission_enabled=False,
+            paused_reason=(
+                "Operator control state is unavailable; execution submissions are "
+                "paused for safety."
+            ),
+        ),
+        warnings=(warning,),
+        degraded=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -692,11 +732,13 @@ class OperatorControlService:
         env_file: Path | None = None,
         broker_adapter_factory: BrokerAdapterFactory | None = None,
         now_utc: Callable[[], datetime] | None = None,
+        fail_closed_on_missing_safety_state: bool = False,
     ) -> None:
         self.project_root = project_root
         self.env_file = env_file
         self._broker_adapter_factory = broker_adapter_factory or create_broker_execution_adapter
         self._now_utc = now_utc or (lambda: datetime.now(timezone.utc))
+        self._fail_closed_on_missing_safety_state = fail_closed_on_missing_safety_state
         self._safety_store = OperatorControlStateStore(project_root)
         self._pending_order_store = PendingOrderStateStore(project_root)
         self._trade_feedback_store = TradeFeedbackLogStore(project_root)
@@ -706,7 +748,7 @@ class OperatorControlService:
         return default_operator_control_audit_log_path(self.project_root)
 
     def safety_state(self) -> OperatorControlState:
-        return _load_operator_control_state_result(self._safety_store.path).state
+        return self._load_safety_state_result().state
 
     def pause_execution(self, command: PauseExecutionCommand) -> OperatorCommandResult:
         requested_at = _utc_now_isoformat(self._now_utc())
@@ -1574,7 +1616,10 @@ class OperatorControlService:
         }
 
     def _load_safety_state_result(self) -> _OperatorControlStateLoadResult:
-        return _load_operator_control_state_result(self._safety_store.path)
+        return _load_operator_control_state_result(
+            self._safety_store.path,
+            fail_closed_if_missing=self._fail_closed_on_missing_safety_state,
+        )
 
     def _create_broker_adapter_for_policy(
         self,

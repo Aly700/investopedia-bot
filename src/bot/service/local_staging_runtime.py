@@ -8,11 +8,13 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 import shutil
 import threading
+import time
 from typing import Any, Callable, Protocol
 
 from bot.api.control_api import (
     OperatorControlService,
     default_operator_control_state_path,
+    initialize_operator_control_state_if_missing,
 )
 from bot.api.internal_api import InternalApiQueryService, create_internal_api_server
 from bot.config import AppConfig, load_app_config
@@ -114,6 +116,13 @@ class LocalStagingRuntime:
     _server_threads: list[threading.Thread] = field(default_factory=list, init=False, repr=False)
     _supervisor_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _supervisor_exception: BaseException | None = field(default=None, init=False, repr=False)
+    _server_exception: BaseException | None = field(default=None, init=False, repr=False)
+    _server_failure_name: str | None = field(default=None, init=False, repr=False)
+    _server_failure_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
     _started: bool = field(default=False, init=False, repr=False)
     last_supervisor_result: object | None = field(default=None, init=False)
 
@@ -150,6 +159,9 @@ class LocalStagingRuntime:
         self._started = True
         self._server_threads = []
         self._supervisor_exception = None
+        self._server_exception = None
+        self._server_failure_name = None
+        self.last_supervisor_result = None
         for name, server in (
             ("internal-api", self.internal_api_server),
             ("control-api", self.control_api_server),
@@ -170,16 +182,44 @@ class LocalStagingRuntime:
         self._supervisor_thread.start()
 
     def wait_for_supervisor(self, timeout: float | None = None) -> bool:
+        return self.wait_for_stack(timeout=timeout)
+
+    def wait_for_stack(
+        self,
+        timeout: float | None = None,
+        *,
+        stabilization_seconds: float = 0.25,
+    ) -> bool:
+        self._raise_if_server_failed()
         if self._supervisor_thread is None:
-            return True
-        self._supervisor_thread.join(timeout=timeout)
-        if self._supervisor_thread.is_alive():
-            return False
+            return self._wait_for_server_stability(
+                timeout=stabilization_seconds,
+            )
+        remaining_timeout = timeout
+        if timeout is None:
+            while self._supervisor_thread.is_alive():
+                self._supervisor_thread.join(timeout=0.1)
+                self._raise_if_server_failed()
+        else:
+            deadline = time.monotonic() + timeout
+            while self._supervisor_thread.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._raise_if_server_failed()
+                    return False
+                self._supervisor_thread.join(timeout=min(0.1, remaining))
+                self._raise_if_server_failed()
+            remaining_timeout = max(deadline - time.monotonic(), 0.0)
         if self._supervisor_exception is not None:
             raise RuntimeError(
                 "Local staging supervisor exited with an exception."
             ) from self._supervisor_exception
-        return True
+        stability_timeout = (
+            stabilization_seconds
+            if remaining_timeout is None
+            else min(stabilization_seconds, remaining_timeout)
+        )
+        return self._wait_for_server_stability(timeout=stability_timeout)
 
     def stop(self) -> None:
         if not self._started:
@@ -245,15 +285,73 @@ class LocalStagingRuntime:
     def _serve_server(self, name: str, server: ThreadingHTTPServer) -> None:
         try:
             server.serve_forever()
-        except Exception:
+        except Exception as exc:
             LOGGER.exception("Local staging %s server exited unexpectedly.", name)
-            raise
+            self._record_server_failure(name, exc)
 
     def _run_supervisor(self, *, max_iterations: int | None) -> None:
         try:
             self.last_supervisor_result = self.supervisor.run(max_iterations=max_iterations)
         except BaseException as exc:
             self._supervisor_exception = exc
+
+    def _record_server_failure(self, name: str, exc: BaseException) -> None:
+        should_stop_stack = False
+        with self._server_failure_lock:
+            if self._server_exception is None:
+                self._server_exception = exc
+                self._server_failure_name = name
+                should_stop_stack = True
+        if not should_stop_stack:
+            return
+        if hasattr(self.supervisor, "stop"):
+            try:
+                self.supervisor.stop()
+            except Exception:
+                LOGGER.exception(
+                    "Failed to stop local staging supervisor after %s server failure.",
+                    name,
+                )
+        for server_name, server in (
+            ("internal-api", self.internal_api_server),
+            ("control-api", self.control_api_server),
+            ("dashboard", self.dashboard_server),
+        ):
+            if server_name == name:
+                continue
+            try:
+                server.shutdown()
+            except Exception:
+                LOGGER.exception(
+                    "Failed to shut down local staging %s server after %s server failure.",
+                    server_name,
+                    name,
+                )
+
+    def _raise_if_server_failed(self) -> None:
+        if self._server_exception is None:
+            return
+        server_name = self._server_failure_name or "unknown"
+        raise RuntimeError(
+            f"Local staging {server_name} server exited with an exception."
+        ) from self._server_exception
+
+    def _wait_for_server_stability(self, *, timeout: float | None) -> bool:
+        if timeout is not None and timeout <= 0:
+            self._raise_if_server_failed()
+            return True
+        if timeout is None:
+            deadline = time.monotonic() + 0.25
+        else:
+            deadline = time.monotonic() + timeout
+        while any(thread.is_alive() for thread in self._server_threads):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.05, remaining))
+            self._raise_if_server_failed()
+        self._raise_if_server_failed()
+        return True
 
 
 def prepare_local_staging_runtime(
@@ -299,12 +397,13 @@ def prepare_local_staging_runtime(
         archive_dir=archive_dir,
     )
 
-    runtime_root.mkdir(parents=True, exist_ok=True)
     config_dir = runtime_root / "config"
+    initialize_control_state = not config_dir.exists()
+    runtime_root.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source_config_dir, config_dir, dirs_exist_ok=True)
 
     env_file = runtime_root / ".env"
-    if source_env_file is not None and source_env_file.exists():
+    if source_env_file is not None and source_env_file.exists() and not env_file.exists():
         env_file.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_env_file, env_file)
 
@@ -319,6 +418,8 @@ def prepare_local_staging_runtime(
         hot_state_mount_path=hot_state_mount_path,
         hot_state_dir=hot_state_dir,
     )
+    if initialize_control_state:
+        initialize_operator_control_state_if_missing(runtime_root)
     active_log_path = logs_dir / runtime_config.active_log_filename
     return LocalStagingRuntimePaths(
         runtime_root=runtime_root,
@@ -361,7 +462,11 @@ def create_local_staging_runtime(
     control_service = (
         control_service_factory(app_config, paths)
         if control_service_factory is not None
-        else OperatorControlService(project_root=app_config.project_root, env_file=paths.env_file)
+        else OperatorControlService(
+            project_root=app_config.project_root,
+            env_file=paths.env_file,
+            fail_closed_on_missing_safety_state=True,
+        )
     )
     resolved_internal_api_server_factory = (
         internal_api_server_factory or create_internal_api_server

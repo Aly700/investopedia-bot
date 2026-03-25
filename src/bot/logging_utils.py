@@ -70,6 +70,17 @@ class ArchiveRotatingFileHandler(RotatingFileHandler):
             self.stream = self._open()
         return archived_path
 
+    def force_rollover(self) -> Path | None:
+        """Serialize a manual rollover with normal emit() calls."""
+
+        self.acquire()
+        try:
+            if self.stream is not None:
+                self.flush()
+            return self.doRollover()
+        finally:
+            self.release()
+
     def _next_archive_path(self, source_path: Path) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         suffix = source_path.suffix
@@ -111,7 +122,7 @@ def rotate_archive_log_handlers(
     for handler in active_logger.handlers:
         if not isinstance(handler, ArchiveRotatingFileHandler):
             continue
-        archived_path = handler.doRollover()
+        archived_path = handler.force_rollover()
         if archived_path is not None:
             archived_paths.append(archived_path)
     return tuple(archived_paths)

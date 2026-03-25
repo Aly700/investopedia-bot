@@ -803,6 +803,21 @@ def test_operator_control_service_pause_fails_closed_when_control_state_file_is_
     assert result.error_code == "control_state_unavailable"
 
 
+def test_operator_control_service_pause_fails_closed_when_control_state_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    service = OperatorControlService(
+        project_root=tmp_path,
+        fail_closed_on_missing_safety_state=True,
+    )
+
+    result = service.pause_execution(PauseExecutionCommand(reason="maintenance"))
+
+    assert result.ok is False
+    assert result.status == "failed"
+    assert result.error_code == "control_state_unavailable"
+
+
 @pytest.mark.parametrize(
     ("command_builder", "expected_error_code"),
     [
@@ -1431,6 +1446,27 @@ def test_operator_control_response_for_request_returns_structured_safety_when_st
     assert payload["warnings"]
     assert payload["data"]["control_state_readable"] is False
     assert payload["data"]["safety_state"]["execution_submission_enabled"] is False
+
+
+def test_operator_control_response_for_request_fails_closed_when_state_is_missing(
+    tmp_path: Path,
+) -> None:
+    service = OperatorControlService(
+        project_root=tmp_path,
+        fail_closed_on_missing_safety_state=True,
+    )
+
+    status, payload = operator_control_response_for_request(
+        control_service=service,
+        method="POST",
+        path="/control/execution/pause",
+        body=json.dumps({"reason": "missing state"}).encode("utf-8"),
+    )
+
+    assert status == HTTPStatus.INTERNAL_SERVER_ERROR
+    assert payload["ok"] is False
+    assert payload["status"] == "failed"
+    assert payload["error_code"] == "control_state_unavailable"
 
 
 def test_build_parser_accepts_serve_operator_control_api_command() -> None:
