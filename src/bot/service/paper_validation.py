@@ -430,15 +430,38 @@ class LocalPaperValidationRuntime:
             )
 
     def restart(self, *, max_iterations: int | None = None) -> "LocalPaperValidationRuntime":
+        was_started = getattr(self.runtime, "_started", False)
         self._record_event(
             "runtime_restart_requested",
             {"max_iterations": max_iterations},
         )
+        if was_started:
+            self._record_event(
+                "runtime_stopped",
+                {
+                    "reason": "restart_requested",
+                    "last_supervisor_result": (
+                        self.last_supervisor_result.to_dict()
+                        if hasattr(self.last_supervisor_result, "to_dict")
+                        else self.last_supervisor_result
+                    ),
+                },
+            )
         restarted_runtime = self.runtime.restart(max_iterations=max_iterations)
         restarted = LocalPaperValidationRuntime(
             profile=self.profile,
             runtime=restarted_runtime,
             event_store=self.event_store,
+        )
+        restarted._record_event(
+            "runtime_started",
+            {
+                "internal_api_url": restarted.internal_api_url,
+                "control_api_url": restarted.control_api_url,
+                "dashboard_url": restarted.dashboard_url,
+                "max_iterations": max_iterations,
+                "restart": True,
+            },
         )
         restarted._record_event(
             "runtime_restarted",
@@ -615,9 +638,14 @@ class LocalPaperValidationSummary:
     control_actions: dict[str, Any]
     trade_feedback: dict[str, Any]
     notification_summary: dict[str, Any]
-    pending_orders: dict[str, Any] | None
-    market_state: dict[str, Any] | None
+    pending_orders: dict[str, Any]
+    market_state: dict[str, Any]
     log_summary: dict[str, Any]
+    paper_integrity: dict[str, Any]
+    anomaly_flags: tuple[dict[str, Any], ...]
+    change_summary: dict[str, Any]
+    daily_review: dict[str, Any]
+    operator_checklist: tuple[dict[str, Any], ...]
     artifact_paths: dict[str, str]
     warnings: tuple[str, ...] = ()
 
@@ -633,9 +661,14 @@ class LocalPaperValidationSummary:
             "control_actions": dict(self.control_actions),
             "trade_feedback": dict(self.trade_feedback),
             "notification_summary": dict(self.notification_summary),
-            "pending_orders": dict(self.pending_orders) if self.pending_orders is not None else None,
-            "market_state": dict(self.market_state) if self.market_state is not None else None,
+            "pending_orders": dict(self.pending_orders),
+            "market_state": dict(self.market_state),
             "log_summary": dict(self.log_summary),
+            "paper_integrity": dict(self.paper_integrity),
+            "anomaly_flags": [dict(item) for item in self.anomaly_flags],
+            "change_summary": dict(self.change_summary),
+            "daily_review": dict(self.daily_review),
+            "operator_checklist": [dict(item) for item in self.operator_checklist],
             "artifact_paths": dict(sorted(self.artifact_paths.items())),
             "warnings": list(self.warnings),
         }
@@ -696,6 +729,10 @@ class LocalPaperValidationSummary:
                 f"errors: {self.log_summary['error_count']} | "
                 f"disconnect warnings: {self.log_summary['disconnect_warning_count']}"
             ),
+            (
+                f"- Anomaly flags: {len(self.anomaly_flags)} | "
+                f"paper integrity warnings: {len(self.paper_integrity.get('integrity_warnings', ()))}"
+            ),
         ]
         repeated = self.log_summary.get("top_warning_messages", [])
         if repeated:
@@ -715,6 +752,414 @@ class LocalPaperValidationSummary:
             lines.extend(["", "Summary warnings"])
             lines.extend(f"- {warning}" for warning in self.warnings)
         return "\n".join(lines)
+
+    def to_daily_review_text(self) -> str:
+        lines = [
+            f"Local paper validation daily review for {self.as_of_date.isoformat()}",
+            "",
+            "Service",
+            (
+                f"- Healthy={self.daily_review['service']['healthy']} | "
+                f"state={self.health_checkpoint['service_state']} | "
+                f"uptime_seconds={self.runtime_journal['estimated_uptime_seconds']} | "
+                f"restarts={self.runtime_journal['restart_count']}"
+            ),
+            (
+                f"- Last successful cycle: {self.health_checkpoint['last_successful_flush_at_utc'] or 'n/a'} | "
+                f"last cycle status: {self.health_checkpoint['last_cycle_status'] or 'n/a'}"
+            ),
+            "",
+            "Connectivity",
+            (
+                f"- Reconnect attempts={self.health_checkpoint['reconnect_attempt_count']} | "
+                f"manual disconnects={self.runtime_journal['manual_disconnect_count']} | "
+                f"manual reconnects={self.runtime_journal['manual_reconnect_count']}"
+            ),
+            (
+                f"- Disconnect warnings={self.log_summary['disconnect_warning_count']} | "
+                f"connect failures={self.log_summary['connect_failure_count']}"
+            ),
+            "",
+            "Safety",
+            (
+                f"- Paper only intact={self.paper_integrity['paper_only_intact']} | "
+                f"execution mode stayed paper={self.paper_integrity['execution_mode_stayed_paper']} | "
+                f"broker target stayed paper={self.paper_integrity['broker_target_stayed_paper']}"
+            ),
+            (
+                f"- Live trading enabled ever={self.paper_integrity['live_trading_enabled_ever']} | "
+                f"control-state degradation count={self.paper_integrity['control_state_degradation_count']} | "
+                f"window degradation count={self.paper_integrity['control_state_degradation_window_count']}"
+            ),
+            "",
+            "Orders And Broker",
+            (
+                f"- Pending orders={self.pending_orders['active_order_count']} | "
+                f"unusual states={self.pending_orders['unusual_state_count']} | "
+                f"broker sync drift signals={self.control_actions['broker_sync_drift_count']}"
+            ),
+            (
+                f"- Broker submitted={self.trade_feedback['broker_submitted_count']} | "
+                f"cancelled={self.trade_feedback['broker_cancelled_count']} | "
+                f"replaced={self.trade_feedback['broker_replaced_count']} | "
+                f"filled={self.trade_feedback['executed_count']}"
+            ),
+            "",
+            "Notifications",
+            (
+                f"- Configured={self.notification_summary['notifications_configured']} | "
+                f"delivery failures={self.notification_summary['delivery_failure_count']} | "
+                f"categories available={self.notification_summary['categories_available']}"
+            ),
+            (
+                f"- Active suppression keys={self.notification_summary['active_key_count']} | "
+                f"delivered once keys={self.notification_summary['delivered_once_key_count']}"
+            ),
+            "",
+            "Attention",
+        ]
+        if self.anomaly_flags:
+            lines.extend(
+                f"- [{flag['severity'].upper()}] {flag['message']}"
+                for flag in self.anomaly_flags
+            )
+        else:
+            lines.append("- No anomaly flags for this review window.")
+        if self.paper_integrity.get("integrity_warnings"):
+            lines.extend(["", "Integrity warnings"])
+            lines.extend(
+                f"- {warning}"
+                for warning in self.paper_integrity["integrity_warnings"]
+            )
+        if self.paper_integrity.get("evidence_notes"):
+            lines.extend(["", "Evidence notes"])
+            lines.extend(
+                f"- {note}"
+                for note in self.paper_integrity["evidence_notes"]
+            )
+        return "\n".join(lines)
+
+    def to_changes_text(self) -> str:
+        lines = [
+            f"What changed on {self.as_of_date.isoformat()}",
+            "",
+            "Actions",
+        ]
+        control_counts = self.change_summary.get("control_actions_by_command", {})
+        if control_counts:
+            lines.extend(
+                f"- {command}: {count}"
+                for command, count in sorted(control_counts.items())
+            )
+        else:
+            lines.append("- No control actions recorded in this window.")
+        broker_counts = self.change_summary.get("broker_events_by_type", {})
+        if broker_counts:
+            lines.extend(["", "Broker/order events"])
+            lines.extend(
+                f"- {event_type}: {count}"
+                for event_type, count in sorted(broker_counts.items())
+            )
+        important_broker_events = self.change_summary.get("important_broker_events", [])
+        if important_broker_events:
+            lines.extend(["", "Recent broker/order activity"])
+            lines.extend(
+                (
+                    f"- {item['timestamp_utc'] or item['as_of_date'] or 'n/a'} "
+                    f"{item['event_type']} {item['symbol']} via {item['workflow']}"
+                )
+                for item in important_broker_events
+            )
+        repeated = self.change_summary.get("repeated_warnings", [])
+        if repeated:
+            lines.extend(["", "Repeated warnings"])
+            lines.extend(
+                f"- {item['count']}x {item['message']}"
+                for item in repeated
+            )
+        failures = self.change_summary.get("failures", [])
+        if failures:
+            lines.extend(["", "Failures"])
+            lines.extend(
+                f"- {item['requested_at_utc']} {item['command_name']} -> {item['status']} ({item['error_code'] or 'no_error_code'})"
+                for item in failures
+            )
+        transitions = self.change_summary.get("state_transitions", [])
+        if transitions:
+            lines.extend(["", "State transitions"])
+            lines.extend(
+                f"- {item['symbol'] or 'n/a'} {item['action'] or 'n/a'} ({item['transition_type'] or 'n/a'})"
+                for item in transitions
+            )
+        return "\n".join(lines)
+
+    def to_checklist_text(self) -> str:
+        lines = [
+            f"Paper validation operator checklist for {self.as_of_date.isoformat()}",
+            "",
+        ]
+        lines.extend(
+            f"[{item['status'].upper()}] {item['item']}: {item['detail']}"
+            for item in self.operator_checklist
+        )
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class LocalPaperValidationSmokeResult:
+    """Compact Day-1 bounded smoke-run verdict for the paper-validation stack."""
+
+    generated_at_utc: str
+    as_of_date: date
+    max_iterations: int | None
+    passed: bool
+    startup_succeeded: bool
+    runtime_stopped_cleanly: bool
+    api_available: bool
+    internal_api_available: bool
+    control_api_available: bool
+    dashboard_available: bool
+    service_status_artifact_present: bool
+    successful_cycle_count: int
+    last_successful_cycle_at_utc: str | None
+    review_artifacts_written: bool
+    paper_only_intact: bool
+    execution_mode_current: str | None
+    execution_submission_enabled: bool | None
+    broker_trading_enabled: bool | None
+    warning_count: int
+    anomaly_flag_count: int
+    blocking_issues: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    artifact_paths: dict[str, str] = field(default_factory=dict)
+    probe_results: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "generated_at_utc": self.generated_at_utc,
+            "as_of_date": self.as_of_date.isoformat(),
+            "max_iterations": self.max_iterations,
+            "passed": self.passed,
+            "startup_succeeded": self.startup_succeeded,
+            "runtime_stopped_cleanly": self.runtime_stopped_cleanly,
+            "api_available": self.api_available,
+            "internal_api_available": self.internal_api_available,
+            "control_api_available": self.control_api_available,
+            "dashboard_available": self.dashboard_available,
+            "service_status_artifact_present": self.service_status_artifact_present,
+            "successful_cycle_count": self.successful_cycle_count,
+            "last_successful_cycle_at_utc": self.last_successful_cycle_at_utc,
+            "review_artifacts_written": self.review_artifacts_written,
+            "paper_only_intact": self.paper_only_intact,
+            "execution_mode_current": self.execution_mode_current,
+            "execution_submission_enabled": self.execution_submission_enabled,
+            "broker_trading_enabled": self.broker_trading_enabled,
+            "warning_count": self.warning_count,
+            "anomaly_flag_count": self.anomaly_flag_count,
+            "blocking_issues": list(self.blocking_issues),
+            "warnings": list(self.warnings),
+            "artifact_paths": dict(sorted(self.artifact_paths.items())),
+            "probe_results": dict(self.probe_results),
+        }
+
+    def to_brief(self) -> str:
+        lines = [
+            f"Local paper validation smoke run for {self.as_of_date.isoformat()}",
+            "",
+            (
+                f"- Passed={self.passed} | startup_succeeded={self.startup_succeeded} | "
+                f"runtime_stopped_cleanly={self.runtime_stopped_cleanly}"
+            ),
+            (
+                f"- API available={self.api_available} | "
+                f"internal_api={self.internal_api_available} | "
+                f"control_api={self.control_api_available} | "
+                f"dashboard={self.dashboard_available}"
+            ),
+            (
+                f"- Successful cycles={self.successful_cycle_count} | "
+                f"last successful cycle={self.last_successful_cycle_at_utc or 'n/a'}"
+            ),
+            (
+                f"- Review artifacts written={self.review_artifacts_written} | "
+                f"service status artifact present={self.service_status_artifact_present}"
+            ),
+            (
+                f"- Paper only intact={self.paper_only_intact} | "
+                f"execution_mode={self.execution_mode_current or 'n/a'} | "
+                f"execution_submission_enabled={self.execution_submission_enabled} | "
+                f"broker_trading_enabled={self.broker_trading_enabled}"
+            ),
+            (
+                f"- Warning count={self.warning_count} | "
+                f"anomaly flags={self.anomaly_flag_count} | "
+                f"blocking issues={len(self.blocking_issues)}"
+            ),
+        ]
+        if self.blocking_issues:
+            lines.extend(["", "Blocking issues"])
+            lines.extend(f"- {issue}" for issue in self.blocking_issues)
+        if self.warnings:
+            lines.extend(["", "Warnings"])
+            lines.extend(f"- {warning}" for warning in self.warnings[:10])
+        return "\n".join(lines)
+
+
+def build_local_paper_validation_smoke_result(
+    profile: LocalPaperValidationProfile,
+    *,
+    as_of_date: date,
+    max_iterations: int | None,
+    summary: LocalPaperValidationSummary | None,
+    review_paths: Mapping[str, Path],
+    internal_api_probe: Mapping[str, Any],
+    control_api_probe: Mapping[str, Any],
+    dashboard_probe: Mapping[str, Any],
+    startup_succeeded: bool,
+    runtime_stopped_cleanly: bool,
+    runtime_failure_message: str | None = None,
+    review_failure_message: str | None = None,
+    summary_failure_message: str | None = None,
+) -> LocalPaperValidationSmokeResult:
+    """Build a compact pass/fail verdict for one bounded Day-1 smoke run."""
+
+    internal_api_available = bool(internal_api_probe.get("available"))
+    control_api_available = bool(control_api_probe.get("available"))
+    dashboard_available = bool(dashboard_probe.get("available"))
+    api_available = internal_api_available and control_api_available
+    required_review_labels = (
+        "paper_validation_summary_json",
+        "paper_validation_checkpoint_json",
+        "paper_validation_brief",
+    )
+    review_artifacts_written = all(
+        review_paths.get(label) is not None and review_paths[label].exists()
+        for label in required_review_labels
+    )
+    service_status_path = (
+        Path(summary.artifact_paths["live_market_service_status"])
+        if summary is not None
+        and summary.artifact_paths.get("live_market_service_status") is not None
+        else LiveMarketServiceStatusStore(profile.runtime_root).path
+    )
+    service_status_artifact_present = service_status_path.exists()
+    health_checkpoint = summary.health_checkpoint if summary is not None else {}
+    safety_summary = summary.safety if summary is not None else {}
+    paper_integrity = summary.paper_integrity if summary is not None else {}
+    successful_cycle_count = _coerce_int(health_checkpoint.get("cycle_count"))
+    last_successful_cycle_at_utc = health_checkpoint.get("last_successful_flush_at_utc")
+    execution_mode_current = safety_summary.get("current_execution_mode")
+    execution_submission_enabled = safety_summary.get("execution_submission_enabled")
+    broker_trading_enabled = safety_summary.get("broker_trading_enabled")
+    paper_only_intact = bool(paper_integrity.get("paper_only_intact"))
+    blocking_issues: list[str] = []
+    if runtime_failure_message:
+        blocking_issues.append(runtime_failure_message)
+    if not startup_succeeded:
+        blocking_issues.append("Smoke runtime did not complete startup successfully.")
+    if review_failure_message:
+        blocking_issues.append(review_failure_message)
+    if summary_failure_message:
+        blocking_issues.append(summary_failure_message)
+    if not internal_api_available:
+        blocking_issues.append("Internal API health endpoint was not reachable during the smoke run.")
+    if not control_api_available:
+        blocking_issues.append("Operator control safety endpoint was not reachable during the smoke run.")
+    if not dashboard_available:
+        blocking_issues.append("Operator dashboard was not reachable during the smoke run.")
+    if not service_status_artifact_present:
+        blocking_issues.append("Live service status artifact was not written.")
+    if not review_artifacts_written:
+        blocking_issues.append(
+            "Required paper-validation review artifacts were not written."
+        )
+    if successful_cycle_count < 1 or not last_successful_cycle_at_utc:
+        blocking_issues.append(
+            "No successful market cycle completed during the smoke run."
+        )
+    if execution_mode_current != "paper":
+        blocking_issues.append(
+            f"Execution mode drifted out of paper mode: current_execution_mode={execution_mode_current!r}."
+        )
+    if broker_trading_enabled is True:
+        blocking_issues.append(
+            "Broker trading was enabled during the smoke run."
+        )
+    if summary is None:
+        blocking_issues.append(
+            "Paper-validation summary was not available for the smoke run verdict."
+        )
+    elif not bool(safety_summary.get("paper_guardrail_active")):
+        blocking_issues.append(
+            "Paper-validation guardrail was not active in the smoke-run summary."
+        )
+    elif not bool(safety_summary.get("control_state_readable")):
+        blocking_issues.append(
+            "Final operator control state was unreadable at the end of the smoke run."
+        )
+    elif not paper_only_intact:
+        blocking_issues.append(
+            "Paper-only integrity did not hold for the smoke run."
+        )
+    if not runtime_stopped_cleanly:
+        blocking_issues.append("Smoke runtime did not stop cleanly.")
+
+    warning_messages = list(summary.warnings) if summary is not None else []
+    if summary is not None:
+        warning_messages.extend(
+            str(flag.get("message"))
+            for flag in summary.anomaly_flags
+            if str(flag.get("severity")) != "critical" and flag.get("message")
+        )
+        warning_messages.extend(
+            str(note)
+            for note in paper_integrity.get("evidence_notes", ())
+            if isinstance(note, str)
+        )
+    deduped_warnings = tuple(_dedupe_texts(warning_messages))
+    artifact_paths = {}
+    if summary is not None:
+        artifact_paths.update(summary.artifact_paths)
+    artifact_paths.update(
+        {
+            label: str(path.resolve())
+            for label, path in sorted(review_paths.items())
+        }
+    )
+    return LocalPaperValidationSmokeResult(
+        generated_at_utc=_utc_now_isoformat(datetime.now(timezone.utc)),
+        as_of_date=as_of_date,
+        max_iterations=max_iterations,
+        passed=not blocking_issues,
+        startup_succeeded=startup_succeeded,
+        runtime_stopped_cleanly=runtime_stopped_cleanly,
+        api_available=api_available,
+        internal_api_available=internal_api_available,
+        control_api_available=control_api_available,
+        dashboard_available=dashboard_available,
+        service_status_artifact_present=service_status_artifact_present,
+        successful_cycle_count=successful_cycle_count,
+        last_successful_cycle_at_utc=last_successful_cycle_at_utc,
+        review_artifacts_written=review_artifacts_written,
+        paper_only_intact=paper_only_intact,
+        execution_mode_current=execution_mode_current,
+        execution_submission_enabled=execution_submission_enabled,
+        broker_trading_enabled=broker_trading_enabled,
+        warning_count=(
+            _coerce_int(summary.log_summary.get("warning_count"))
+            if summary is not None
+            else 0
+        ),
+        anomaly_flag_count=(len(summary.anomaly_flags) if summary is not None else 0),
+        blocking_issues=tuple(blocking_issues),
+        warnings=deduped_warnings,
+        artifact_paths=artifact_paths,
+        probe_results={
+            "internal_api": dict(internal_api_probe),
+            "control_api": dict(control_api_probe),
+            "dashboard": dict(dashboard_probe),
+        },
+    )
 
 
 def build_local_paper_validation_summary(
@@ -805,6 +1250,17 @@ def build_local_paper_validation_summary(
     live_mode_success_count = sum(
         record.status == "completed" for record in live_mode_attempt_records
     )
+    broker_records = [
+        record
+        for record in control_records
+        if record.command_name
+        in {
+            "submit_pending_order",
+            "cancel_pending_order",
+            "replace_pending_order",
+            "force_broker_sync",
+        }
+    ]
     broker_sync_drift_count = 0
     for record in control_records_window:
         if record.command_name != "force_broker_sync":
@@ -822,6 +1278,7 @@ def build_local_paper_validation_summary(
 
     feedback_counts_by_type = Counter(event.event_type for event in feedback_events_window)
     feedback_counts_by_workflow = Counter(event.workflow for event in feedback_events_window)
+    important_broker_events = _important_broker_event_summaries(feedback_events_window)
     action_counts_by_day = Counter(
         record.requested_at_utc[:10] for record in control_records_window
     )
@@ -845,49 +1302,30 @@ def build_local_paper_validation_summary(
         as_of_date=resolved_as_of_date,
     )
 
-    notification_summary = {
-        "notifications_configured": _notifications_configured(profile.runtime_root / ".env"),
-        "updated_at_utc": notification_state.updated_at_utc,
-        "active_key_count": len(notification_state.active_keys),
-        "delivered_once_key_count": len(notification_state.delivered_once_keys),
-    }
+    notification_summary = _build_notification_summary(
+        env_file=profile.runtime_root / ".env",
+        notification_state=notification_state,
+        log_summary=log_summary,
+    )
 
     health_checkpoint = _build_health_checkpoint_payload(health_payload)
     recent_transitions = _recent_transition_summaries(market_state_transitions_payload)
-    market_state_summary = None
-    if market_state_payload is not None:
-        market_state_data = market_state_payload.get("data")
-        if isinstance(market_state_data, Mapping):
-            snapshot = market_state_data.get("snapshot", {})
-            alertable_states = market_state_data.get("current_alertable_states", ())
-            top_priority_candidates = market_state_data.get("top_priority_candidates", ())
-            market_state_summary = {
-                "available": bool(market_state_payload.get("available")),
-                "transition_count": market_state_data.get("transition_count"),
-                "baseline_established": market_state_data.get("baseline_established"),
-                "alertable_state_count": len(alertable_states) if isinstance(alertable_states, Sequence) else 0,
-                "top_priority_candidate_count": (
-                    len(top_priority_candidates)
-                    if isinstance(top_priority_candidates, Sequence)
-                    else 0
-                ),
-                "portfolio_path": (
-                    snapshot.get("portfolio_path")
-                    if isinstance(snapshot, Mapping)
-                    else None
-                ),
-                "recent_transitions": recent_transitions,
-            }
-
-    pending_orders_summary = None
-    if pending_orders_payload is not None:
-        pending_data = pending_orders_payload.get("data")
-        if isinstance(pending_data, Mapping):
-            summary = pending_data.get("summary", {})
-            pending_orders_summary = dict(summary) if isinstance(summary, Mapping) else None
-
-    paper_only_intact = (
-        safety_state.get("execution_mode") == "paper" and live_mode_success_count == 0
+    market_state_summary = _build_market_state_summary(
+        market_state_payload,
+        recent_transitions=recent_transitions,
+    )
+    pending_orders_summary = _build_pending_orders_summary(pending_orders_payload)
+    paper_integrity = _build_paper_integrity_summary(
+        current_safety_state=safety_state,
+        safety_payload=safety_payload,
+        control_records=control_records,
+        broker_records=broker_records,
+        live_mode_attempt_records=live_mode_attempt_records,
+        live_mode_success_count=live_mode_success_count,
+        journal_events=journal_events,
+        journal_events_window=journal_events_window,
+        window_start=window_start,
+        as_of_date=resolved_as_of_date,
     )
     safety_summary = {
         "paper_guardrail_active": True,
@@ -898,12 +1336,65 @@ def build_local_paper_validation_summary(
         ),
         "broker_trading_enabled": safety_state.get("broker_trading_enabled"),
         "control_state_readable": bool(safety_payload["data"]["control_state_readable"]),
-        "paper_only_intact": paper_only_intact,
+        "paper_only_intact": paper_integrity["paper_only_intact"],
         "live_mode_attempt_count": len(live_mode_attempt_records),
         "live_mode_success_count": live_mode_success_count,
         "current_state": safety_state,
         "warnings": list(safety_payload.get("warnings", ())),
     }
+    change_summary = _build_change_summary(
+        as_of_date=resolved_as_of_date,
+        control_counts_by_command=control_counts_by_command,
+        failed_control_records=failed_control_records,
+        recent_transitions=recent_transitions,
+        feedback_events_window=feedback_events_window,
+        feedback_counts_by_type=feedback_counts_by_type,
+        top_warning_messages=log_summary["top_warning_messages"],
+        pending_orders_summary=pending_orders_summary,
+    )
+    anomaly_flags = _build_anomaly_flags(
+        health_checkpoint=health_checkpoint,
+        runtime_journal_summary=runtime_journal_summary,
+        control_actions_summary={
+            "broker_sync_drift_count": broker_sync_drift_count,
+            "failed_or_rejected_count": len(failed_control_records),
+        },
+        log_summary=log_summary,
+        paper_integrity=paper_integrity,
+    )
+    daily_review = _build_daily_review(
+        as_of_date=resolved_as_of_date,
+        health_checkpoint=health_checkpoint,
+        runtime_journal_summary=runtime_journal_summary,
+        control_actions_summary={
+            "window_action_count": len(control_records_window),
+            "failed_or_rejected_count": len(failed_control_records),
+            "broker_sync_drift_count": broker_sync_drift_count,
+        },
+        trade_feedback_summary={
+            "broker_submitted_count": feedback_counts_by_type.get("broker_submitted", 0),
+            "broker_cancelled_count": feedback_counts_by_type.get("broker_cancelled", 0),
+            "broker_replaced_count": feedback_counts_by_type.get("broker_replaced", 0),
+            "broker_expired_count": feedback_counts_by_type.get("broker_expired", 0),
+            "executed_count": feedback_counts_by_type.get("executed", 0),
+        },
+        notification_summary=notification_summary,
+        pending_orders_summary=pending_orders_summary,
+        log_summary=log_summary,
+        paper_integrity=paper_integrity,
+        anomaly_flags=anomaly_flags,
+    )
+    operator_checklist = _build_operator_checklist(
+        health_checkpoint=health_checkpoint,
+        notification_summary=notification_summary,
+        pending_orders_summary=pending_orders_summary,
+        control_actions_summary={
+            "failed_or_rejected_count": len(failed_control_records),
+            "broker_sync_drift_count": broker_sync_drift_count,
+        },
+        paper_integrity=paper_integrity,
+        anomaly_flags=anomaly_flags,
+    )
 
     artifact_paths = {
         "paper_validation_profile": str(profile.profile_path.resolve()),
@@ -957,6 +1448,11 @@ def build_local_paper_validation_summary(
         pending_orders=pending_orders_summary,
         market_state=market_state_summary,
         log_summary=log_summary,
+        paper_integrity=paper_integrity,
+        anomaly_flags=tuple(anomaly_flags),
+        change_summary=change_summary,
+        daily_review=daily_review,
+        operator_checklist=tuple(operator_checklist),
         artifact_paths=artifact_paths,
         warnings=tuple(warnings),
     )
@@ -974,6 +1470,10 @@ def write_local_paper_validation_summary(
     summary_json = resolved_output_dir / "paper_validation_summary.json"
     checkpoint_json = resolved_output_dir / "paper_validation_checkpoint.json"
     brief_text = resolved_output_dir / "paper_validation_brief.txt"
+    daily_review_json = resolved_output_dir / "paper_validation_daily_review.json"
+    daily_review_text = resolved_output_dir / "paper_validation_daily_review.txt"
+    changes_text = resolved_output_dir / "paper_validation_changes_today.txt"
+    checklist_text = resolved_output_dir / "paper_validation_operator_checklist.txt"
     summary_json.write_text(
         json.dumps(summary.to_dict(), indent=2, sort_keys=True),
         encoding="utf-8",
@@ -983,10 +1483,57 @@ def write_local_paper_validation_summary(
         encoding="utf-8",
     )
     brief_text.write_text(summary.to_brief(), encoding="utf-8")
+    daily_review_json.write_text(
+        json.dumps(
+            {
+                "generated_at_utc": summary.generated_at_utc,
+                "as_of_date": summary.as_of_date.isoformat(),
+                "window_days": summary.window_days,
+                "daily_review": dict(summary.daily_review),
+                "paper_integrity": dict(summary.paper_integrity),
+                "anomaly_flags": [dict(item) for item in summary.anomaly_flags],
+                "change_summary": dict(summary.change_summary),
+                "operator_checklist": [dict(item) for item in summary.operator_checklist],
+                "warnings": list(summary.warnings),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    daily_review_text.write_text(summary.to_daily_review_text(), encoding="utf-8")
+    changes_text.write_text(summary.to_changes_text(), encoding="utf-8")
+    checklist_text.write_text(summary.to_checklist_text(), encoding="utf-8")
     return {
         "paper_validation_summary_json": summary_json.resolve(),
         "paper_validation_checkpoint_json": checkpoint_json.resolve(),
         "paper_validation_brief": brief_text.resolve(),
+        "paper_validation_daily_review_json": daily_review_json.resolve(),
+        "paper_validation_daily_review": daily_review_text.resolve(),
+        "paper_validation_changes_today": changes_text.resolve(),
+        "paper_validation_operator_checklist": checklist_text.resolve(),
+    }
+
+
+def write_local_paper_validation_smoke_result(
+    result: LocalPaperValidationSmokeResult,
+    *,
+    output_dir: Path,
+) -> dict[str, Path]:
+    """Write compact Day-1 smoke-run verdict artifacts alongside review outputs."""
+
+    resolved_output_dir = output_dir.resolve()
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+    result_json = resolved_output_dir / "smoke_run_result.json"
+    brief_text = resolved_output_dir / "smoke_run_brief.txt"
+    result_json.write_text(
+        json.dumps(result.to_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    brief_text.write_text(result.to_brief(), encoding="utf-8")
+    return {
+        "smoke_run_result_json": result_json.resolve(),
+        "smoke_run_brief": brief_text.resolve(),
     }
 
 
@@ -1038,6 +1585,318 @@ def _build_health_checkpoint_payload(
     }
 
 
+def _build_notification_summary(
+    *,
+    env_file: Path,
+    notification_state: Any,
+    log_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "notifications_configured": _notifications_configured(env_file),
+        "updated_at_utc": getattr(notification_state, "updated_at_utc", None),
+        "active_key_count": len(getattr(notification_state, "active_keys", ())),
+        "delivered_once_key_count": len(
+            getattr(notification_state, "delivered_once_keys", {})
+        ),
+        "delivery_failure_count": _coerce_int(
+            log_summary.get("notification_failure_count")
+        ),
+        "categories_available": False,
+        "important_categories": [],
+        "warnings": [
+            (
+                "Notification event categories are not persisted in current runtime "
+                "artifacts; only configuration, suppression-state counts, and log "
+                "failures are available."
+            )
+        ],
+    }
+
+
+def _build_market_state_summary(
+    market_state_payload: Mapping[str, Any] | None,
+    *,
+    recent_transitions: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(market_state_payload, Mapping):
+        return {
+            "available": False,
+            "transition_count": 0,
+            "baseline_established": False,
+            "alertable_state_count": 0,
+            "top_priority_candidate_count": 0,
+            "portfolio_path": None,
+            "recent_transitions": [],
+        }
+    market_state_data = market_state_payload.get("data")
+    if not isinstance(market_state_data, Mapping):
+        return {
+            "available": bool(market_state_payload.get("available")),
+            "transition_count": 0,
+            "baseline_established": False,
+            "alertable_state_count": 0,
+            "top_priority_candidate_count": 0,
+            "portfolio_path": None,
+            "recent_transitions": list(recent_transitions),
+        }
+    snapshot = market_state_data.get("snapshot", {})
+    alertable_states = market_state_data.get("current_alertable_states", ())
+    top_priority_candidates = market_state_data.get("top_priority_candidates", ())
+    return {
+        "available": bool(market_state_payload.get("available")),
+        "transition_count": _coerce_int(market_state_data.get("transition_count")),
+        "baseline_established": bool(market_state_data.get("baseline_established")),
+        "alertable_state_count": (
+            len(alertable_states) if isinstance(alertable_states, Sequence) else 0
+        ),
+        "top_priority_candidate_count": (
+            len(top_priority_candidates)
+            if isinstance(top_priority_candidates, Sequence)
+            else 0
+        ),
+        "portfolio_path": snapshot.get("portfolio_path")
+        if isinstance(snapshot, Mapping)
+        else None,
+        "recent_transitions": list(recent_transitions),
+    }
+
+
+def _build_pending_orders_summary(
+    pending_orders_payload: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    empty_summary = {
+        "available": False,
+        "active_order_count": 0,
+        "capacity_reserving_buy_order_count": 0,
+        "reserved_notional": None,
+        "pending_fill_notional": None,
+        "reserved_slot_count": None,
+        "available_slots": None,
+        "position_context_available": False,
+        "status_counts": {},
+        "broker_status_counts": {},
+        "pending_symbols": [],
+        "unusual_state_count": 0,
+        "unusual_states": [],
+    }
+    if not isinstance(pending_orders_payload, Mapping):
+        return empty_summary
+    pending_data = pending_orders_payload.get("data")
+    if not isinstance(pending_data, Mapping):
+        return {
+            **empty_summary,
+            "available": bool(pending_orders_payload.get("available")),
+        }
+    summary = pending_data.get("summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    active_orders = pending_data.get("active_orders", ())
+    if not isinstance(active_orders, Sequence):
+        active_orders = ()
+    status_counts = Counter()
+    broker_status_counts = Counter()
+    pending_cancel_count = 0
+    partially_filled_count = 0
+    broker_link_missing_count = 0
+    for item in active_orders:
+        if not isinstance(item, Mapping):
+            continue
+        status = _clean_text(item.get("status")) or "unknown"
+        broker_status = _clean_text(item.get("broker_status"))
+        status_counts[status] += 1
+        if broker_status is not None:
+            broker_status_counts[broker_status] += 1
+        if broker_status == "pending_cancel":
+            pending_cancel_count += 1
+        if status == "partially_filled":
+            partially_filled_count += 1
+        if (
+            _clean_text(item.get("submitted_at")) is not None
+            and _clean_text(item.get("broker_order_id")) is None
+        ):
+            broker_link_missing_count += 1
+    unusual_states: list[str] = []
+    if not bool(summary.get("position_context_available")):
+        unusual_states.append(
+            "Pending-order position context is unavailable for capacity review."
+        )
+    if pending_cancel_count > 0:
+        unusual_states.append(
+            f"{pending_cancel_count} active pending order(s) are awaiting broker cancel confirmation."
+        )
+    if partially_filled_count > 0:
+        unusual_states.append(
+            f"{partially_filled_count} active pending order(s) are partially filled."
+        )
+    if broker_link_missing_count > 0:
+        unusual_states.append(
+            f"{broker_link_missing_count} active pending order(s) have submitted_at set without a broker_order_id."
+        )
+    return {
+        "available": bool(pending_orders_payload.get("available")),
+        "active_order_count": _coerce_int(summary.get("active_order_count")),
+        "capacity_reserving_buy_order_count": _coerce_int(
+            summary.get("capacity_reserving_buy_order_count")
+        ),
+        "reserved_notional": summary.get("reserved_notional"),
+        "pending_fill_notional": summary.get("pending_fill_notional"),
+        "reserved_slot_count": summary.get("reserved_slot_count"),
+        "available_slots": summary.get("available_slots"),
+        "position_context_available": bool(summary.get("position_context_available")),
+        "status_counts": dict(sorted(status_counts.items())),
+        "broker_status_counts": dict(sorted(broker_status_counts.items())),
+        "pending_symbols": list(summary.get("pending_symbols", ())),
+        "unusual_state_count": len(unusual_states),
+        "unusual_states": unusual_states,
+    }
+
+
+def _build_paper_integrity_summary(
+    *,
+    current_safety_state: Mapping[str, Any],
+    safety_payload: Mapping[str, Any],
+    control_records: Sequence[Any],
+    broker_records: Sequence[Any],
+    live_mode_attempt_records: Sequence[Any],
+    live_mode_success_count: int,
+    journal_events: Sequence[PaperValidationRuntimeEvent],
+    journal_events_window: Sequence[PaperValidationRuntimeEvent],
+    window_start: date,
+    as_of_date: date,
+) -> dict[str, Any]:
+    observed_safety_states = [
+        state
+        for state in (_record_safety_state(record) for record in control_records)
+        if state is not None
+    ]
+    observed_execution_modes = {
+        _clean_text(state.get("execution_mode"))
+        for state in observed_safety_states
+        if _clean_text(state.get("execution_mode")) is not None
+    }
+    non_paper_safety_records = [
+        record
+        for record in control_records
+        if (_record_safety_state(record) or {}).get("execution_mode") != "paper"
+        and _record_safety_state(record) is not None
+    ]
+    broker_target_non_paper_records = [
+        record
+        for record in broker_records
+        if (_record_safety_state(record) or {}).get("execution_mode") != "paper"
+        and _record_safety_state(record) is not None
+    ]
+    live_trading_enabled_ever = any(
+        bool(state.get("broker_trading_enabled")) for state in observed_safety_states
+    ) or bool(current_safety_state.get("broker_trading_enabled"))
+    live_confirmation_enabled_ever = any(
+        bool(state.get("live_actions_require_confirmation"))
+        for state in observed_safety_states
+    ) or bool(current_safety_state.get("live_actions_require_confirmation"))
+    live_confirmation_disabled_ever = any(
+        state.get("live_actions_require_confirmation") is False
+        for state in observed_safety_states
+    ) or current_safety_state.get("live_actions_require_confirmation") is False
+    degradation_from_controls = sum(
+        1
+        for record in control_records
+        if _is_control_state_degradation_record(record)
+    )
+    degradation_from_journal = sum(
+        event.event_type in {"runtime_safety_state_corrupted", "runtime_safety_state_deleted"}
+        for event in journal_events
+    )
+    degradation_window_count = sum(
+        1
+        for record in control_records
+        if _is_control_state_degradation_record(record)
+        and _record_in_window(record.requested_at_utc, window_start, as_of_date)
+    )
+    journal_window_degradation_count = sum(
+        event.event_type in {"runtime_safety_state_corrupted", "runtime_safety_state_deleted"}
+        for event in journal_events_window
+    )
+    execution_mode_stayed_paper = (
+        current_safety_state.get("execution_mode") == "paper"
+        and not non_paper_safety_records
+        and live_mode_success_count == 0
+    )
+    broker_target_stayed_paper = (
+        current_safety_state.get("execution_mode") == "paper"
+        and not broker_target_non_paper_records
+    )
+    control_state_readable = bool(safety_payload["data"]["control_state_readable"])
+    integrity_warnings: list[str] = []
+    evidence_notes: list[str] = []
+    if not control_state_readable:
+        integrity_warnings.append(
+            "Current operator control state is degraded or unreadable."
+        )
+    if not execution_mode_stayed_paper:
+        integrity_warnings.append(
+            "Observed execution-mode evidence shows a non-paper state or live-mode success."
+        )
+    if not broker_target_stayed_paper:
+        integrity_warnings.append(
+            "Observed broker-mutation evidence includes a non-paper execution target."
+        )
+    if live_trading_enabled_ever:
+        integrity_warnings.append(
+            "Live broker trading was enabled in observed safety-state history."
+        )
+    if degradation_from_controls + degradation_from_journal > 0:
+        integrity_warnings.append(
+            "Control-state degradation or recovery events occurred during the proving run."
+        )
+        if live_mode_success_count == 0:
+            evidence_notes.append(
+                "Observed control-state degradation or recovery activity occurred without any "
+                "observed live-mode success evidence; review the windowed degradation count to "
+                "separate resilience testing from paper-mode safety drift."
+            )
+    if not broker_records:
+        evidence_notes.append(
+            "No broker mutation or broker sync commands were audited in the current runtime history; "
+            "broker-target integrity is based on current backend policy enforcement, not direct broker-action observations."
+        )
+    if not control_records:
+        evidence_notes.append(
+            "No control actions were audited in the current runtime history; execution-mode integrity is based on current state plus runtime guardrails."
+        )
+    paper_only_intact = (
+        execution_mode_stayed_paper
+        and broker_target_stayed_paper
+        and not live_trading_enabled_ever
+        and (degradation_from_controls + degradation_from_journal) == 0
+        and control_state_readable
+    )
+    return {
+        "paper_only_intact": paper_only_intact,
+        "execution_mode_current": current_safety_state.get("execution_mode"),
+        "execution_mode_stayed_paper": execution_mode_stayed_paper,
+        "observed_execution_modes": sorted(
+            mode for mode in observed_execution_modes if mode is not None
+        ),
+        "broker_target_stayed_paper": broker_target_stayed_paper,
+        "broker_target_evidence_limited": not broker_records,
+        "observed_broker_mutation_count": len(broker_records),
+        "live_mode_attempt_count": len(live_mode_attempt_records),
+        "live_mode_success_count": live_mode_success_count,
+        "live_trading_enabled_ever": live_trading_enabled_ever,
+        "live_confirmation_enabled_ever": live_confirmation_enabled_ever,
+        "live_confirmation_disabled_ever": live_confirmation_disabled_ever,
+        "control_state_readable": control_state_readable,
+        "control_state_degradation_count": (
+            degradation_from_controls + degradation_from_journal
+        ),
+        "control_state_degradation_window_count": (
+            degradation_window_count + journal_window_degradation_count
+        ),
+        "integrity_warnings": integrity_warnings,
+        "evidence_notes": evidence_notes,
+    }
+
+
 def _build_runtime_journal_summary(
     all_events: Sequence[PaperValidationRuntimeEvent],
     *,
@@ -1055,6 +1914,11 @@ def _build_runtime_journal_summary(
         "restart_count": counts.get("runtime_restarted", 0),
         "manual_disconnect_count": counts.get("runtime_transport_disconnected", 0),
         "manual_reconnect_count": counts.get("runtime_transport_reconnected", 0),
+        "log_rotation_count": counts.get("runtime_logs_rotated", 0),
+        "env_override_count": counts.get("runtime_env_overridden", 0),
+        "safety_state_corruption_count": counts.get("runtime_safety_state_corrupted", 0),
+        "safety_state_deletion_count": counts.get("runtime_safety_state_deleted", 0),
+        "safety_state_reset_count": counts.get("runtime_safety_state_reset", 0),
         "window_counts": dict(sorted(window_counts.items())),
         "estimated_uptime_seconds": uptime_seconds,
     }
@@ -1125,6 +1989,371 @@ def _build_runtime_log_summary(
         "top_warning_messages": top_warning_messages,
         "top_error_messages": top_error_messages,
     }
+
+
+def _build_change_summary(
+    *,
+    as_of_date: date,
+    control_counts_by_command: Mapping[str, int],
+    failed_control_records: Sequence[dict[str, Any]],
+    recent_transitions: Sequence[dict[str, Any]],
+    feedback_events_window: Sequence[TradeFeedbackEvent],
+    feedback_counts_by_type: Mapping[str, int],
+    top_warning_messages: Sequence[dict[str, Any]],
+    pending_orders_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "control_actions_by_command": dict(sorted(control_counts_by_command.items())),
+        "broker_events_by_type": {
+            key: int(feedback_counts_by_type.get(key, 0))
+            for key in (
+                "broker_submitted",
+                "broker_cancelled",
+                "broker_replaced",
+                "broker_expired",
+                "executed",
+            )
+            if int(feedback_counts_by_type.get(key, 0)) > 0
+        },
+        "repeated_warnings": [dict(item) for item in top_warning_messages[:5]],
+        "failures": [dict(item) for item in failed_control_records[:5]],
+        "state_transitions": [dict(item) for item in recent_transitions[:5]],
+        "important_broker_events": _important_broker_event_summaries(feedback_events_window),
+        "pending_order_attention": list(pending_orders_summary.get("unusual_states", ())),
+    }
+
+
+def _build_daily_review(
+    *,
+    as_of_date: date,
+    health_checkpoint: Mapping[str, Any],
+    runtime_journal_summary: Mapping[str, Any],
+    control_actions_summary: Mapping[str, Any],
+    trade_feedback_summary: Mapping[str, Any],
+    notification_summary: Mapping[str, Any],
+    pending_orders_summary: Mapping[str, Any],
+    log_summary: Mapping[str, Any],
+    paper_integrity: Mapping[str, Any],
+    anomaly_flags: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    service_healthy = (
+        bool(health_checkpoint.get("available"))
+        and bool(health_checkpoint.get("last_successful_flush_at_utc"))
+        and not bool(health_checkpoint.get("stale"))
+    )
+    return {
+        "as_of_date": as_of_date.isoformat(),
+        "service": {
+            "healthy": service_healthy,
+            "service_state": health_checkpoint.get("service_state"),
+            "estimated_uptime_seconds": runtime_journal_summary.get(
+                "estimated_uptime_seconds"
+            ),
+            "restart_count": runtime_journal_summary.get("restart_count"),
+            "last_successful_cycle_at_utc": health_checkpoint.get(
+                "last_successful_flush_at_utc"
+            ),
+            "last_cycle_status": health_checkpoint.get("last_cycle_status"),
+        },
+        "connectivity": {
+            "reconnect_attempt_count": health_checkpoint.get("reconnect_attempt_count"),
+            "manual_disconnect_count": runtime_journal_summary.get(
+                "manual_disconnect_count"
+            ),
+            "manual_reconnect_count": runtime_journal_summary.get(
+                "manual_reconnect_count"
+            ),
+            "disconnect_warning_count": _coerce_int(
+                log_summary.get("disconnect_warning_count")
+            ),
+            "connect_failure_count": _coerce_int(
+                log_summary.get("connect_failure_count")
+            ),
+        },
+        "notifications": {
+            "notifications_configured": notification_summary.get(
+                "notifications_configured"
+            ),
+            "active_key_count": notification_summary.get("active_key_count"),
+            "delivered_once_key_count": notification_summary.get(
+                "delivered_once_key_count"
+            ),
+            "delivery_failure_count": notification_summary.get(
+                "delivery_failure_count"
+            ),
+            "important_categories": list(
+                notification_summary.get("important_categories", ())
+            ),
+            "categories_available": notification_summary.get("categories_available"),
+        },
+        "pending_orders": {
+            "active_order_count": pending_orders_summary.get("active_order_count"),
+            "unusual_state_count": pending_orders_summary.get("unusual_state_count"),
+            "unusual_states": list(pending_orders_summary.get("unusual_states", ())),
+        },
+        "broker_activity": dict(trade_feedback_summary),
+        "control": {
+            "window_action_count": control_actions_summary.get("window_action_count"),
+            "failed_or_rejected_count": control_actions_summary.get(
+                "failed_or_rejected_count"
+            ),
+            "broker_sync_drift_count": control_actions_summary.get(
+                "broker_sync_drift_count"
+            ),
+        },
+        "paper_integrity": {
+            "paper_only_intact": paper_integrity.get("paper_only_intact"),
+            "execution_mode_stayed_paper": paper_integrity.get(
+                "execution_mode_stayed_paper"
+            ),
+            "broker_target_stayed_paper": paper_integrity.get(
+                "broker_target_stayed_paper"
+            ),
+            "live_trading_enabled_ever": paper_integrity.get(
+                "live_trading_enabled_ever"
+            ),
+            "control_state_degradation_count": paper_integrity.get(
+                "control_state_degradation_count"
+            ),
+            "control_state_degradation_window_count": paper_integrity.get(
+                "control_state_degradation_window_count"
+            ),
+        },
+        "anomaly_flag_count": len(anomaly_flags),
+    }
+
+
+def _build_operator_checklist(
+    *,
+    health_checkpoint: Mapping[str, Any],
+    notification_summary: Mapping[str, Any],
+    pending_orders_summary: Mapping[str, Any],
+    control_actions_summary: Mapping[str, Any],
+    paper_integrity: Mapping[str, Any],
+    anomaly_flags: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    checklist: list[dict[str, str]] = []
+    service_healthy = (
+        bool(health_checkpoint.get("available"))
+        and bool(health_checkpoint.get("last_successful_flush_at_utc"))
+        and not bool(health_checkpoint.get("stale"))
+    )
+    checklist.append(
+        {
+            "item": "Service health",
+            "status": "pass" if service_healthy else "warn",
+            "detail": (
+                f"state={health_checkpoint.get('service_state')} "
+                f"last_successful_cycle={health_checkpoint.get('last_successful_flush_at_utc') or 'n/a'}"
+            ),
+        }
+    )
+    drift_count = _coerce_int(control_actions_summary.get("broker_sync_drift_count"))
+    checklist.append(
+        {
+            "item": "Broker drift and reconciliation",
+            "status": "pass" if drift_count == 0 else "warn",
+            "detail": f"broker_sync_drift_signals={drift_count}",
+        }
+    )
+    integrity_ok = bool(paper_integrity.get("paper_only_intact"))
+    checklist.append(
+        {
+            "item": "Safety boundaries",
+            "status": "pass" if integrity_ok else "fail",
+            "detail": (
+                f"paper_only_intact={paper_integrity.get('paper_only_intact')} "
+                f"control_state_degradation_count={paper_integrity.get('control_state_degradation_count')} "
+                f"control_state_degradation_window_count={paper_integrity.get('control_state_degradation_window_count')}"
+            ),
+        }
+    )
+    notifications_configured = bool(notification_summary.get("notifications_configured"))
+    notification_failures = _coerce_int(notification_summary.get("delivery_failure_count"))
+    checklist.append(
+        {
+            "item": "Alerts and notifications",
+            "status": (
+                "warn"
+                if notification_failures > 0
+                else ("pass" if notifications_configured else "needs_review")
+            ),
+            "detail": (
+                f"configured={notifications_configured} "
+                f"delivery_failures={notification_failures}"
+            ),
+        }
+    )
+    unusual_pending = _coerce_int(pending_orders_summary.get("unusual_state_count"))
+    checklist.append(
+        {
+            "item": "Pending-order and broker state coherence",
+            "status": "pass" if unusual_pending == 0 else "warn",
+            "detail": (
+                f"active_orders={pending_orders_summary.get('active_order_count')} "
+                f"unusual_states={unusual_pending}"
+            ),
+        }
+    )
+    checklist.append(
+        {
+            "item": "Dashboard/API truth surfaces",
+            "status": (
+                "pass"
+                if bool(health_checkpoint.get("available"))
+                and bool(paper_integrity.get("control_state_readable"))
+                else "warn"
+            ),
+            "detail": (
+                f"health_available={health_checkpoint.get('available')} "
+                f"control_state_readable={paper_integrity.get('control_state_readable')}"
+            ),
+        }
+    )
+    if anomaly_flags:
+        checklist.append(
+            {
+                "item": "Follow-up required",
+                "status": "warn",
+                "detail": f"{len(anomaly_flags)} anomaly flag(s) need review.",
+            }
+        )
+    return checklist
+
+
+def _build_anomaly_flags(
+    *,
+    health_checkpoint: Mapping[str, Any],
+    runtime_journal_summary: Mapping[str, Any],
+    control_actions_summary: Mapping[str, Any],
+    log_summary: Mapping[str, Any],
+    paper_integrity: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    flags: list[dict[str, Any]] = []
+    reconnect_attempts = _coerce_int(health_checkpoint.get("reconnect_attempt_count"))
+    disconnect_warnings = _coerce_int(log_summary.get("disconnect_warning_count"))
+    connect_failures = _coerce_int(log_summary.get("connect_failure_count"))
+    if disconnect_warnings >= 3 or connect_failures >= 2:
+        flags.append(
+            {
+                "code": "repeated_reconnects",
+                "severity": "warning",
+                "message": (
+                    f"Repeated connectivity churn detected: reconnect_attempts={reconnect_attempts}, "
+                    f"disconnect_warnings={disconnect_warnings}, connect_failures={connect_failures}."
+                ),
+            }
+        )
+    drift_count = _coerce_int(control_actions_summary.get("broker_sync_drift_count"))
+    if drift_count >= 2:
+        flags.append(
+            {
+                "code": "repeated_broker_sync_warnings",
+                "severity": "warning",
+                "message": f"Broker sync reported drift or warnings {drift_count} times in the review window.",
+            }
+        )
+    malformed_recovery_count = (
+        _coerce_int(runtime_journal_summary.get("window_counts", {}).get("runtime_safety_state_corrupted"))
+        + _coerce_int(runtime_journal_summary.get("window_counts", {}).get("runtime_safety_state_deleted"))
+        + _coerce_int(runtime_journal_summary.get("window_counts", {}).get("runtime_safety_state_reset"))
+    )
+    if malformed_recovery_count >= 2:
+        flags.append(
+            {
+                "code": "repeated_malformed_state_recoveries",
+                "severity": "warning",
+                "message": (
+                    f"Safety-state corruption/deletion/reset activity occurred {malformed_recovery_count} times in the review window."
+                ),
+            }
+        )
+    notification_failures = _coerce_int(log_summary.get("notification_failure_count"))
+    if notification_failures > 0:
+        flags.append(
+            {
+                "code": "notification_delivery_failures",
+                "severity": "warning",
+                "message": f"Notification routing logged {notification_failures} delivery failure(s).",
+            }
+        )
+    if not bool(paper_integrity.get("paper_only_intact")):
+        flags.append(
+            {
+                "code": "paper_integrity_warning",
+                "severity": "critical",
+                "message": "Paper-only integrity did not hold for the observed review evidence.",
+            }
+        )
+    restart_count = _coerce_int(
+        runtime_journal_summary.get("window_counts", {}).get("runtime_restarted")
+    )
+    if restart_count >= 3:
+        flags.append(
+            {
+                "code": "too_many_restarts",
+                "severity": "warning",
+                "message": f"The runtime restarted {restart_count} times in the review window.",
+            }
+        )
+    return flags
+
+
+def _important_broker_event_summaries(
+    feedback_events: Sequence[TradeFeedbackEvent],
+) -> list[dict[str, Any]]:
+    important_types = {
+        "broker_submitted",
+        "broker_cancelled",
+        "broker_replaced",
+        "broker_expired",
+        "executed",
+    }
+    summaries: list[dict[str, Any]] = []
+    sorted_events = sorted(
+        feedback_events,
+        key=lambda event: (event.timestamp_utc or "", event.as_of_date or date.min),
+        reverse=True,
+    )
+    for event in sorted_events:
+        if event.event_type not in important_types:
+            continue
+        summaries.append(
+            {
+                "event_type": event.event_type,
+                "workflow": event.workflow,
+                "symbol": event.symbol,
+                "timestamp_utc": event.timestamp_utc,
+                "as_of_date": (
+                    event.as_of_date.isoformat() if event.as_of_date is not None else None
+                ),
+            }
+        )
+        if len(summaries) >= 10:
+            break
+    return summaries
+
+
+def _record_safety_state(record: Any) -> Mapping[str, Any] | None:
+    raw_state = getattr(record, "result_payload", {}).get("safety_state")
+    if not isinstance(raw_state, Mapping):
+        return None
+    return raw_state
+
+
+def _is_control_state_degradation_record(record: Any) -> bool:
+    if getattr(record, "error_code", None) == "control_state_unavailable":
+        return True
+    for warning in getattr(record, "warnings", ()):
+        if not isinstance(warning, str):
+            continue
+        lowered = warning.lower()
+        if "control state" in lowered and (
+            "unavailable" in lowered or "unreadable" in lowered
+        ):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -1316,6 +2545,18 @@ def _clean_text(value: object) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+def _dedupe_texts(values: Iterable[object]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        cleaned = _clean_text(value)
+        if cleaned is None or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        deduped.append(cleaned)
+    return tuple(deduped)
 
 
 def _coerce_int(value: object) -> int:

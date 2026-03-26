@@ -61,6 +61,13 @@ Historical daily-bar data is selected by `config/data_sources.yaml`. Local cache
 
 After installation, use either the console script or `python -m bot.main`.
 
+Operational proving-run workflow:
+
+- `ops/paper_validation_proving_runbook.md` covers the Day-1 and Week-1 local paper-validation procedure.
+- `ops/paper_validation_daily_review_template.md` is the daily operator note template.
+- `ops/paper_validation_week1_review_template.md` is the end-of-week readiness review template.
+- `run-local-paper-validation-smoke` is the bounded Day-1 smoke-run command for the paper-validation stack.
+
 ### Developer shortcuts
 
 For normal local use, the repo includes small bash wrappers under `scripts/` plus shared defaults in `scripts/common.sh`.

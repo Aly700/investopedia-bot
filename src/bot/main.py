@@ -13,7 +13,10 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 from typing import Any, Mapping, Optional, Sequence, cast
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pandas as pd
 import yaml
@@ -259,10 +262,12 @@ from bot.service.local_staging_runtime import (
     create_local_staging_runtime,
 )
 from bot.service.paper_validation import (
+    build_local_paper_validation_smoke_result,
     build_local_paper_validation_profile,
     build_local_paper_validation_runtime_config,
     build_local_paper_validation_summary,
     create_local_paper_validation_runtime,
+    write_local_paper_validation_smoke_result,
     write_local_paper_validation_summary,
 )
 
@@ -644,6 +649,78 @@ def _add_live_market_service_arguments(
         help="Optional maximum supervisor iterations before exiting.",
     )
     _add_notification_arguments(parser)
+
+
+def _add_local_paper_validation_runtime_arguments(
+    parser: argparse.ArgumentParser,
+) -> None:
+    parser.add_argument(
+        "--validation-root",
+        type=Path,
+        default=None,
+        help="Optional isolated root for the local paper-validation profile.",
+    )
+    parser.add_argument(
+        "--preserve-existing-safety-state",
+        action="store_true",
+        help="Do not reset the validation safety state to the forced paper profile on startup.",
+    )
+    parser.add_argument(
+        "--internal-api-host",
+        default="127.0.0.1",
+        help="Bind host for the local paper-validation internal API.",
+    )
+    parser.add_argument(
+        "--internal-api-port",
+        type=int,
+        default=8765,
+        help="Bind port for the local paper-validation internal API.",
+    )
+    parser.add_argument(
+        "--control-api-host",
+        default="127.0.0.1",
+        help="Bind host for the local paper-validation operator control API.",
+    )
+    parser.add_argument(
+        "--control-api-port",
+        type=int,
+        default=8766,
+        help="Bind port for the local paper-validation operator control API.",
+    )
+    parser.add_argument(
+        "--dashboard-host",
+        default="127.0.0.1",
+        help="Bind host for the local paper-validation dashboard.",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8780,
+        help="Bind port for the local paper-validation dashboard.",
+    )
+    parser.add_argument(
+        "--dashboard-refresh-seconds",
+        type=int,
+        default=5,
+        help="Dashboard polling cadence in seconds.",
+    )
+    parser.add_argument(
+        "--active-log-filename",
+        default="local_paper_validation.log",
+        help="Active runtime log filename under the profile logs directory.",
+    )
+    parser.add_argument(
+        "--log-rotate-max-bytes",
+        type=int,
+        default=250_000,
+        help="Rotate the active paper-validation log after this many bytes.",
+    )
+    parser.add_argument(
+        "--log-rotate-backup-count",
+        type=int,
+        default=5,
+        help="Maximum archived paper-validation log files to keep.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1264,80 +1341,33 @@ def build_parser() -> argparse.ArgumentParser:
             "<validation-root>/archive/live_market/<as-of-date>."
         ),
     )
-    run_local_paper_validation_parser.add_argument(
-        "--validation-root",
-        type=Path,
-        default=None,
-        help="Optional isolated root for the local paper-validation profile.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--preserve-existing-safety-state",
-        action="store_true",
-        help="Do not reset the validation safety state to the forced paper profile on startup.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--internal-api-host",
-        default="127.0.0.1",
-        help="Bind host for the local paper-validation internal API.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--internal-api-port",
-        type=int,
-        default=8765,
-        help="Bind port for the local paper-validation internal API.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--control-api-host",
-        default="127.0.0.1",
-        help="Bind host for the local paper-validation operator control API.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--control-api-port",
-        type=int,
-        default=8766,
-        help="Bind port for the local paper-validation operator control API.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--dashboard-host",
-        default="127.0.0.1",
-        help="Bind host for the local paper-validation dashboard.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--dashboard-port",
-        type=int,
-        default=8780,
-        help="Bind port for the local paper-validation dashboard.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--dashboard-refresh-seconds",
-        type=int,
-        default=5,
-        help="Dashboard polling cadence in seconds.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--active-log-filename",
-        default="local_paper_validation.log",
-        help="Active runtime log filename under the profile logs directory.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--log-rotate-max-bytes",
-        type=int,
-        default=250_000,
-        help="Rotate the active paper-validation log after this many bytes.",
-    )
-    run_local_paper_validation_parser.add_argument(
-        "--log-rotate-backup-count",
-        type=int,
-        default=5,
-        help="Maximum archived paper-validation log files to keep.",
-    )
+    _add_local_paper_validation_runtime_arguments(run_local_paper_validation_parser)
     run_local_paper_validation_parser.set_defaults(
         handler=_handle_run_local_paper_validation
     )
 
+    run_local_paper_validation_smoke_parser = subparsers.add_parser(
+        "run-local-paper-validation-smoke",
+        help="Launch a bounded Day-1 smoke run over the isolated paper-validation profile.",
+    )
+    _add_live_market_service_arguments(
+        run_local_paper_validation_smoke_parser,
+        output_dir_help=(
+            "Optional archive directory for live report outputs. Defaults to "
+            "<validation-root>/archive/live_market/<as-of-date>."
+        ),
+    )
+    _add_local_paper_validation_runtime_arguments(
+        run_local_paper_validation_smoke_parser
+    )
+    run_local_paper_validation_smoke_parser.set_defaults(
+        max_iterations=5,
+        handler=_handle_run_local_paper_validation_smoke,
+    )
+
     summarize_local_paper_validation_parser = subparsers.add_parser(
         "summarize-local-paper-validation",
-        help="Write a checkpoint and operational review summary for the paper-validation runtime.",
+        help="Write daily checkpoint, operator review, and checklist artifacts for the paper-validation runtime.",
     )
     summarize_local_paper_validation_parser.add_argument(
         "--validation-root",
@@ -3246,7 +3276,9 @@ def _handle_run_local_staging_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
-def _handle_run_local_paper_validation(args: argparse.Namespace) -> int:
+def _local_paper_validation_profile_and_config(
+    args: argparse.Namespace,
+) -> tuple[Any, LocalStagingRuntimeConfig]:
     profile = build_local_paper_validation_profile(
         project_root=args.config_dir.resolve().parent,
         validation_root=args.validation_root,
@@ -3266,6 +3298,80 @@ def _handle_run_local_paper_validation(args: argparse.Namespace) -> int:
         log_rotate_max_bytes=args.log_rotate_max_bytes,
         log_rotate_backup_count=args.log_rotate_backup_count,
     )
+    return profile, runtime_config
+
+
+def _probe_local_paper_validation_surface(
+    url: str,
+    *,
+    expect_json: bool,
+    timeout_seconds: float = 0.5,
+    attempts: int = 5,
+    retry_delay_seconds: float = 0.1,
+) -> dict[str, Any]:
+    request = Request(url, headers={"User-Agent": "investopedia-bot-smoke"})
+    last_error: str | None = None
+    last_status_code: int | None = None
+    for attempt_index in range(max(attempts, 1)):
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                status_code = response.getcode()
+                last_status_code = status_code
+                body = response.read()
+                if expect_json:
+                    try:
+                        payload = json.loads(body.decode("utf-8") or "{}")
+                    except json.JSONDecodeError as exc:
+                        last_error = f"Invalid JSON response: {exc}"
+                    else:
+                        return {
+                            "url": url,
+                            "available": 200 <= status_code < 400,
+                            "status_code": status_code,
+                            "error": None,
+                            "json_payload": payload,
+                        }
+                else:
+                    return {
+                        "url": url,
+                        "available": 200 <= status_code < 400,
+                        "status_code": status_code,
+                        "error": None,
+                    }
+        except HTTPError as exc:
+            last_status_code = exc.code
+            last_error = f"HTTP {exc.code}: {exc.reason}"
+        except (OSError, URLError) as exc:
+            last_error = str(exc)
+        if attempt_index + 1 < max(attempts, 1):
+            time.sleep(retry_delay_seconds)
+    return {
+        "url": url,
+        "available": False,
+        "status_code": last_status_code,
+        "error": last_error,
+    }
+
+
+def _run_local_paper_validation_smoke_probes(runtime: Any) -> dict[str, dict[str, Any]]:
+    return {
+        "internal_api": _probe_local_paper_validation_surface(
+            runtime.internal_api_url.rstrip("/") + "/health",
+            expect_json=True,
+        ),
+        "control_api": _probe_local_paper_validation_surface(
+            runtime.control_api_url.rstrip("/") + "/control/safety",
+            expect_json=True,
+        ),
+        "dashboard": _probe_local_paper_validation_surface(
+            runtime.dashboard_url,
+            expect_json=False,
+        ),
+    }
+
+
+def _handle_run_local_paper_validation(args: argparse.Namespace) -> int:
+    profile, runtime_config = _local_paper_validation_profile_and_config(args)
     bundle_holder: dict[str, _LiveMarketServiceBundle] = {}
     try:
         runtime = create_local_paper_validation_runtime(
@@ -3343,6 +3449,151 @@ def _handle_run_local_paper_validation(args: argparse.Namespace) -> int:
     }
     _print_structured(payload, output_format=args.format)
     return 0
+
+
+def _handle_run_local_paper_validation_smoke(args: argparse.Namespace) -> int:
+    profile, runtime_config = _local_paper_validation_profile_and_config(args)
+    bundle_holder: dict[str, _LiveMarketServiceBundle] = {}
+    review_output_dir = profile.default_review_output_dir(as_of_date=args.as_of)
+    runtime: Any | None = None
+    runtime_failure_message: str | None = None
+    review_failure_message: str | None = None
+    summary_failure_message: str | None = None
+    startup_succeeded = False
+    runtime_stopped_cleanly = False
+    review_paths: dict[str, Path] = {}
+    summary = None
+    probes: dict[str, dict[str, Any]] = {
+        "internal_api": {"url": None, "available": False, "status_code": None, "error": None},
+        "control_api": {"url": None, "available": False, "status_code": None, "error": None},
+        "dashboard": {"url": None, "available": False, "status_code": None, "error": None},
+    }
+    try:
+        runtime = create_local_paper_validation_runtime(
+            runtime_config=runtime_config,
+            validation_root=profile.validation_root,
+            reset_safety_state=not args.preserve_existing_safety_state,
+            supervisor_factory=lambda config, paths: _capture_staging_supervisor(
+                bundle_holder,
+                _build_live_market_service_bundle(
+                    args,
+                    config=config,
+                    env_file=paths.env_file,
+                    output_dir=(
+                        args.output_dir
+                        or profile.default_live_output_dir(as_of_date=args.as_of)
+                    ).resolve(),
+                ),
+            ),
+        )
+    except OSError as exc:
+        runtime_failure_message = (
+            f"Failed to initialize local paper validation smoke runtime: {exc}"
+        )
+    if runtime is not None:
+        runtime.configure_logging(level=args.log_level, json_logs=args.json_logs)
+        LOGGER.info(
+            "Starting local paper validation smoke run: internal_api=%s control_api=%s dashboard=%s",
+            runtime.internal_api_url,
+            runtime.control_api_url,
+            runtime.dashboard_url,
+        )
+        try:
+            runtime.start(max_iterations=args.max_iterations)
+            startup_succeeded = True
+            probes = _run_local_paper_validation_smoke_probes(runtime)
+            runtime.wait_for_stack()
+        except KeyboardInterrupt:
+            runtime_failure_message = (
+                "Local paper validation smoke run was interrupted before bounded completion."
+            )
+        except RuntimeError as exc:
+            runtime_failure_message = str(exc)
+        finally:
+            try:
+                runtime.stop()
+                runtime_stopped_cleanly = True
+            except OSError as exc:
+                stop_error = f"Failed to stop local paper validation smoke runtime cleanly: {exc}"
+                runtime_failure_message = (
+                    f"{runtime_failure_message} {stop_error}"
+                    if runtime_failure_message is not None
+                    else stop_error
+                )
+    if runtime is not None:
+        try:
+            review_paths = runtime.write_review_summary(
+                as_of_date=args.as_of,
+                window_days=1,
+            )
+        except OSError as exc:
+            review_failure_message = (
+                f"Failed to write paper-validation review artifacts: {exc}"
+            )
+    try:
+        summary = build_local_paper_validation_summary(
+            profile,
+            as_of_date=args.as_of,
+            window_days=1,
+        )
+    except Exception as exc:
+        summary_failure_message = (
+            f"Failed to build paper-validation smoke summary: {exc}"
+        )
+    smoke_result = build_local_paper_validation_smoke_result(
+        profile,
+        as_of_date=args.as_of,
+        max_iterations=args.max_iterations,
+        summary=summary,
+        review_paths=review_paths,
+        internal_api_probe=probes["internal_api"],
+        control_api_probe=probes["control_api"],
+        dashboard_probe=probes["dashboard"],
+        startup_succeeded=startup_succeeded,
+        runtime_stopped_cleanly=runtime_stopped_cleanly,
+        runtime_failure_message=runtime_failure_message,
+        review_failure_message=review_failure_message,
+        summary_failure_message=summary_failure_message,
+    )
+    smoke_paths = write_local_paper_validation_smoke_result(
+        smoke_result,
+        output_dir=review_output_dir,
+    )
+    bundle = bundle_holder.get("live_market_bundle")
+    supervisor_status = runtime.last_supervisor_result if runtime is not None else None
+    payload = {
+        "command": "run-local-paper-validation-smoke",
+        "validation_profile": profile.to_dict(),
+        "as_of_date": args.as_of.isoformat(),
+        "websocket_url": args.websocket_url,
+        "transport_name": args.transport_name,
+        "portfolio_file": (
+            str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
+        ),
+        "include_intraday_review": bool(args.include_intraday_review),
+        "notifications_enabled": (
+            bundle.notification_router is not None if bundle is not None else False
+        ),
+        "status": (
+            supervisor_status.to_dict()
+            if hasattr(supervisor_status, "to_dict")
+            else supervisor_status
+        ),
+        "outputs": (
+            dict(sorted(bundle.latest_outputs.items()))
+            if bundle is not None
+            else {}
+        ),
+        "review_outputs": {
+            label: str(path.resolve()) for label, path in sorted(review_paths.items())
+        },
+        "smoke_outputs": {
+            label: str(path.resolve()) for label, path in sorted(smoke_paths.items())
+        },
+        "smoke_result": smoke_result.to_dict(),
+    }
+    _print_structured(payload, output_format=args.format)
+    return 0 if smoke_result.passed else 1
 
 
 def _handle_summarize_local_paper_validation(args: argparse.Namespace) -> int:
