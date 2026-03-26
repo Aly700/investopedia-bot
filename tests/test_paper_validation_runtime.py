@@ -108,7 +108,7 @@ def test_build_parser_accepts_run_local_paper_validation_smoke_command() -> None
 
     assert args.command == "run-local-paper-validation-smoke"
     assert args.websocket_url == "wss://example.test/live"
-    assert args.max_iterations == 5
+    assert args.max_iterations == 10
 
 
 def test_build_local_paper_validation_profile_stays_isolated_from_project_root(
@@ -624,7 +624,7 @@ def test_run_local_paper_validation_smoke_writes_passed_result_artifacts(
 
     assert exit_code == 0
     assert created_runtime is not None
-    assert created_runtime.start_calls == [5]
+    assert created_runtime.start_calls == [10]
     assert created_runtime.stop_calls == 1
     review_output_dir = profile.default_review_output_dir(as_of_date=args.as_of)
     smoke_result_path = review_output_dir / "smoke_run_result.json"

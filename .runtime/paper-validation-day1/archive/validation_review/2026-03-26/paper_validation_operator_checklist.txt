@@ -1,0 +1,8 @@
+Paper validation operator checklist for 2026-03-26
+
+[PASS] Service health: state=connected last_successful_cycle=2026-03-26T20:08:14.723023+00:00
+[PASS] Broker drift and reconciliation: broker_sync_drift_signals=0
+[PASS] Safety boundaries: paper_only_intact=True control_state_degradation_count=0 control_state_degradation_window_count=0
+[NEEDS_REVIEW] Alerts and notifications: configured=False delivery_failures=0
+[WARN] Pending-order and broker state coherence: active_orders=0 unusual_states=1
+[PASS] Dashboard/API truth surfaces: health_available=True control_state_readable=True

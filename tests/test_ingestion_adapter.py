@@ -16,6 +16,7 @@ from bot.ingestion.streaming import (
     StreamingMarketDataEvent,
     WebsocketIngestionAdapter,
 )
+from bot.ingestion.websocket_transport import normalize_polygon_websocket_message
 from bot.orchestration.live_runner import (
     LiveMarketCycleRequest,
     LiveMarketRunner,
@@ -582,6 +583,127 @@ def test_websocket_ingestion_adapter_skips_malformed_messages_cleanly() -> None:
         request,
         now_utc=datetime(2024, 1, 5, 14, 30, 1, tzinfo=timezone.utc),
     ) is not None
+
+
+def test_polygon_aggregate_message_normalizes_to_valid_internal_event() -> None:
+    polygon_message = {
+        "ev": "A",
+        "sym": "AAPL",
+        "v": 100,
+        "av": 50000,
+        "op": 150.0,
+        "vw": 151.5,
+        "o": 150.5,
+        "c": 151.0,
+        "h": 151.5,
+        "l": 150.0,
+        "a": 150.75,
+        "z": 25,
+        "s": 1704067200000,
+        "e": 1704067201000,
+    }
+    normalized = normalize_polygon_websocket_message(polygon_message)
+    assert normalized is not None
+    assert isinstance(normalized["type"], str)
+    assert normalized["type"] == "candidate_universe_refresh_batch"
+    assert normalized["symbols"] == ["AAPL"]
+    assert normalized["as_of_date"] == "2024-01-01"
+    event = StreamingMarketDataEvent.from_message(normalized)
+    assert event.event_type == "candidate_universe_refresh_batch"
+    assert "AAPL" in event.symbols
+
+
+def test_polygon_status_message_is_silently_dropped() -> None:
+    status_message = {
+        "ev": "status",
+        "status": "connected",
+        "message": "Connected Successfully",
+    }
+    assert normalize_polygon_websocket_message(status_message) is None
+
+
+def test_polygon_normalizer_passes_through_pre_normalized_messages() -> None:
+    internal_message = {
+        "type": "candidate_universe_refresh_batch",
+        "as_of_date": "2024-01-05",
+    }
+    result = normalize_polygon_websocket_message(internal_message)
+    assert result is not None
+    assert result["type"] == "candidate_universe_refresh_batch"
+
+
+def test_websocket_adapter_with_polygon_normalizer_accepts_raw_polygon_messages() -> None:
+    adapter = WebsocketIngestionAdapter(
+        transport_name="polygon-test",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "ev": "status",
+                        "status": "connected",
+                        "message": "Connected Successfully",
+                    },
+                    {
+                        "ev": "A",
+                        "sym": "MSFT",
+                        "v": 200,
+                        "s": 1704067200000,
+                        "e": 1704067201000,
+                    },
+                ]
+            ]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        flush_interval_seconds=1,
+        message_normalizer=normalize_polygon_websocket_message,
+    )
+    adapter.connect()
+    poll_result = adapter.poll_messages(
+        observed_at_utc=datetime(2024, 1, 1, 14, 30, tzinfo=timezone.utc),
+    )
+
+    assert poll_result.accepted_count == 1
+    assert poll_result.skipped_count == 0
+    assert poll_result.warning_count == 0
+
+
+def test_polygon_normalized_event_drives_cycle_eligible_buffer_update() -> None:
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=date(2024, 1, 1),
+        include_daily_summary=True,
+        daily_summary_required=False,
+    )
+    adapter = WebsocketIngestionAdapter(
+        transport_name="polygon-test",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "ev": "A",
+                        "sym": "AAPL",
+                        "v": 100,
+                        "s": 1704067200000,
+                        "e": 1704067201000,
+                    },
+                ]
+            ]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        flush_interval_seconds=1,
+        message_normalizer=normalize_polygon_websocket_message,
+    )
+    adapter.connect()
+    t0 = datetime(2024, 1, 1, 14, 30, tzinfo=timezone.utc)
+    adapter.poll_messages(observed_at_utc=t0)
+    assert adapter._buffer.dirty_since_utc is not None
+    assert adapter._buffer.flush_due(
+        as_of_date=date(2024, 1, 1),
+        now_utc=t0 + timedelta(seconds=2),
+        flush_interval=timedelta(seconds=1),
+    )
 
 
 def test_websocket_ingestion_adapter_handles_disconnect_and_reconnect() -> None:

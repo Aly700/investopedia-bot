@@ -1,0 +1,316 @@
+master_universe:
+  market: stocks
+  locale: us
+  active_only: true
+  allowed_ticker_types:
+    - CS
+    - ETF
+  liquidity_lookback_days: 20
+  reference_cache_dir: data/cache/reference_universe
+  processed_output_dir: data/processed/universe
+  candidate_output_dir: data/raw
+  raw_reference_filename: master_reference.csv
+  master_universe_filename: master_universe.csv
+  profile_summary_dir: profiles
+
+profiles:
+  broad_momentum:
+    description: Broad liquid common-stock universe for momentum and breakout scans.
+    active_only: true
+    allowed_exchanges:
+      - XNAS
+      - XNYS
+      - ARCX
+    allowed_ticker_types:
+      - CS
+    common_stock_only: true
+    include_etfs: false
+    include_adrs: false
+    exclude_weird_instruments: true
+    min_price: 12
+    min_average_daily_volume: 750000
+    min_dollar_volume: 25000000
+    min_market_cap: 2000000000
+    max_symbols: 400
+    preferred_symbol_groups:
+      GOOGL:
+        - GOOGL
+        - GOOG
+      FOXA:
+        - FOXA
+        - FOX
+      NWSA:
+        - NWSA
+        - NWS
+    exclude_symbols:
+      - SPY
+      - QQQ
+      - IWM
+      - DIA
+      - COIN
+      - CRCL
+      - CRWV
+      - HIMS
+      - IREN
+      - MSTR
+      - NU
+      - RKLB
+      - SOFI
+      - ASTS
+
+  growth_momentum:
+    description: Selective liquid growth universe for aggressive breakout and momentum scans.
+    active_only: true
+    allowed_exchanges:
+      - XNAS
+      - XNYS
+      - ARCX
+    allowed_ticker_types:
+      - CS
+    common_stock_only: true
+    include_etfs: false
+    include_adrs: false
+    exclude_weird_instruments: true
+    min_price: 15
+    min_average_daily_volume: 500000
+    min_dollar_volume: 35000000
+    min_market_cap: 10000000000
+    max_symbols: 250
+    allowed_industries:
+      - semiconductor
+      - prepackaged software
+      - computer programming
+      - programming services
+      - data processing
+      - computer processing
+      - computer integrated systems design
+      - computer communications equipment
+      - communications equipment
+      - telegraph apparatus
+      - computer storage
+      - electronic computers
+      - computer peripheral
+      - special industry machinery
+      - optical instruments
+      - electronic components
+      - testing of electricity
+    preferred_symbol_groups:
+      GOOGL:
+        - GOOGL
+        - GOOG
+      FOXA:
+        - FOXA
+        - FOX
+      NWSA:
+        - NWSA
+        - NWS
+    include_symbols:
+      - AMZN
+      - GOOGL
+      - META
+      - NFLX
+      - UBER
+      - SPOT
+    exclude_symbols:
+      - ADP
+      - CTSH
+      - HUBB
+      - IONQ
+      - JKHY
+      - LDOS
+      - NVT
+      - PNR
+      - VLTO
+      - VRSK
+
+  quality_liquid:
+    description: Conservative high-liquidity common-stock universe for cleaner multi-sector scans.
+    active_only: true
+    allowed_exchanges:
+      - XNAS
+      - XNYS
+      - ARCX
+    allowed_ticker_types:
+      - CS
+    common_stock_only: true
+    include_etfs: false
+    include_adrs: false
+    exclude_weird_instruments: true
+    min_price: 15
+    min_average_daily_volume: 1000000
+    min_dollar_volume: 60000000
+    min_market_cap: 15000000000
+    max_symbols: 275
+    preferred_symbol_groups:
+      GOOGL:
+        - GOOGL
+        - GOOG
+      FOXA:
+        - FOXA
+        - FOX
+      NWSA:
+        - NWSA
+        - NWS
+    exclude_symbols:
+      - SPY
+      - QQQ
+      - IWM
+      - DIA
+      - ASTS
+      - NBIS
+      - COIN
+      - CRCL
+      - CRWV
+      - CVNA
+      - HIMS
+      - HOOD
+      - IREN
+      - MSTR
+      - NU
+      - RBLX
+      - RDDT
+      - RKLB
+      - SOFI
+
+  large_cap_liquid:
+    description: Large-cap liquid common stocks for core watchlists and daily scans.
+    active_only: true
+    allowed_exchanges:
+      - XNAS
+      - XNYS
+      - ARCX
+    allowed_ticker_types:
+      - CS
+    common_stock_only: true
+    include_etfs: false
+    include_adrs: false
+    min_price: 15
+    min_average_daily_volume: 1000000
+    min_dollar_volume: 50000000
+    min_market_cap: 10000000000
+    max_symbols: 250
+
+  semis_ai:
+    description: Semiconductor and AI infrastructure universe with manual force-includes.
+    active_only: true
+    allowed_exchanges:
+      - XNAS
+      - XNYS
+      - ARCX
+    allowed_ticker_types:
+      - CS
+    common_stock_only: true
+    include_etfs: false
+    include_adrs: false
+    min_price: 10
+    min_average_daily_volume: 300000
+    min_dollar_volume: 10000000
+    min_market_cap: 1000000000
+    allowed_industries:
+      - semiconductor
+      - electronic components
+      - storage devices
+      - computer peripheral
+    include_symbols:
+      - NVDA
+      - AMD
+      - AVGO
+      - MU
+      - AMAT
+      - LRCX
+      - KLAC
+      - ADI
+      - TXN
+      - QCOM
+      - ASML
+      - TSM
+      - MRVL
+      - MPWR
+      - TER
+      - ANET
+      - ARM
+      - SMCI
+      - VRT
+      - WDC
+      - STX
+    max_symbols: 150
+
+  growth_software:
+    description: Software and cloud growth universe with manual force-includes.
+    active_only: true
+    allowed_exchanges:
+      - XNAS
+      - XNYS
+      - ARCX
+    allowed_ticker_types:
+      - CS
+    common_stock_only: true
+    include_etfs: false
+    include_adrs: false
+    min_price: 10
+    min_average_daily_volume: 250000
+    min_dollar_volume: 7500000
+    min_market_cap: 1000000000
+    allowed_industries:
+      - software
+      - data processing
+      - computer integrated systems design
+    include_symbols:
+      - CRM
+      - ORCL
+      - ADBE
+      - NOW
+      - PANW
+      - CRWD
+      - SNOW
+      - DDOG
+      - MDB
+      - ZS
+      - SHOP
+      - PLTR
+      - S
+    max_symbols: 175
+
+  watchlist_manual_merge:
+    description: Manual include list merged with a liquid large-cap baseline.
+    active_only: true
+    allowed_exchanges:
+      - XNAS
+      - XNYS
+      - ARCX
+    allowed_ticker_types:
+      - CS
+    common_stock_only: true
+    include_etfs: false
+    include_adrs: false
+    min_price: 10
+    min_average_daily_volume: 500000
+    min_dollar_volume: 15000000
+    min_market_cap: 1000000000
+    include_symbols:
+      - AAPL
+      - MSFT
+      - NVDA
+      - AMZN
+      - META
+      - GOOGL
+      - TSLA
+      - NFLX
+      - AVGO
+      - AMD
+      - MU
+      - CRM
+      - ORCL
+      - ADBE
+      - PANW
+      - UBER
+      - NOW
+      - CRWD
+      - SNOW
+      - DDOG
+      - MDB
+      - ZS
+      - SHOP
+      - PLTR
+      - S
+    max_symbols: 200

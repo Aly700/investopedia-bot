@@ -1,0 +1,23 @@
+2026-03-26 00:17:23,294 | INFO     | __main__ | Starting local paper validation smoke run: internal_api=http://127.0.0.1:8765 control_api=http://127.0.0.1:8766 dashboard=http://127.0.0.1:8780/dashboard
+2026-03-26 00:17:23,315 | INFO     | bot.api.internal_api | internal-api "GET /health HTTP/1.1" 200 -
+2026-03-26 00:17:23,317 | INFO     | bot.api.control_api | operator-control "GET /control/safety HTTP/1.1" 200 -
+2026-03-26 00:17:23,318 | INFO     | bot.dashboard.operator_dashboard | operator-dashboard "GET /dashboard HTTP/1.1" 200 -
+2026-03-26 00:18:22,972 | INFO     | __main__ | Starting local paper validation smoke run: internal_api=http://127.0.0.1:8765 control_api=http://127.0.0.1:8766 dashboard=http://127.0.0.1:8780/dashboard
+2026-03-26 00:18:23,017 | INFO     | bot.api.internal_api | internal-api "GET /health HTTP/1.1" 200 -
+2026-03-26 00:18:23,019 | INFO     | bot.api.control_api | operator-control "GET /control/safety HTTP/1.1" 200 -
+2026-03-26 00:18:23,020 | INFO     | bot.dashboard.operator_dashboard | operator-dashboard "GET /dashboard HTTP/1.1" 200 -
+2026-03-26 00:18:23,139 | WARNING  | bot.ingestion.websocket_transport | Skipping malformed websocket payload: Expecting value: line 1 column 1 (char 0)
+2026-03-26 00:18:23,139 | WARNING  | bot.ingestion.streaming | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:23,140 | WARNING  | bot.service.live_market_service | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:24,267 | WARNING  | bot.ingestion.websocket_transport | Skipping malformed websocket payload: Expecting value: line 1 column 1 (char 0)
+2026-03-26 00:18:24,269 | WARNING  | bot.ingestion.streaming | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:24,271 | WARNING  | bot.service.live_market_service | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:25,395 | WARNING  | bot.ingestion.websocket_transport | Skipping malformed websocket payload: Expecting value: line 1 column 1 (char 0)
+2026-03-26 00:18:25,396 | WARNING  | bot.ingestion.streaming | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:25,397 | WARNING  | bot.service.live_market_service | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:26,519 | WARNING  | bot.ingestion.websocket_transport | Skipping malformed websocket payload: Expecting value: line 1 column 1 (char 0)
+2026-03-26 00:18:26,520 | WARNING  | bot.ingestion.streaming | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:26,523 | WARNING  | bot.service.live_market_service | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:27,647 | WARNING  | bot.ingestion.websocket_transport | Skipping malformed websocket payload: Expecting value: line 1 column 1 (char 0)
+2026-03-26 00:18:27,648 | WARNING  | bot.ingestion.streaming | websocket transport disconnected: Connection is already closed.
+2026-03-26 00:18:27,650 | WARNING  | bot.service.live_market_service | websocket transport disconnected: Connection is already closed.

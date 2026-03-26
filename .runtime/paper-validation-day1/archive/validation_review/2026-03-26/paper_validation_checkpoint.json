@@ -1,0 +1,16 @@
+{
+  "available": true,
+  "connected": true,
+  "cycle_count": 5,
+  "last_connected_at_utc": "2026-03-26T20:07:38.274611+00:00",
+  "last_cycle_status": "ok",
+  "last_cycle_warning_count": 0,
+  "last_error": null,
+  "last_message_at_utc": "2026-03-26T20:08:20.699337+00:00",
+  "last_successful_flush_at_utc": "2026-03-26T20:08:14.723023+00:00",
+  "last_warning": null,
+  "reconnect_attempt_count": 0,
+  "service_state": "connected",
+  "stale": false,
+  "warning_count": 0
+}

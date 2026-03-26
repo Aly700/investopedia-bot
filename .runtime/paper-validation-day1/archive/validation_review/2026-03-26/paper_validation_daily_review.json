@@ -1,0 +1,148 @@
+{
+  "anomaly_flags": [],
+  "as_of_date": "2026-03-26",
+  "change_summary": {
+    "as_of_date": "2026-03-26",
+    "broker_events_by_type": {},
+    "control_actions_by_command": {},
+    "failures": [],
+    "important_broker_events": [],
+    "pending_order_attention": [
+      "Pending-order position context is unavailable for capacity review."
+    ],
+    "repeated_warnings": [
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"db2b93c07473d93ddbf13542ef998229\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"1e7141f419bdbdb8ecb11dc8cab49afa\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"93b9ddbbe7d9a0034d939857897e3328\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"32a6761f3147105bbec3d78145467418\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"feb516e301415bf755177c008f211327\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      }
+    ],
+    "state_transitions": []
+  },
+  "daily_review": {
+    "anomaly_flag_count": 0,
+    "as_of_date": "2026-03-26",
+    "broker_activity": {
+      "broker_cancelled_count": 0,
+      "broker_expired_count": 0,
+      "broker_replaced_count": 0,
+      "broker_submitted_count": 0,
+      "executed_count": 0
+    },
+    "connectivity": {
+      "connect_failure_count": 0,
+      "disconnect_warning_count": 0,
+      "manual_disconnect_count": 0,
+      "manual_reconnect_count": 0,
+      "reconnect_attempt_count": 0
+    },
+    "control": {
+      "broker_sync_drift_count": 0,
+      "failed_or_rejected_count": 0,
+      "window_action_count": 0
+    },
+    "notifications": {
+      "active_key_count": 0,
+      "categories_available": false,
+      "delivered_once_key_count": 0,
+      "delivery_failure_count": 0,
+      "important_categories": [],
+      "notifications_configured": false
+    },
+    "paper_integrity": {
+      "broker_target_stayed_paper": true,
+      "control_state_degradation_count": 0,
+      "control_state_degradation_window_count": 0,
+      "execution_mode_stayed_paper": true,
+      "live_trading_enabled_ever": false,
+      "paper_only_intact": true
+    },
+    "pending_orders": {
+      "active_order_count": 0,
+      "unusual_state_count": 1,
+      "unusual_states": [
+        "Pending-order position context is unavailable for capacity review."
+      ]
+    },
+    "service": {
+      "estimated_uptime_seconds": 43.147,
+      "healthy": true,
+      "last_cycle_status": "ok",
+      "last_successful_cycle_at_utc": "2026-03-26T20:08:14.723023+00:00",
+      "restart_count": 0,
+      "service_state": "connected"
+    }
+  },
+  "generated_at_utc": "2026-03-26T20:08:21.422909+00:00",
+  "operator_checklist": [
+    {
+      "detail": "state=connected last_successful_cycle=2026-03-26T20:08:14.723023+00:00",
+      "item": "Service health",
+      "status": "pass"
+    },
+    {
+      "detail": "broker_sync_drift_signals=0",
+      "item": "Broker drift and reconciliation",
+      "status": "pass"
+    },
+    {
+      "detail": "paper_only_intact=True control_state_degradation_count=0 control_state_degradation_window_count=0",
+      "item": "Safety boundaries",
+      "status": "pass"
+    },
+    {
+      "detail": "configured=False delivery_failures=0",
+      "item": "Alerts and notifications",
+      "status": "needs_review"
+    },
+    {
+      "detail": "active_orders=0 unusual_states=1",
+      "item": "Pending-order and broker state coherence",
+      "status": "warn"
+    },
+    {
+      "detail": "health_available=True control_state_readable=True",
+      "item": "Dashboard/API truth surfaces",
+      "status": "pass"
+    }
+  ],
+  "paper_integrity": {
+    "broker_target_evidence_limited": true,
+    "broker_target_stayed_paper": true,
+    "control_state_degradation_count": 0,
+    "control_state_degradation_window_count": 0,
+    "control_state_readable": true,
+    "evidence_notes": [
+      "No broker mutation or broker sync commands were audited in the current runtime history; broker-target integrity is based on current backend policy enforcement, not direct broker-action observations.",
+      "No control actions were audited in the current runtime history; execution-mode integrity is based on current state plus runtime guardrails."
+    ],
+    "execution_mode_current": "paper",
+    "execution_mode_stayed_paper": true,
+    "integrity_warnings": [],
+    "live_confirmation_disabled_ever": false,
+    "live_confirmation_enabled_ever": true,
+    "live_mode_attempt_count": 0,
+    "live_mode_success_count": 0,
+    "live_trading_enabled_ever": false,
+    "observed_broker_mutation_count": 0,
+    "observed_execution_modes": [],
+    "paper_only_intact": true
+  },
+  "warnings": [],
+  "window_days": 1
+}

@@ -1,0 +1,28 @@
+Local paper validation daily review for 2026-03-26
+
+Service
+- Healthy=True | state=connected | uptime_seconds=43.147 | restarts=0
+- Last successful cycle: 2026-03-26T20:08:14.723023+00:00 | last cycle status: ok
+
+Connectivity
+- Reconnect attempts=0 | manual disconnects=0 | manual reconnects=0
+- Disconnect warnings=0 | connect failures=0
+
+Safety
+- Paper only intact=True | execution mode stayed paper=True | broker target stayed paper=True
+- Live trading enabled ever=False | control-state degradation count=0 | window degradation count=0
+
+Orders And Broker
+- Pending orders=0 | unusual states=1 | broker sync drift signals=0
+- Broker submitted=0 | cancelled=0 | replaced=0 | filled=0
+
+Notifications
+- Configured=False | delivery failures=0 | categories available=False
+- Active suppression keys=0 | delivered once keys=0
+
+Attention
+- No anomaly flags for this review window.
+
+Evidence notes
+- No broker mutation or broker sync commands were audited in the current runtime history; broker-target integrity is based on current backend policy enforcement, not direct broker-action observations.
+- No control actions were audited in the current runtime history; execution-mode integrity is based on current state plus runtime guardrails.

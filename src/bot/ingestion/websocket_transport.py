@@ -68,6 +68,65 @@ def parse_json_websocket_message(
     raise TypeError("websocket payload must be a JSON object or list of JSON objects.")
 
 
+_POLYGON_EV_TO_INTERNAL_TYPE: dict[str, str] = {
+    "A": "candidate_universe_refresh_batch",
+    "AM": "candidate_universe_refresh_batch",
+}
+
+_POLYGON_STATUS_EVENT = "status"
+
+
+def normalize_polygon_websocket_message(
+    message: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Convert one raw Polygon websocket message into the internal event shape.
+
+    Returns ``None`` for Polygon control/status messages that have no
+    internal equivalent (e.g. auth confirmations).  Returns the message
+    unchanged when it already carries a ``type`` field (i.e. it was
+    pre-normalized or originates from a non-Polygon source).
+    """
+
+    if "type" in message:
+        return dict(message)
+
+    ev = message.get("ev")
+    if not isinstance(ev, str) or not ev.strip():
+        return dict(message)
+
+    ev = ev.strip()
+
+    if ev.lower() == _POLYGON_STATUS_EVENT:
+        return None
+
+    internal_type = _POLYGON_EV_TO_INTERNAL_TYPE.get(ev)
+    if internal_type is None:
+        return dict(message)
+
+    sym = message.get("sym") or message.get("T") or ""
+    symbols: list[str] = [sym] if isinstance(sym, str) and sym.strip() else []
+
+    epoch_ms = message.get("e") or message.get("s") or message.get("t")
+    as_of_date: str | None = None
+    if isinstance(epoch_ms, (int, float)) and epoch_ms > 0:
+        as_of_date = datetime.fromtimestamp(
+            epoch_ms / 1000.0,
+            tz=timezone.utc,
+        ).date().isoformat()
+
+    metadata: dict[str, Any] = {"polygon_ev": ev}
+    for key in ("v", "vw", "o", "c", "h", "l", "a", "z", "s", "e", "av", "op"):
+        if key in message:
+            metadata[key] = message[key]
+
+    return {
+        "type": internal_type,
+        "symbols": symbols,
+        "as_of_date": as_of_date or datetime.now(timezone.utc).date().isoformat(),
+        "metadata": metadata,
+    }
+
+
 @dataclass
 class JsonWebsocketTransport:
     """Concrete websocket transport that parses raw JSON messages."""

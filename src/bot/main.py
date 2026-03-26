@@ -172,7 +172,10 @@ from bot.features import (
 )
 from bot.ingestion.market_data import PollingIngestionAdapter
 from bot.ingestion.streaming import LiveUpdateBufferSnapshot, WebsocketIngestionAdapter
-from bot.ingestion.websocket_transport import JsonWebsocketTransport
+from bot.ingestion.websocket_transport import (
+    JsonWebsocketTransport,
+    normalize_polygon_websocket_message,
+)
 from bot.indicators.volatility import atr
 from bot.logging_utils import get_logger, setup_logging
 from bot.notifications import (
@@ -1361,7 +1364,7 @@ def build_parser() -> argparse.ArgumentParser:
         run_local_paper_validation_smoke_parser
     )
     run_local_paper_validation_smoke_parser.set_defaults(
-        max_iterations=5,
+        max_iterations=10,
         handler=_handle_run_local_paper_validation_smoke,
     )
 
@@ -3112,6 +3115,11 @@ def _build_live_market_service_bundle(
         ),
         provider_name=_configured_provider_name(config),
         flush_interval_seconds=args.flush_interval_seconds,
+        message_normalizer=(
+            normalize_polygon_websocket_message
+            if "polygon" in args.websocket_url.lower()
+            else None
+        ),
     )
     latest_outputs: dict[str, str] = {}
     notification_router = _build_notification_router(

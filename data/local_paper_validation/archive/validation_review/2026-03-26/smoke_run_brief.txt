@@ -1,0 +1,16 @@
+Local paper validation smoke run for 2026-03-26
+
+- Passed=False | startup_succeeded=True | runtime_stopped_cleanly=True
+- API available=True | internal_api=True | control_api=True | dashboard=True
+- Successful cycles=0 | last successful cycle=n/a
+- Review artifacts written=True | service status artifact present=True
+- Paper only intact=True | execution_mode=paper | execution_submission_enabled=True | broker_trading_enabled=False
+- Warning count=15 | anomaly flags=1 | blocking issues=1
+
+Blocking issues
+- No successful market cycle completed during the smoke run.
+
+Warnings
+- Repeated connectivity churn detected: reconnect_attempts=1, disconnect_warnings=10, connect_failures=0.
+- No broker mutation or broker sync commands were audited in the current runtime history; broker-target integrity is based on current backend policy enforcement, not direct broker-action observations.
+- No control actions were audited in the current runtime history; execution-mode integrity is based on current state plus runtime guardrails.

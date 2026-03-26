@@ -1,0 +1,322 @@
+{
+  "anomaly_flags": [],
+  "artifact_paths": {
+    "archive_dir": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/archive",
+    "hot_state_dir": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/hot-state",
+    "live_market_service_status": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/hot-state/snapshots/live_market_service_status.json",
+    "logs_dir": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/logs",
+    "notification_delivery_state": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/hot-state/snapshots/notification_delivery_state.json",
+    "operator_control_audit_log": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/hot-state/logs/operator_control_audit.jsonl",
+    "operator_control_state": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/hot-state/snapshots/operator_control_state.json",
+    "paper_validation_profile": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/paper_validation_profile.json",
+    "paper_validation_runtime_journal": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/archive/paper_validation_runtime_journal.jsonl",
+    "pending_order_state": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/hot-state/snapshots/pending_orders.json",
+    "runtime_root": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/runtime-root",
+    "trade_feedback_log": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/hot-state/logs/trade_feedback.jsonl"
+  },
+  "as_of_date": "2026-03-26",
+  "change_summary": {
+    "as_of_date": "2026-03-26",
+    "broker_events_by_type": {},
+    "control_actions_by_command": {},
+    "failures": [],
+    "important_broker_events": [],
+    "pending_order_attention": [
+      "Pending-order position context is unavailable for capacity review."
+    ],
+    "repeated_warnings": [
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"db2b93c07473d93ddbf13542ef998229\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"1e7141f419bdbdb8ecb11dc8cab49afa\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"93b9ddbbe7d9a0034d939857897e3328\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"32a6761f3147105bbec3d78145467418\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"feb516e301415bf755177c008f211327\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      }
+    ],
+    "state_transitions": []
+  },
+  "control_actions": {
+    "action_counts_by_day": {
+      "2026-03-26": 2
+    },
+    "broker_sync_drift_count": 0,
+    "counts_by_command": {},
+    "failed_or_rejected_count": 0,
+    "recent_failures": [],
+    "window_action_count": 0
+  },
+  "daily_review": {
+    "anomaly_flag_count": 0,
+    "as_of_date": "2026-03-26",
+    "broker_activity": {
+      "broker_cancelled_count": 0,
+      "broker_expired_count": 0,
+      "broker_replaced_count": 0,
+      "broker_submitted_count": 0,
+      "executed_count": 0
+    },
+    "connectivity": {
+      "connect_failure_count": 0,
+      "disconnect_warning_count": 0,
+      "manual_disconnect_count": 0,
+      "manual_reconnect_count": 0,
+      "reconnect_attempt_count": 0
+    },
+    "control": {
+      "broker_sync_drift_count": 0,
+      "failed_or_rejected_count": 0,
+      "window_action_count": 0
+    },
+    "notifications": {
+      "active_key_count": 0,
+      "categories_available": false,
+      "delivered_once_key_count": 0,
+      "delivery_failure_count": 0,
+      "important_categories": [],
+      "notifications_configured": false
+    },
+    "paper_integrity": {
+      "broker_target_stayed_paper": true,
+      "control_state_degradation_count": 0,
+      "control_state_degradation_window_count": 0,
+      "execution_mode_stayed_paper": true,
+      "live_trading_enabled_ever": false,
+      "paper_only_intact": true
+    },
+    "pending_orders": {
+      "active_order_count": 0,
+      "unusual_state_count": 1,
+      "unusual_states": [
+        "Pending-order position context is unavailable for capacity review."
+      ]
+    },
+    "service": {
+      "estimated_uptime_seconds": 43.147,
+      "healthy": true,
+      "last_cycle_status": "ok",
+      "last_successful_cycle_at_utc": "2026-03-26T20:08:14.723023+00:00",
+      "restart_count": 0,
+      "service_state": "connected"
+    }
+  },
+  "generated_at_utc": "2026-03-26T20:08:21.422909+00:00",
+  "health_checkpoint": {
+    "available": true,
+    "connected": true,
+    "cycle_count": 5,
+    "last_connected_at_utc": "2026-03-26T20:07:38.274611+00:00",
+    "last_cycle_status": "ok",
+    "last_cycle_warning_count": 0,
+    "last_error": null,
+    "last_message_at_utc": "2026-03-26T20:08:20.699337+00:00",
+    "last_successful_flush_at_utc": "2026-03-26T20:08:14.723023+00:00",
+    "last_warning": null,
+    "reconnect_attempt_count": 0,
+    "service_state": "connected",
+    "stale": false,
+    "warning_count": 0
+  },
+  "log_summary": {
+    "connect_failure_count": 0,
+    "disconnect_warning_count": 0,
+    "error_count": 0,
+    "notification_failure_count": 0,
+    "record_count": 7,
+    "top_error_messages": [],
+    "top_warning_messages": [
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"db2b93c07473d93ddbf13542ef998229\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"1e7141f419bdbdb8ecb11dc8cab49afa\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"93b9ddbbe7d9a0034d939857897e3328\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"32a6761f3147105bbec3d78145467418\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      },
+      {
+        "count": 1,
+        "message": "Earnings context unavailable for daily-summary: polygon request failed with HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"feb516e301415bf755177c008f211327\",\"message\":\"You are not entitled to this data. Please upgrade your plan at https://massive.com/pricing\"}"
+      }
+    ],
+    "warning_count": 5
+  },
+  "market_state": {
+    "alertable_state_count": 0,
+    "available": true,
+    "baseline_established": false,
+    "portfolio_path": null,
+    "recent_transitions": [],
+    "top_priority_candidate_count": 0,
+    "transition_count": 0
+  },
+  "notification_summary": {
+    "active_key_count": 0,
+    "categories_available": false,
+    "delivered_once_key_count": 0,
+    "delivery_failure_count": 0,
+    "important_categories": [],
+    "notifications_configured": false,
+    "updated_at_utc": null,
+    "warnings": [
+      "Notification event categories are not persisted in current runtime artifacts; only configuration, suppression-state counts, and log failures are available."
+    ]
+  },
+  "operator_checklist": [
+    {
+      "detail": "state=connected last_successful_cycle=2026-03-26T20:08:14.723023+00:00",
+      "item": "Service health",
+      "status": "pass"
+    },
+    {
+      "detail": "broker_sync_drift_signals=0",
+      "item": "Broker drift and reconciliation",
+      "status": "pass"
+    },
+    {
+      "detail": "paper_only_intact=True control_state_degradation_count=0 control_state_degradation_window_count=0",
+      "item": "Safety boundaries",
+      "status": "pass"
+    },
+    {
+      "detail": "configured=False delivery_failures=0",
+      "item": "Alerts and notifications",
+      "status": "needs_review"
+    },
+    {
+      "detail": "active_orders=0 unusual_states=1",
+      "item": "Pending-order and broker state coherence",
+      "status": "warn"
+    },
+    {
+      "detail": "health_available=True control_state_readable=True",
+      "item": "Dashboard/API truth surfaces",
+      "status": "pass"
+    }
+  ],
+  "paper_integrity": {
+    "broker_target_evidence_limited": true,
+    "broker_target_stayed_paper": true,
+    "control_state_degradation_count": 0,
+    "control_state_degradation_window_count": 0,
+    "control_state_readable": true,
+    "evidence_notes": [
+      "No broker mutation or broker sync commands were audited in the current runtime history; broker-target integrity is based on current backend policy enforcement, not direct broker-action observations.",
+      "No control actions were audited in the current runtime history; execution-mode integrity is based on current state plus runtime guardrails."
+    ],
+    "execution_mode_current": "paper",
+    "execution_mode_stayed_paper": true,
+    "integrity_warnings": [],
+    "live_confirmation_disabled_ever": false,
+    "live_confirmation_enabled_ever": true,
+    "live_mode_attempt_count": 0,
+    "live_mode_success_count": 0,
+    "live_trading_enabled_ever": false,
+    "observed_broker_mutation_count": 0,
+    "observed_execution_modes": [],
+    "paper_only_intact": true
+  },
+  "pending_orders": {
+    "active_order_count": 0,
+    "available": true,
+    "available_slots": null,
+    "broker_status_counts": {},
+    "capacity_reserving_buy_order_count": 0,
+    "pending_fill_notional": null,
+    "pending_symbols": [],
+    "position_context_available": false,
+    "reserved_notional": 0,
+    "reserved_slot_count": null,
+    "status_counts": {},
+    "unusual_state_count": 1,
+    "unusual_states": [
+      "Pending-order position context is unavailable for capacity review."
+    ]
+  },
+  "profile": {
+    "archive_dir": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/archive",
+    "hot_state_dir": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/hot-state",
+    "journal_path": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/archive/paper_validation_runtime_journal.jsonl",
+    "logs_dir": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/logs",
+    "name": "local-paper-validation",
+    "profile_path": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/paper_validation_profile.json",
+    "project_root": "/Users/affan/Projects/investopedia-bot",
+    "review_dir": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/archive/validation_review",
+    "runtime_root": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1/runtime-root",
+    "validation_root": "/Users/affan/Projects/investopedia-bot/.runtime/paper-validation-day1"
+  },
+  "runtime_journal": {
+    "env_override_count": 0,
+    "estimated_uptime_seconds": 43.147,
+    "event_count": 2,
+    "log_rotation_count": 0,
+    "manual_disconnect_count": 0,
+    "manual_reconnect_count": 0,
+    "restart_count": 0,
+    "safety_state_corruption_count": 0,
+    "safety_state_deletion_count": 0,
+    "safety_state_reset_count": 0,
+    "start_count": 1,
+    "stop_count": 1,
+    "window_counts": {
+      "runtime_started": 1,
+      "runtime_stopped": 1
+    },
+    "window_event_count": 2
+  },
+  "safety": {
+    "broker_trading_enabled": false,
+    "control_state_readable": true,
+    "current_execution_mode": "paper",
+    "current_state": {
+      "broker_trading_enabled": false,
+      "execution_mode": "paper",
+      "execution_submission_enabled": true,
+      "last_pause_at_utc": null,
+      "last_resume_at_utc": null,
+      "live_actions_require_confirmation": true,
+      "paused_reason": null,
+      "schema_version": 1,
+      "updated_at_utc": "2026-03-26T20:07:38.271125+00:00"
+    },
+    "execution_submission_enabled": true,
+    "live_actions_require_confirmation": true,
+    "live_mode_attempt_count": 0,
+    "live_mode_success_count": 0,
+    "paper_guardrail_active": true,
+    "paper_only_intact": true,
+    "warnings": []
+  },
+  "trade_feedback": {
+    "broker_cancelled_count": 0,
+    "broker_expired_count": 0,
+    "broker_replaced_count": 0,
+    "broker_submitted_count": 0,
+    "decision_count": 0,
+    "event_counts_by_type": {},
+    "event_counts_by_workflow": {},
+    "executed_count": 0,
+    "window_event_count": 0
+  },
+  "warnings": [],
+  "window_days": 1
+}

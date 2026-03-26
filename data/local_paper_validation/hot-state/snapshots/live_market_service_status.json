@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "status": {
+    "connected": false,
+    "cycle_count": 0,
+    "last_connected_at_utc": "2026-03-26T04:18:27.527596+00:00",
+    "last_cycle_status": null,
+    "last_cycle_warning_count": 0,
+    "last_error": "websocket transport disconnected: Connection is already closed.",
+    "last_message_at_utc": null,
+    "last_successful_flush_at_utc": null,
+    "last_warning": "websocket transport disconnected: Connection is already closed.",
+    "reconnect_attempt_count": 1,
+    "service_state": "stopped",
+    "stale": false,
+    "warning_count": 5
+  },
+  "updated_at_utc": "2026-03-26T04:18:27.652018+00:00"
+}

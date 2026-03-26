@@ -239,6 +239,7 @@ class WebsocketIngestionAdapter:
     run_intraday_review: Callable[[LiveUpdateBufferSnapshot, list[ExistingPosition]], IntradayPortfolioReviewReport] | None = None
     provider_name: str | None = None
     flush_interval_seconds: int = 5
+    message_normalizer: Callable[[Mapping[str, Any]], dict[str, Any] | None] | None = None
     _buffer: LiveUpdateBuffer = field(default_factory=LiveUpdateBuffer, init=False, repr=False)
     _connected: bool = field(default=False, init=False, repr=False)
 
@@ -303,6 +304,18 @@ class WebsocketIngestionAdapter:
         warnings: list[str] = []
         for message in messages:
             received_count += 1
+            if self.message_normalizer is not None:
+                try:
+                    normalized = self.message_normalizer(message)
+                except Exception as exc:
+                    skipped_count += 1
+                    warning = f"skipped malformed stream message: {exc}"
+                    warnings.append(warning)
+                    LOGGER.warning("%s", warning)
+                    continue
+                if normalized is None:
+                    continue
+                message = normalized
             try:
                 event = StreamingMarketDataEvent.from_message(message)
             except (TypeError, ValueError) as exc:

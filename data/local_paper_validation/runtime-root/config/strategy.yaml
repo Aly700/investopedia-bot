@@ -1,0 +1,32 @@
+strategy_name: breakout_momentum
+
+universe:
+  min_price: 10
+  min_avg_dollar_volume: 20000000
+  max_symbols: 100
+
+signals:
+  breakout_lookback: 20
+  benchmark_symbol: SPY
+  benchmark_sma_fast: 50
+  benchmark_sma_slow: 200
+  relative_volume_threshold: 1.5
+  earnings_entry_block_days: 3
+  earnings_watch_days: 7
+  market_breadth_entry_floor_200ma: 0.40
+  vix_caution_threshold: 25.0
+  vix_entry_block_threshold: 30.0
+  require_sector_regime_for_entries: true
+  sector_relative_strength_window: 20
+  sector_relative_strength_entry_reject_threshold: -0.05
+  sector_relative_strength_watch_threshold: -0.05
+  max_positions_per_sector: 3
+  max_same_industry_positions: 2
+  max_sector_notional_pct: null
+
+risk:
+  risk_per_trade: 0.01
+  atr_length: 14
+  initial_stop_atr: 2.5
+  trailing_stop_atr: 3.0
+  drawdown_risk_reduction_threshold: 0.15

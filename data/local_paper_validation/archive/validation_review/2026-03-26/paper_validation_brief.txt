@@ -1,0 +1,24 @@
+Local paper validation summary for 2026-03-26
+
+Health
+- Service state: stopped | connected=False | stale=False | last cycle=n/a
+- Last message: n/a | last successful cycle: n/a | reconnect attempts: 1
+
+Safety
+- Paper guardrail active: True | current mode: paper | paper-only intact: True
+- Live mode attempts: 0 | live mode successes: 0
+
+Actions
+- Control actions: 0 | failed/rejected: 0 | broker sync drift signals: 0
+- Orders: decisions=0 | submitted=0 | cancelled=0 | replaced=0 | filled=0
+
+Runtime
+- Starts=2 | stops=2 | restarts=0 | manual disconnects=0
+
+Warnings
+- Log warnings: 15 | errors: 0 | disconnect warnings: 10
+- Anomaly flags: 1 | paper integrity warnings: 0
+
+Repeated warnings
+- 10x websocket transport disconnected: Connection is already closed.
+- 5x Skipping malformed websocket payload: Expecting value: line 1 column 1 (char 0)

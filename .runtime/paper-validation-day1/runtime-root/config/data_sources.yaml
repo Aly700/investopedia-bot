@@ -1,0 +1,10 @@
+provider: polygon
+
+alphavantage:
+  api_key_env: ALPHAVANTAGE_API_KEY
+
+tiingo:
+  api_key_env: TIINGO_API_KEY
+
+polygon:
+  api_key_env: POLYGON_API_KEY

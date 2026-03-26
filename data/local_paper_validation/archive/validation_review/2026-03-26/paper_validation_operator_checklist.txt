@@ -1,0 +1,9 @@
+Paper validation operator checklist for 2026-03-26
+
+[WARN] Service health: state=stopped last_successful_cycle=n/a
+[PASS] Broker drift and reconciliation: broker_sync_drift_signals=0
+[PASS] Safety boundaries: paper_only_intact=True control_state_degradation_count=0 control_state_degradation_window_count=0
+[NEEDS_REVIEW] Alerts and notifications: configured=False delivery_failures=0
+[WARN] Pending-order and broker state coherence: active_orders=0 unusual_states=1
+[PASS] Dashboard/API truth surfaces: health_available=True control_state_readable=True
+[WARN] Follow-up required: 1 anomaly flag(s) need review.

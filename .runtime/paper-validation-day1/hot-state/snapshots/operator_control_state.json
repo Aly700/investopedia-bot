@@ -1,0 +1,11 @@
+{
+  "broker_trading_enabled": false,
+  "execution_mode": "paper",
+  "execution_submission_enabled": true,
+  "last_pause_at_utc": null,
+  "last_resume_at_utc": null,
+  "live_actions_require_confirmation": true,
+  "paused_reason": null,
+  "schema_version": 1,
+  "updated_at_utc": "2026-03-26T20:07:38.271125+00:00"
+}
