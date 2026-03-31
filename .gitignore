@@ -18,3 +18,5 @@ data/processed/*
 data/logs/*
 notebooks/.ipynb_checkpoints/
 !.gitkeep
+
+.runtime/
