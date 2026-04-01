@@ -272,8 +272,10 @@ class WebsocketIngestionAdapter:
         self._connected = True
 
     def disconnect(self) -> None:
-        self.transport.disconnect()
-        self._connected = False
+        try:
+            self.transport.disconnect()
+        finally:
+            self._connected = False
 
     def poll_messages(
         self,
@@ -387,7 +389,10 @@ class WebsocketIngestionAdapter:
         now_utc: datetime,
         force: bool,
     ) -> MarketCycleIngestionEnvelope | None:
-        updates = self._buffer.current_updates(as_of_date=request.as_of_date)
+        updates = _resolved_monitor_updates(
+            self._buffer.current_updates(as_of_date=request.as_of_date),
+            include_daily_summary=request.include_daily_summary,
+        )
         if not updates:
             if force:
                 raise ValueError(
@@ -473,6 +478,50 @@ class WebsocketIngestionAdapter:
         )
         self._buffer.mark_flushed(flushed_at_utc=now_utc)
         return envelope
+
+
+def _resolved_monitor_updates(
+    updates: Sequence[MarketDataIngestionUpdate],
+    *,
+    include_daily_summary: bool,
+) -> tuple[MarketDataIngestionUpdate, ...]:
+    """Normalize live quote updates into the monitor-market trigger shape.
+
+    Streaming feeds commonly emit quote-bar batches instead of the polling-style
+    ``candidate_universe_refresh_batch`` update. The daily-summary path only
+    needs evidence that fresh candidate symbols arrived for the session, so
+    synthesize that refresh update from quote bars when necessary.
+    """
+
+    resolved_updates = tuple(updates)
+    if not include_daily_summary:
+        return resolved_updates
+
+    update_types = {update.update_type for update in resolved_updates}
+    if "candidate_universe_refresh_batch" in update_types:
+        return resolved_updates
+
+    quote_bar_update = next(
+        (
+            update
+            for update in resolved_updates
+            if update.update_type == "quote_bar_batch_refresh"
+        ),
+        None,
+    )
+    if quote_bar_update is None:
+        return resolved_updates
+
+    synthetic_refresh = MarketDataIngestionUpdate(
+        update_type="candidate_universe_refresh_batch",
+        as_of_date=quote_bar_update.as_of_date,
+        symbols=quote_bar_update.symbols,
+        metadata={
+            **dict(quote_bar_update.metadata),
+            "synthetic_from_update_type": "quote_bar_batch_refresh",
+        },
+    )
+    return sort_ingestion_updates((*resolved_updates, synthetic_refresh))
 
 
 def _merge_updates(

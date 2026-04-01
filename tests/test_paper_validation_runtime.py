@@ -406,6 +406,56 @@ def test_local_paper_validation_summary_ignores_cumulative_reconnect_attempts_wi
         runtime.stop()
 
 
+def test_local_paper_validation_summary_marks_degraded_feed_continuity_unhealthy(
+    tmp_path: Path,
+) -> None:
+    runtime, _supervisors = _create_runtime(tmp_path)
+    now_utc = datetime.now(timezone.utc)
+    timestamp_utc = now_utc.isoformat()
+
+    try:
+        LiveMarketServiceStatusStore(runtime.paths.runtime_root).save(
+            LiveMarketServiceStatus(
+                service_state="retrying",
+                connected=False,
+                stale=False,
+                reconnect_attempt_count=3,
+                warning_count=2,
+                cycle_count=128,
+                last_message_at_utc="2024-01-05T03:12:00+00:00",
+                last_successful_flush_at_utc="2024-01-05T03:11:30+00:00",
+                last_cycle_status="completed",
+                last_warning="websocket connect failed: offline",
+                last_error="offline",
+            ),
+            updated_at_utc=timestamp_utc,
+        )
+
+        summary = build_local_paper_validation_summary(
+            runtime.profile,
+            as_of_date=now_utc.date(),
+            window_days=1,
+        )
+
+        assert summary.daily_review["service"]["healthy"] is False
+        assert summary.daily_review["service"]["feed_continuity_healthy"] is False
+        assert summary.daily_review["service"]["connectivity_degraded"] is True
+        assert summary.daily_review["service"]["status_artifact_available"] is True
+        assert summary.daily_review["service"]["service_state"] == "retrying"
+        flag_codes = {flag["code"] for flag in summary.anomaly_flags}
+        assert "feed_continuity_failed" in flag_codes
+        service_check = next(
+            item for item in summary.operator_checklist if item["item"] == "Service health"
+        )
+        assert service_check["status"] == "warn"
+        assert "feed_continuity_healthy=False" in service_check["detail"]
+        review_text = summary.to_daily_review_text()
+        assert "feed_continuity_healthy=False" in review_text
+        assert "Last warning: websocket connect failed: offline" in review_text
+    finally:
+        runtime.stop()
+
+
 def test_local_paper_validation_summary_reports_paper_integrity_review_fields(
     tmp_path: Path,
 ) -> None:

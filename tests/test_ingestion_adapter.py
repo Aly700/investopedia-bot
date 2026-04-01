@@ -863,6 +863,50 @@ def test_websocket_ingestion_adapter_build_cycle_ingestion_returns_valid_envelop
     ]
 
 
+def test_websocket_ingestion_adapter_build_cycle_ingestion_synthesizes_candidate_refresh_from_quote_bars() -> None:
+    adapter = WebsocketIngestionAdapter(
+        transport_name="test-websocket",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "type": "quote_bar_batch_refresh",
+                        "as_of_date": "2024-01-05",
+                        "symbols": ["AAPL", "MSFT"],
+                        "metadata": {"source": "stream"},
+                    },
+                ]
+            ]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        run_daily_summary=lambda snapshot, current_positions: {"summary": _daily_summary()},
+    )
+    adapter.connect()
+    adapter.poll_messages(
+        observed_at_utc=datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    )
+
+    envelope = adapter.build_cycle_ingestion(
+        LiveMarketCycleRequest(
+            workflow="monitor-market",
+            as_of_date=date(2024, 1, 5),
+            include_daily_summary=True,
+            daily_summary_required=True,
+        )
+    )
+
+    assert [update.update_type for update in envelope.updates] == [
+        "candidate_universe_refresh_batch",
+        "quote_bar_batch_refresh",
+    ]
+    assert envelope.updates[0].symbols == ("AAPL", "MSFT")
+    assert envelope.updates[0].metadata == {
+        "source": "stream",
+        "synthetic_from_update_type": "quote_bar_batch_refresh",
+    }
+
+
 def test_websocket_ingestion_adapter_keeps_buffer_dirty_when_envelope_build_fails() -> None:
     request = LiveMarketCycleRequest(
         workflow="monitor-market",
