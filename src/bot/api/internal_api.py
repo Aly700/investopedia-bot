@@ -26,6 +26,7 @@ from bot.risk.portfolio_rules import (
 from bot.service.live_market_service import LiveMarketServiceStatusStore
 from bot.state.market_state import (
     MarketStateStore,
+    MarketStateSnapshot,
     diff_market_state_snapshots,
 )
 
@@ -100,6 +101,11 @@ class InternalApiQueryService:
             for candidate in current_snapshot.approved_candidate_queue
             if candidate.priority_bucket == "top_priority"
         ]
+        recommendation_state = _market_state_recommendation_state(
+            project_root=self.project_root,
+            current_snapshot=current_snapshot,
+            top_priority_candidates=top_priority_candidates,
+        )
         return _endpoint_response(
             endpoint="market_state",
             available=True,
@@ -120,6 +126,7 @@ class InternalApiQueryService:
                     )
                 },
                 "top_priority_candidates": top_priority_candidates,
+                "recommendation_state": recommendation_state,
                 "recent_transitions": [transition.to_dict() for transition in change_set.transitions],
                 "transition_count": change_set.transition_count,
                 "baseline_established": change_set.baseline_established,
@@ -476,6 +483,118 @@ def _load_current_positions(
         return load_existing_positions(resolved_path), (), True
     except (PortfolioInputError, OSError, UnicodeDecodeError) as exc:
         return [], (f"Failed to load portfolio snapshot at {resolved_path}: {exc}",), False
+
+
+def _market_state_recommendation_state(
+    *,
+    project_root: Path,
+    current_snapshot: MarketStateSnapshot,
+    top_priority_candidates: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    latest_monitor_market_output_path, latest_monitor_market_output_date = (
+        _latest_monitor_market_output(project_root)
+    )
+    empty_reasons: list[str] = []
+    if not current_snapshot.approved_candidate_queue:
+        if current_snapshot.top_rejected_reasons_summary:
+            rejection_summary = "; ".join(
+                f"{reason.reason} ({reason.count})"
+                for reason in current_snapshot.top_rejected_reasons_summary
+            )
+            empty_reasons.append(
+                f"No approved candidates remain after screening. Top rejection reasons: {rejection_summary}."
+            )
+        else:
+            empty_reasons.append(
+                "No approved candidates are present in the current market-state snapshot."
+            )
+    if not top_priority_candidates and current_snapshot.approved_candidate_queue:
+        empty_reasons.append(
+            "Approved candidates are present, but none are currently marked top priority."
+        )
+    return {
+        "approved_candidate_count": len(current_snapshot.approved_candidate_queue),
+        "top_priority_candidate_count": len(top_priority_candidates),
+        "queue_empty": not current_snapshot.approved_candidate_queue,
+        "top_priority_empty": not top_priority_candidates,
+        "empty_reasons": empty_reasons,
+        "context_notes": _market_state_recommendation_context_notes(
+            current_snapshot=current_snapshot,
+            latest_monitor_market_output_date=latest_monitor_market_output_date,
+        ),
+        "latest_successful_monitor_market_as_of_date": (
+            latest_monitor_market_output_date.isoformat()
+            if latest_monitor_market_output_date is not None
+            else None
+        ),
+        "latest_successful_monitor_market_output_path": (
+            str(latest_monitor_market_output_path.resolve())
+            if latest_monitor_market_output_path is not None
+            else None
+        ),
+        "monitor_market_fresh_for_snapshot_date": (
+            latest_monitor_market_output_date == current_snapshot.as_of_date
+            if latest_monitor_market_output_date is not None
+            else False
+        ),
+    }
+
+
+def _market_state_recommendation_context_notes(
+    *,
+    current_snapshot: MarketStateSnapshot,
+    latest_monitor_market_output_date: date | None,
+) -> list[str]:
+    notes: list[str] = []
+    if (
+        current_snapshot.benchmark_context is None
+        or current_snapshot.benchmark_context.benchmark_return is None
+    ):
+        notes.append("Benchmark context is unavailable in the current market-state snapshot.")
+    if (
+        current_snapshot.volatility_context is None
+        or current_snapshot.volatility_context.vix_close is None
+    ):
+        notes.append("Volatility context is unavailable in the current market-state snapshot.")
+    if not current_snapshot.sector_context_summary:
+        notes.append("Sector context summary is empty in the current market-state snapshot.")
+    if latest_monitor_market_output_date is None:
+        notes.append("No successful monitor-market output artifact has been written yet.")
+    elif latest_monitor_market_output_date < current_snapshot.as_of_date:
+        notes.append(
+            "No successful monitor-market output artifact was written for "
+            f"{current_snapshot.as_of_date.isoformat()}; latest successful monitor-market "
+            f"output is {latest_monitor_market_output_date.isoformat()}."
+        )
+    return notes
+
+
+def _latest_monitor_market_output(project_root: Path) -> tuple[Path | None, date | None]:
+    monitor_market_root = project_root / "data" / "processed" / "monitor_market"
+    if not monitor_market_root.exists():
+        return None, None
+    try:
+        candidate_paths = list(monitor_market_root.rglob("market_monitor.json"))
+    except OSError as exc:
+        LOGGER.warning(
+            "Ignoring monitor-market artifact lookup under %s because the directory could not be scanned: %s",
+            monitor_market_root,
+            exc,
+        )
+        return None, None
+    latest_candidate: tuple[date, int, Path] | None = None
+    for path in candidate_paths:
+        try:
+            artifact_date = date.fromisoformat(path.parent.name)
+            mtime_ns = path.stat().st_mtime_ns
+        except (OSError, ValueError):
+            continue
+        candidate = (artifact_date, mtime_ns, path)
+        if latest_candidate is None or candidate > latest_candidate:
+            latest_candidate = candidate
+    if latest_candidate is None:
+        return None, None
+    return latest_candidate[2], latest_candidate[0]
 
 
 @dataclass(frozen=True)

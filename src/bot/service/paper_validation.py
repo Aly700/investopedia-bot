@@ -760,13 +760,20 @@ class LocalPaperValidationSummary:
             "Service",
             (
                 f"- Healthy={self.daily_review['service']['healthy']} | "
+                f"feed_continuity_healthy={self.daily_review['service']['feed_continuity_healthy']} | "
+                f"status_artifact_available={self.daily_review['service']['status_artifact_available']} | "
                 f"state={self.health_checkpoint['service_state']} | "
                 f"uptime_seconds={self.runtime_journal['estimated_uptime_seconds']} | "
                 f"restarts={self.runtime_journal['restart_count']}"
             ),
             (
-                f"- Last successful cycle: {self.health_checkpoint['last_successful_flush_at_utc'] or 'n/a'} | "
+                f"- Last message: {self.health_checkpoint['last_message_at_utc'] or 'n/a'} | "
+                f"last successful cycle: {self.health_checkpoint['last_successful_flush_at_utc'] or 'n/a'} | "
                 f"last cycle status: {self.health_checkpoint['last_cycle_status'] or 'n/a'}"
+            ),
+            (
+                f"- Last warning: {self.health_checkpoint['last_warning'] or 'n/a'} | "
+                f"status updated: {self.health_checkpoint['status_updated_at_utc'] or 'n/a'}"
             ),
             "",
             "Connectivity",
@@ -777,6 +784,7 @@ class LocalPaperValidationSummary:
             ),
             (
                 f"- Disconnect warnings={self.log_summary['disconnect_warning_count']} | "
+                f"stale feed warnings={self.log_summary['stale_feed_warning_count']} | "
                 f"connect failures={self.log_summary['connect_failure_count']}"
             ),
             "",
@@ -1551,6 +1559,7 @@ def _build_health_checkpoint_payload(
     if not isinstance(health_payload, Mapping):
         return {
             "available": False,
+            "status_updated_at_utc": None,
             "service_state": "unknown",
             "connected": False,
             "stale": False,
@@ -1569,6 +1578,9 @@ def _build_health_checkpoint_payload(
         status = {}
     return {
         "available": bool(health_payload.get("available")),
+        "status_updated_at_utc": data.get("updated_at_utc")
+        if isinstance(data, Mapping)
+        else None,
         "service_state": status.get("service_state", "unknown"),
         "connected": bool(status.get("connected")),
         "stale": bool(status.get("stale")),
@@ -1583,6 +1595,34 @@ def _build_health_checkpoint_payload(
         "last_warning": status.get("last_warning"),
         "last_error": status.get("last_error"),
     }
+
+
+def _service_feed_continuity_healthy(
+    health_checkpoint: Mapping[str, Any],
+) -> bool:
+    service_state = _clean_text(health_checkpoint.get("service_state")) or "unknown"
+    return (
+        bool(health_checkpoint.get("available"))
+        and service_state == "connected"
+        and bool(health_checkpoint.get("connected"))
+        and not bool(health_checkpoint.get("stale"))
+        and bool(health_checkpoint.get("last_message_at_utc"))
+        and bool(health_checkpoint.get("last_successful_flush_at_utc"))
+    )
+
+
+def _service_connectivity_degraded(
+    health_checkpoint: Mapping[str, Any],
+) -> bool:
+    if not bool(health_checkpoint.get("available")):
+        return False
+    service_state = _clean_text(health_checkpoint.get("service_state")) or "unknown"
+    if service_state in {"retrying", "stale"}:
+        return True
+    return service_state == "connected" and (
+        not bool(health_checkpoint.get("connected"))
+        or bool(health_checkpoint.get("stale"))
+    )
 
 
 def _build_notification_summary(
@@ -1980,6 +2020,9 @@ def _build_runtime_log_summary(
         "disconnect_warning_count": sum(
             "websocket transport disconnected:" in record.message for record in warning_records
         ),
+        "stale_feed_warning_count": sum(
+            "websocket feed stale:" in record.message for record in warning_records
+        ),
         "connect_failure_count": sum(
             "websocket connect failed:" in record.message for record in warning_records
         ),
@@ -2037,24 +2080,27 @@ def _build_daily_review(
     paper_integrity: Mapping[str, Any],
     anomaly_flags: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    service_healthy = (
-        bool(health_checkpoint.get("available"))
-        and bool(health_checkpoint.get("last_successful_flush_at_utc"))
-        and not bool(health_checkpoint.get("stale"))
-    )
+    feed_continuity_healthy = _service_feed_continuity_healthy(health_checkpoint)
+    connectivity_degraded = _service_connectivity_degraded(health_checkpoint)
     return {
         "as_of_date": as_of_date.isoformat(),
         "service": {
-            "healthy": service_healthy,
+            "healthy": feed_continuity_healthy,
+            "feed_continuity_healthy": feed_continuity_healthy,
+            "connectivity_degraded": connectivity_degraded,
+            "status_artifact_available": bool(health_checkpoint.get("available")),
             "service_state": health_checkpoint.get("service_state"),
+            "status_updated_at_utc": health_checkpoint.get("status_updated_at_utc"),
             "estimated_uptime_seconds": runtime_journal_summary.get(
                 "estimated_uptime_seconds"
             ),
             "restart_count": runtime_journal_summary.get("restart_count"),
+            "last_message_at_utc": health_checkpoint.get("last_message_at_utc"),
             "last_successful_cycle_at_utc": health_checkpoint.get(
                 "last_successful_flush_at_utc"
             ),
             "last_cycle_status": health_checkpoint.get("last_cycle_status"),
+            "last_warning": health_checkpoint.get("last_warning"),
         },
         "connectivity": {
             "reconnect_attempt_count": health_checkpoint.get("reconnect_attempt_count"),
@@ -2066,6 +2112,9 @@ def _build_daily_review(
             ),
             "disconnect_warning_count": _coerce_int(
                 log_summary.get("disconnect_warning_count")
+            ),
+            "stale_feed_warning_count": _coerce_int(
+                log_summary.get("stale_feed_warning_count")
             ),
             "connect_failure_count": _coerce_int(
                 log_summary.get("connect_failure_count")
@@ -2134,17 +2183,15 @@ def _build_operator_checklist(
     anomaly_flags: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str]]:
     checklist: list[dict[str, str]] = []
-    service_healthy = (
-        bool(health_checkpoint.get("available"))
-        and bool(health_checkpoint.get("last_successful_flush_at_utc"))
-        and not bool(health_checkpoint.get("stale"))
-    )
+    service_healthy = _service_feed_continuity_healthy(health_checkpoint)
     checklist.append(
         {
             "item": "Service health",
             "status": "pass" if service_healthy else "warn",
             "detail": (
+                f"feed_continuity_healthy={service_healthy} "
                 f"state={health_checkpoint.get('service_state')} "
+                f"last_message_at_utc={health_checkpoint.get('last_message_at_utc') or 'n/a'} "
                 f"last_successful_cycle={health_checkpoint.get('last_successful_flush_at_utc') or 'n/a'}"
             ),
         }
@@ -2231,6 +2278,21 @@ def _build_anomaly_flags(
     paper_integrity: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     flags: list[dict[str, Any]] = []
+    if _service_connectivity_degraded(health_checkpoint):
+        flags.append(
+            {
+                "code": "feed_continuity_failed",
+                "severity": "critical",
+                "message": (
+                    "Feed continuity is degraded: "
+                    f"service_state={health_checkpoint.get('service_state')}, "
+                    f"connected={health_checkpoint.get('connected')}, "
+                    f"stale={health_checkpoint.get('stale')}, "
+                    f"last_message_at_utc={health_checkpoint.get('last_message_at_utc') or 'n/a'}, "
+                    f"last_successful_cycle_at_utc={health_checkpoint.get('last_successful_flush_at_utc') or 'n/a'}."
+                ),
+            }
+        )
     reconnect_attempts = _coerce_int(health_checkpoint.get("reconnect_attempt_count"))
     disconnect_warnings = _coerce_int(log_summary.get("disconnect_warning_count"))
     connect_failures = _coerce_int(log_summary.get("connect_failure_count"))

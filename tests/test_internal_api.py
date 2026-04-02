@@ -32,6 +32,7 @@ from bot.state.market_state import (
     MarketStateAlertableState,
     MarketStateCandidateState,
     MarketStatePortfolioSummary,
+    MarketStateRejectedReasonSummary,
     MarketStateSnapshot,
     default_current_market_state_path,
     default_previous_market_state_path,
@@ -51,6 +52,90 @@ def test_internal_api_market_state_returns_snapshot_and_recent_transitions(
     assert payload["data"]["top_priority_candidates"][0]["symbol"] == "NVDA"
     assert payload["data"]["current_alertable_states"][0]["symbol"] == "AAPL"
     assert payload["data"]["recent_transitions"][0]["transition_type"] == "HOLD_TO_WATCH_CLOSELY"
+
+
+def test_internal_api_market_state_reports_fresh_recommendation_state_when_queue_is_populated(
+    tmp_path: Path,
+) -> None:
+    query_service = InternalApiQueryService(project_root=tmp_path)
+    _write_market_state_snapshots(tmp_path)
+    write_json_file(
+        tmp_path / "data" / "processed" / "monitor_market" / "2024-01-05" / "market_monitor.json",
+        {"as_of_date": "2024-01-05"},
+    )
+
+    payload = query_service.market_state()
+    recommendation_state = payload["data"]["recommendation_state"]
+
+    assert recommendation_state["queue_empty"] is False
+    assert recommendation_state["top_priority_empty"] is False
+    assert recommendation_state["empty_reasons"] == []
+    assert recommendation_state["latest_successful_monitor_market_as_of_date"] == "2024-01-05"
+    assert recommendation_state["monitor_market_fresh_for_snapshot_date"] is True
+
+
+def test_internal_api_market_state_surfaces_empty_queue_reasons_and_stale_monitor_market_output(
+    tmp_path: Path,
+) -> None:
+    query_service = InternalApiQueryService(project_root=tmp_path)
+    previous_snapshot = MarketStateSnapshot(
+        schema_version=MARKET_STATE_SNAPSHOT_SCHEMA_VERSION,
+        as_of_timestamp="2024-01-04T15:00:00+00:00",
+        as_of_date=date(2024, 1, 4),
+        source_workflows=("monitor-market",),
+    )
+    current_snapshot = MarketStateSnapshot(
+        schema_version=MARKET_STATE_SNAPSHOT_SCHEMA_VERSION,
+        as_of_timestamp="2024-01-05T15:00:00+00:00",
+        as_of_date=date(2024, 1, 5),
+        source_workflows=("monitor-market",),
+        top_rejected_reasons_summary=(
+            MarketStateRejectedReasonSummary(
+                reason="Max concurrent positions reached.",
+                count=5,
+            ),
+        ),
+    )
+    write_json_file(
+        default_previous_market_state_path(tmp_path),
+        previous_snapshot.to_dict(),
+    )
+    write_json_file(
+        default_current_market_state_path(tmp_path),
+        current_snapshot.to_dict(),
+    )
+    write_json_file(
+        tmp_path / "data" / "processed" / "monitor_market" / "2024-01-04" / "market_monitor.json",
+        {"as_of_date": "2024-01-04"},
+    )
+
+    payload = query_service.market_state()
+    recommendation_state = payload["data"]["recommendation_state"]
+
+    assert payload["data"]["baseline_established"] is False
+    assert recommendation_state["queue_empty"] is True
+    assert recommendation_state["top_priority_empty"] is True
+    assert recommendation_state["latest_successful_monitor_market_as_of_date"] == "2024-01-04"
+    assert recommendation_state["monitor_market_fresh_for_snapshot_date"] is False
+    assert recommendation_state["empty_reasons"] == [
+        "No approved candidates remain after screening. Top rejection reasons: Max concurrent positions reached. (5)."
+    ]
+    assert (
+        "Benchmark context is unavailable in the current market-state snapshot."
+        in recommendation_state["context_notes"]
+    )
+    assert (
+        "Volatility context is unavailable in the current market-state snapshot."
+        in recommendation_state["context_notes"]
+    )
+    assert (
+        "Sector context summary is empty in the current market-state snapshot."
+        in recommendation_state["context_notes"]
+    )
+    assert (
+        "No successful monitor-market output artifact was written for 2024-01-05; latest successful monitor-market output is 2024-01-04."
+        in recommendation_state["context_notes"]
+    )
 
 
 def test_internal_api_market_state_degrades_cleanly_when_missing_or_malformed(

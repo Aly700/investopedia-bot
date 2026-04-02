@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import date, timedelta
 import json
 from pathlib import Path
+import socket
 from typing import Mapping
 
 import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 
+import bot.data.providers as providers_module
 from bot.config import UniverseConfig, load_app_config
 from bot.data.candidate_journal import (
     CandidateJournalEntry,
@@ -74,7 +76,6 @@ from bot.data.trade_feedback import (
     load_trade_feedback_events,
     summarize_trade_feedback_events,
 )
-from bot.execution.interface import ExecutionOrder
 from bot.data.volatility_context import (
     MAX_VOLATILITY_CONTEXT_BAR_AGE_DAYS,
     build_volatility_regime_context,
@@ -89,12 +90,22 @@ from bot.data.normalize import (
     normalize_intraday_bars,
 )
 from bot.data.providers import (
+    DataProviderRequestError,
     DailyBarProvider,
+    PolygonDailyBarProvider,
     create_daily_bar_provider,
     load_provider_environment,
 )
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
-from bot.reporting.daily_report import PortfolioReviewRow, build_portfolio_review_report
+from bot.execution.interface import ExecutionBatch, ExecutionOrder
+from bot.features import MarketContext
+from bot.reporting.daily_report import (
+    DailyPresetSummaryRow,
+    DailyResearchOpportunityRow,
+    DailyResearchSummary,
+    PortfolioReviewRow,
+    build_portfolio_review_report,
+)
 from bot.reporting.trade_review import build_trade_review_analytics_summary
 from bot.risk.portfolio_rules import ExistingPosition
 from bot.state.market_state import (
@@ -728,6 +739,34 @@ def test_create_provider_uses_configured_provider() -> None:
     )
 
     assert provider.provider_name == config.data_sources.provider.lower()
+
+
+@pytest.mark.parametrize(
+    "raw_timeout",
+    (
+        TimeoutError("Operation timed out"),
+        socket.timeout("The read operation timed out"),
+    ),
+)
+def test_polygon_provider_wraps_raw_network_timeouts_as_provider_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raw_timeout: BaseException,
+) -> None:
+    provider = PolygonDailyBarProvider(api_key="test-key", cache_dir=tmp_path)
+
+    def fake_urlopen(*args: object, **kwargs: object) -> object:
+        raise raw_timeout
+
+    monkeypatch.setattr(providers_module, "urlopen", fake_urlopen)
+
+    with pytest.raises(DataProviderRequestError, match="request timed out"):
+        provider.fetch_daily_bars(
+            "AAPL",
+            date(2024, 1, 2),
+            date(2024, 1, 5),
+            refresh_cache=True,
+        )
 
 
 def test_candidate_score_journal_updates_and_persists_repeated_candidates(
@@ -3361,6 +3400,95 @@ def test_market_state_snapshot_keeps_highest_severity_action_for_duplicate_symbo
     assert snapshot.current_action_states_by_symbol["AAPL"].action == "EXIT CANDIDATE"
 
 
+def test_market_state_store_establishes_candidate_baseline_from_daily_summary(
+    tmp_path: Path,
+) -> None:
+    store = MarketStateStore(tmp_path)
+
+    result = store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="monitor-market",
+        daily_summary=_daily_research_summary(
+            rows=(
+                _daily_research_row(symbol="NVDA"),
+                _daily_research_row(
+                    symbol="XOM",
+                    rank=2,
+                    status="rejected",
+                    actionable_now=False,
+                    priority_bucket=None,
+                    rejection_reasons=("Max concurrent positions reached.",),
+                ),
+            ),
+            market_context=MarketContext(
+                as_of_date=date(2024, 1, 5),
+                benchmark_symbol="SPY",
+                benchmark_return=0.012,
+                market_breadth_pct_above_200ma=0.61,
+                market_breadth_pct_above_50ma=0.58,
+                market_breadth_state="healthy",
+                vix_close=14.2,
+                vix_sma_short=13.8,
+                vix_sma_long=15.1,
+                volatility_regime_state="calm",
+                volatility_regime_risk_off=False,
+            ),
+        ),
+    )
+
+    assert result.change_set.baseline_established is True
+    assert result.current_snapshot.benchmark_context is not None
+    assert result.current_snapshot.benchmark_context.benchmark_return == pytest.approx(0.012)
+    assert result.current_snapshot.volatility_context is not None
+    assert result.current_snapshot.volatility_context.vix_close == pytest.approx(14.2)
+    assert result.current_snapshot.approved_candidate_queue[0].symbol == "NVDA"
+    assert result.current_snapshot.approved_candidate_queue[0].priority_bucket == "top_priority"
+    assert result.current_snapshot.sector_context_summary[0].sector_name == "Technology"
+    assert result.current_snapshot.top_rejected_reasons_summary[0].reason == (
+        "Max concurrent positions reached."
+    )
+    assert result.current_snapshot.current_alertable_states[0].category == "BUY CANDIDATE"
+
+
+def test_market_state_store_rebuilds_candidate_queue_after_restart_from_empty_monitor_snapshot(
+    tmp_path: Path,
+) -> None:
+    initial_store = MarketStateStore(tmp_path)
+    initial_store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="monitor-market",
+        daily_summary=_daily_research_summary(rows=()),
+    )
+
+    restarted_store = MarketStateStore(tmp_path)
+    result = restarted_store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="monitor-market",
+        daily_summary=_daily_research_summary(
+            rows=(_daily_research_row(symbol="AVGO"),),
+            market_context=MarketContext(
+                as_of_date=date(2024, 1, 5),
+                benchmark_symbol="SPY",
+                benchmark_return=0.01,
+                market_breadth_pct_above_200ma=0.55,
+                market_breadth_pct_above_50ma=0.52,
+                market_breadth_state="healthy",
+                vix_close=15.0,
+                vix_sma_short=14.4,
+                vix_sma_long=16.2,
+                volatility_regime_state="calm",
+                volatility_regime_risk_off=False,
+            ),
+        ),
+    )
+
+    assert result.change_set.baseline_established is False
+    assert result.current_snapshot.source_workflows == ("monitor-market",)
+    assert result.current_snapshot.approved_candidate_queue[0].symbol == "AVGO"
+    assert result.current_snapshot.sector_context_summary[0].top_symbols == ("AVGO",)
+    assert result.current_snapshot.current_alertable_states[0].symbol == "AVGO"
+
+
 def _market_state_snapshot(
     *,
     action_states: Mapping[str, str] | None = None,
@@ -3411,4 +3539,107 @@ def _market_state_snapshot(
             for index, symbol in enumerate(top_priority_symbols, start=1)
         ),
         current_action_states_by_symbol=resolved_action_states,
+    )
+
+
+def _daily_research_summary(
+    *,
+    rows: tuple[DailyResearchOpportunityRow, ...],
+    market_context: MarketContext | None = None,
+) -> DailyResearchSummary:
+    approved_symbols = tuple(row.symbol for row in rows if row.status == "approved")
+    rejected_symbols = tuple(row.symbol for row in rows if row.status == "rejected")
+    top_score = max((row.score for row in rows), default=0.0)
+    top_symbol = next((row.symbol for row in rows if row.score == top_score), None)
+    return DailyResearchSummary(
+        as_of_date=date(2024, 1, 5),
+        generated_at_utc="2024-01-05T15:30:00+00:00",
+        executor_name="manual",
+        selected_presets=(),
+        preset_selection_source="test",
+        benchmark_symbol=(
+            market_context.benchmark_symbol
+            if market_context is not None
+            else "SPY"
+        ),
+        universe_symbols=tuple(row.symbol for row in rows),
+        current_positions=(),
+        no_signal_symbols_by_preset={},
+        preset_summaries=(
+            DailyPresetSummaryRow(
+                preset_rank=1,
+                preset_name="standard_breakout",
+                parameter_id="standard_breakout:v1",
+                candidate_count=len(rows),
+                approved_count=len(approved_symbols),
+                rejected_count=len(rejected_symbols),
+                no_signal_count=0,
+                order_count=0,
+                average_score=(
+                    sum(row.score for row in rows) / len(rows)
+                    if rows
+                    else 0.0
+                ),
+                top_score=top_score,
+                top_symbol=top_symbol,
+                approved_symbols=approved_symbols,
+                rejected_symbols=rejected_symbols,
+            ),
+        ),
+        rows=rows,
+        execution_batch=ExecutionBatch(
+            executor_name="manual",
+            as_of_date=date(2024, 1, 5),
+            generated_at_utc="2024-01-05T15:30:00+00:00",
+            orders=(),
+        ),
+        market_context=market_context,
+    )
+
+
+def _daily_research_row(
+    *,
+    symbol: str,
+    rank: int = 1,
+    status: str = "approved",
+    actionable_now: bool = True,
+    priority_bucket: str | None = "top_priority",
+    rejection_reasons: tuple[str, ...] = (),
+) -> DailyResearchOpportunityRow:
+    metadata: dict[str, object] = {
+        "signal_metadata": {
+            "sector_name": "Technology",
+            "sector_etf_symbol": "XLK",
+        }
+    }
+    if priority_bucket is not None:
+        metadata["execution_priority"] = {
+            "actionable_now": actionable_now,
+            "priority_bucket": priority_bucket,
+        }
+    return DailyResearchOpportunityRow(
+        rank=rank,
+        date=date(2024, 1, 5),
+        signal_date=date(2024, 1, 5),
+        preset_name="standard_breakout",
+        parameter_id="standard_breakout:v1",
+        symbol=symbol,
+        status=status,
+        action="BUY",
+        quantity=25 if status == "approved" else 0,
+        intended_order_type="STOP_LIMIT" if status == "approved" else None,
+        entry_price_hint=101.0 if status == "approved" else None,
+        stop_level=95.0 if status == "approved" else None,
+        strategy_name="breakout_momentum",
+        rationale="Fresh breakout setup.",
+        score=91.5 - rank,
+        breakout_pct=0.021,
+        relative_volume_ratio=1.8,
+        position_pct_equity=0.09,
+        adjusted_risk_per_trade=0.01,
+        risk_budget=1_000.0,
+        per_share_risk=6.0,
+        notional_value=2_525.0 if status == "approved" else 0.0,
+        rejection_reasons=rejection_reasons,
+        metadata=metadata,
     )

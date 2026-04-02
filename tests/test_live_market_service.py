@@ -196,6 +196,40 @@ def test_live_market_supervisor_reconnects_after_transport_failure_and_runs_cycl
     assert status.service_state == "stopped"
 
 
+def test_live_market_supervisor_runs_cycle_from_quote_bar_updates(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc))
+    connection = FakeWebsocketConnection(
+        [
+            json.dumps(
+                {
+                    "type": "quote_bar_batch_refresh",
+                    "as_of_date": "2024-01-05",
+                    "symbols": ["AAPL"],
+                }
+            ),
+        ]
+    )
+    transport = JsonWebsocketTransport(
+        url="wss://example.test/live",
+        connection_factory=FakeConnectionFactory([connection]),
+    )
+    supervisor = _build_supervisor(
+        tmp_path,
+        transport=transport,
+        clock=clock,
+        flush_interval_seconds=1,
+        poll_interval_seconds=1.0,
+    )
+
+    status = supervisor.run(max_iterations=2)
+
+    assert status.cycle_count == 1
+    assert status.last_successful_flush_at_utc is not None
+    assert status.service_state == "stopped"
+
+
 def test_live_market_supervisor_reconnects_after_non_oserror_recv_failure(
     tmp_path: Path,
 ) -> None:
@@ -375,7 +409,17 @@ def test_live_market_supervisor_detects_stale_connection_without_messages(
     clock = FakeClock(datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc))
     transport = JsonWebsocketTransport(
         url="wss://example.test/live",
-        connection_factory=FakeConnectionFactory([FakeWebsocketConnection([])]),
+        connection_factory=FakeConnectionFactory(
+            [
+                FakeWebsocketConnection(
+                    [
+                        TimeoutError("idle"),
+                        TimeoutError("idle"),
+                        TimeoutError("idle"),
+                    ]
+                )
+            ]
+        ),
     )
     supervisor = _build_supervisor(
         tmp_path,
@@ -390,9 +434,174 @@ def test_live_market_supervisor_detects_stale_connection_without_messages(
     clock.advance(3)
     status = supervisor.run_once()
 
-    assert status.connected is True
+    assert status.connected is False
     assert status.stale is True
-    assert status.service_state == "stale"
+    assert status.service_state == "retrying"
+    assert status.last_warning is not None
+    assert status.last_warning.startswith("websocket feed stale:")
+
+
+def test_live_market_supervisor_reconnects_after_disconnect_during_long_running_session(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc))
+    first_connection = FakeWebsocketConnection(
+        [
+            json.dumps(
+                {"type": "candidate_universe_refresh_batch", "as_of_date": "2024-01-05"}
+            ),
+            json.dumps({"type": "market_context_refresh_batch", "as_of_date": "2024-01-05"}),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            OSError("socket closed"),
+        ]
+    )
+    recovered_connection = FakeWebsocketConnection(
+        [
+            json.dumps(
+                {"type": "candidate_universe_refresh_batch", "as_of_date": "2024-01-05"}
+            ),
+            json.dumps({"type": "market_context_refresh_batch", "as_of_date": "2024-01-05"}),
+            TimeoutError("idle"),
+        ]
+    )
+    transport = JsonWebsocketTransport(
+        url="wss://example.test/live",
+        connection_factory=FakeConnectionFactory([first_connection, recovered_connection]),
+    )
+    supervisor = _build_supervisor(
+        tmp_path,
+        transport=transport,
+        clock=clock,
+        flush_interval_seconds=1,
+        poll_interval_seconds=1.0,
+        reconnect_backoff=ReconnectBackoffPolicy(
+            initial_delay_seconds=1.0,
+            multiplier=1.0,
+            max_delay_seconds=1.0,
+        ),
+    )
+
+    status = supervisor.run(max_iterations=5)
+
+    assert status.cycle_count == 2
+    assert status.warning_count >= 1
+    assert status.last_successful_flush_at_utc is not None
+    assert first_connection.closed is True
+    assert recovered_connection.closed is True
+
+
+def test_live_market_supervisor_forces_reconnect_after_stale_feed_and_resumes_cycles(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc))
+    stale_connection = FakeWebsocketConnection(
+        [
+            json.dumps(
+                {"type": "candidate_universe_refresh_batch", "as_of_date": "2024-01-05"}
+            ),
+            json.dumps({"type": "market_context_refresh_batch", "as_of_date": "2024-01-05"}),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+        ]
+    )
+    recovered_connection = FakeWebsocketConnection(
+        [
+            json.dumps(
+                {"type": "candidate_universe_refresh_batch", "as_of_date": "2024-01-05"}
+            ),
+            json.dumps({"type": "market_context_refresh_batch", "as_of_date": "2024-01-05"}),
+            TimeoutError("idle"),
+        ]
+    )
+    transport = JsonWebsocketTransport(
+        url="wss://example.test/live",
+        connection_factory=FakeConnectionFactory([stale_connection, recovered_connection]),
+    )
+    supervisor = _build_supervisor(
+        tmp_path,
+        transport=transport,
+        clock=clock,
+        flush_interval_seconds=1,
+        poll_interval_seconds=1.0,
+        stale_after_seconds=5.0,
+        reconnect_backoff=ReconnectBackoffPolicy(
+            initial_delay_seconds=1.0,
+            multiplier=1.0,
+            max_delay_seconds=1.0,
+        ),
+    )
+
+    status = supervisor.run(max_iterations=8)
+
+    assert status.cycle_count == 2
+    assert status.warning_count >= 1
+    assert status.last_warning is not None
+    assert "websocket feed stale:" in status.last_warning
+    assert stale_connection.closed is True
+    assert recovered_connection.closed is True
+
+
+def test_live_market_supervisor_exposes_retrying_status_when_stale_feed_reconnect_fails(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock(datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc))
+    stale_connection = FakeWebsocketConnection(
+        [
+            json.dumps(
+                {"type": "candidate_universe_refresh_batch", "as_of_date": "2024-01-05"}
+            ),
+            json.dumps({"type": "market_context_refresh_batch", "as_of_date": "2024-01-05"}),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+            TimeoutError("idle"),
+        ]
+    )
+    transport = JsonWebsocketTransport(
+        url="wss://example.test/live",
+        connection_factory=FakeConnectionFactory([stale_connection, OSError("offline")]),
+    )
+    supervisor = _build_supervisor(
+        tmp_path,
+        transport=transport,
+        clock=clock,
+        flush_interval_seconds=1,
+        poll_interval_seconds=1.0,
+        stale_after_seconds=5.0,
+        reconnect_backoff=ReconnectBackoffPolicy(
+            initial_delay_seconds=1.0,
+            multiplier=1.0,
+            max_delay_seconds=1.0,
+        ),
+    )
+
+    supervisor.run_once()
+    for _ in range(4):
+        clock.advance(1)
+        supervisor.run_once()
+    clock.advance(1)
+    stale_status = supervisor.run_once()
+
+    assert stale_status.service_state == "retrying"
+    assert stale_status.connected is False
+    assert stale_status.stale is True
+    assert stale_status.last_warning is not None
+    assert stale_status.last_warning.startswith("websocket feed stale:")
+
+    clock.advance(1)
+    failed_reconnect_status = supervisor.run_once()
+
+    assert failed_reconnect_status.service_state == "retrying"
+    assert failed_reconnect_status.connected is False
+    assert failed_reconnect_status.last_error == "offline"
+    assert failed_reconnect_status.last_warning == "websocket connect failed: offline"
 
 
 def test_live_market_supervisor_gracefully_shutdowns_and_flushes_remaining_buffer(

@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -175,6 +176,10 @@ class DailyBarProvider(ABC):
         except URLError as exc:
             raise DataProviderRequestError(
                 f"{self.provider_name} request failed: {exc.reason}"
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise DataProviderRequestError(
+                f"{self.provider_name} request timed out: {exc}"
             ) from exc
 
         try:

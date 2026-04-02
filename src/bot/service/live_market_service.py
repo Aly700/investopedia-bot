@@ -317,7 +317,13 @@ class LiveMarketSupervisor:
                         self.status.last_error = str(exc)
                         self._record_warning(f"cycle result handler failed: {exc}")
 
-        self._refresh_liveness(now)
+        if self._recover_from_stale_connection(now):
+            self._notify_service_state_change(
+                previous_state=previous_service_state,
+                now=now,
+            )
+            self._persist_status(now)
+            return self.status
         self._notify_service_state_change(
             previous_state=previous_service_state,
             now=now,
@@ -387,6 +393,34 @@ class LiveMarketSupervisor:
             return
         self.status.service_state = "connected"
         self.status.stale = False
+
+    def _recover_from_stale_connection(self, now: datetime) -> bool:
+        self._refresh_liveness(now)
+        if self.status.service_state != "stale" or not self.adapter.connected:
+            return False
+        reference_timestamp = (
+            self.status.last_message_at_utc or self.status.last_connected_at_utc
+        )
+        stale_seconds = self.stale_after_seconds
+        if reference_timestamp is not None:
+            reference = datetime.fromisoformat(reference_timestamp)
+            stale_seconds = max((now - reference).total_seconds(), 0.0)
+        warning = (
+            "websocket feed stale: no messages received for "
+            f"{stale_seconds:.1f}s (threshold={self.stale_after_seconds:.1f}s); "
+            "forcing reconnect."
+        )
+        self._record_warning(warning)
+        self.status.last_error = warning
+        try:
+            self.adapter.disconnect()
+        except OSError as exc:
+            self._record_warning(f"websocket disconnect failed: {exc}")
+        self.status.connected = False
+        self.status.stale = True
+        self.status.reconnect_attempt_count += 1
+        self.status.service_state = "retrying"
+        return True
 
     def _sleep_delay_seconds(self) -> float:
         if self.status.service_state == "retrying":
