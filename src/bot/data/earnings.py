@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 import json
 from pathlib import Path
+import socket
 from typing import Any, Mapping, Sequence
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -32,7 +33,8 @@ from bot.data.providers import (
     DataProviderConfigurationError,
     DataProviderError,
     DataProviderRequestError,
-    load_provider_environment,
+    provider_capabilities_for_role,
+    resolve_provider_credentials,
 )
 
 
@@ -122,6 +124,7 @@ class EarningsCalendarProvider(ABC):
     """Abstract interface for upcoming earnings-calendar lookups."""
 
     provider_name: str
+    capabilities = provider_capabilities_for_role("earnings_calendar", "polygon")
 
     def __init__(
         self,
@@ -209,6 +212,10 @@ class EarningsCalendarProvider(ABC):
             raise DataProviderRequestError(
                 f"{self.provider_name} request failed: {exc.reason}"
             ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise DataProviderRequestError(
+                f"{self.provider_name} request timed out: {exc}"
+            ) from exc
 
         try:
             return json.loads(payload)
@@ -222,6 +229,7 @@ class PolygonEarningsCalendarProvider(EarningsCalendarProvider):
     """Polygon TMX corporate-events adapter for upcoming earnings dates."""
 
     provider_name = "polygon"
+    capabilities = provider_capabilities_for_role("earnings_calendar", provider_name)
     base_url = "https://api.polygon.io/tmx/v1/corporate-events"
 
     def _fetch_upcoming_earnings_from_api(
@@ -347,30 +355,21 @@ def create_earnings_calendar_provider(
 ) -> EarningsCalendarProvider:
     """Create the configured earnings-calendar provider."""
 
-    provider_name = config.data_sources.provider.lower()
-    active_provider_config = config.data_sources.active_provider()
-    merged_environment = load_provider_environment(env_file=env_file, environment=environment)
-    api_key = merged_environment.get(active_provider_config.api_key_env, "").strip()
-    if not api_key:
-        raise DataProviderConfigurationError(
-            f"Missing API key for provider '{provider_name}'. "
-            f"Set {active_provider_config.api_key_env} in the shell environment or .env file."
-        )
+    credentials = resolve_provider_credentials(
+        config,
+        role_name="earnings_calendar",
+        env_file=env_file,
+        environment=environment,
+    )
+    provider_name = credentials.provider_name
+    provider_capabilities_for_role("earnings_calendar", provider_name)
 
     resolved_cache_dir = cache_dir or config.project_root / "data" / "cache" / "earnings"
     providers: dict[str, type[EarningsCalendarProvider]] = {
         "polygon": PolygonEarningsCalendarProvider,
     }
-    try:
-        provider_class = providers[provider_name]
-    except KeyError as exc:
-        valid_provider_names = ", ".join(sorted(providers))
-        raise DataProviderConfigurationError(
-            f"Unsupported earnings provider '{provider_name}'. "
-            f"Expected one of: {valid_provider_names}."
-        ) from exc
-
-    return provider_class(api_key=api_key, cache_dir=resolved_cache_dir)
+    provider_class = providers[provider_name]
+    return provider_class(api_key=credentials.api_key, cache_dir=resolved_cache_dir)
 
 
 def build_earnings_risk_contexts(

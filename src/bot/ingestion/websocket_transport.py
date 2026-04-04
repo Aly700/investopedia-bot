@@ -33,6 +33,7 @@ def default_websocket_connection_factory(
     url: str,
     *,
     timeout_seconds: float | None,
+    headers: Mapping[str, str] | None = None,
 ) -> WebsocketConnection:
     """Create a websocket-client connection lazily if the dependency is available."""
 
@@ -42,7 +43,17 @@ def default_websocket_connection_factory(
         raise RuntimeError(
             "websocket-client is required for live websocket transport support."
         ) from exc
-    connection = create_connection(url, timeout=timeout_seconds)
+    websocket_headers = None
+    if headers:
+        websocket_headers = [
+            f"{key}: {value}"
+            for key, value in sorted(headers.items())
+        ]
+    connection = create_connection(
+        url,
+        timeout=timeout_seconds,
+        header=websocket_headers,
+    )
     return connection
 
 
@@ -74,6 +85,8 @@ _POLYGON_EV_TO_INTERNAL_TYPE: dict[str, str] = {
 }
 
 _POLYGON_STATUS_EVENT = "status"
+_ALPACA_CONTROL_MESSAGE_TYPES = frozenset({"error", "success", "subscription"})
+_ALPACA_BAR_MESSAGE_TYPES = frozenset({"b", "d", "u"})
 
 
 def normalize_polygon_websocket_message(
@@ -127,6 +140,102 @@ def normalize_polygon_websocket_message(
     }
 
 
+def normalize_alpaca_stock_websocket_message(
+    message: Mapping[str, Any],
+    *,
+    treat_trades_as_refresh: bool = False,
+) -> dict[str, Any] | None:
+    """Convert one raw Alpaca stock websocket message into the internal event shape."""
+
+    if "type" in message:
+        return dict(message)
+
+    raw_type = message.get("T")
+    if not isinstance(raw_type, str) or not raw_type.strip():
+        return dict(message)
+
+    message_type = raw_type.strip()
+    if message_type in _ALPACA_CONTROL_MESSAGE_TYPES:
+        if message_type == "error":
+            error_code = message.get("code")
+            error_message = message.get("msg")
+            warning = (
+                f"alpaca websocket error {error_code}: {error_message}"
+                if error_code is not None and error_message is not None
+                else f"alpaca websocket error: {error_message or message}"
+            )
+            return {
+                "type": "disconnect",
+                "metadata": {
+                    "warning": warning,
+                    "alpaca_T": message_type,
+                    "status_kind": "error",
+                    "code": error_code,
+                    "msg": error_message,
+                },
+            }
+        if message_type == "success":
+            return {
+                "type": "status",
+                "metadata": {
+                    "alpaca_T": message_type,
+                    "status_kind": "success",
+                    "msg": message.get("msg"),
+                    "note": _alpaca_success_note(message),
+                },
+            }
+        return {
+            "type": "status",
+            "metadata": _alpaca_subscription_status_metadata(message),
+        }
+
+    internal_type: str | None = None
+    if message_type in _ALPACA_BAR_MESSAGE_TYPES:
+        internal_type = "quote_bar_batch_refresh"
+    elif message_type == "t" and treat_trades_as_refresh:
+        internal_type = "quote_bar_batch_refresh"
+    elif message_type in {"q", "t"}:
+        internal_type = "market_context_refresh_batch"
+
+    if internal_type is None:
+        return None
+
+    symbol = message.get("S") or ""
+    symbols = [symbol] if isinstance(symbol, str) and symbol.strip() else []
+    as_of_date = _coerce_iso_date_from_timestamp(message.get("t"))
+    metadata: dict[str, Any] = {"alpaca_T": message_type}
+    for key in (
+        "S",
+        "o",
+        "h",
+        "l",
+        "c",
+        "v",
+        "vw",
+        "n",
+        "p",
+        "s",
+        "x",
+        "ax",
+        "ap",
+        "as",
+        "bx",
+        "bp",
+        "bs",
+        "z",
+        "t",
+    ):
+        if key in message:
+            metadata[key] = message[key]
+
+    return {
+        "type": internal_type,
+        "symbols": symbols,
+        "as_of_date": as_of_date or datetime.now(timezone.utc).date().isoformat(),
+        "metadata": metadata,
+    }
+
+
 @dataclass
 class JsonWebsocketTransport:
     """Concrete websocket transport that parses raw JSON messages."""
@@ -135,6 +244,7 @@ class JsonWebsocketTransport:
     connection_factory: Callable[[str], WebsocketConnection] | None = None
     message_parser: Callable[[str], Sequence[Mapping[str, Any]]] = parse_json_websocket_message
     subscription_messages: Sequence[Mapping[str, Any] | str] = ()
+    connection_headers: Mapping[str, str] | None = None
     receive_timeout_seconds: float = 0.25
     max_messages_per_read: int = 100
     transport_name: str = "json-websocket"
@@ -155,6 +265,7 @@ class JsonWebsocketTransport:
             self.connection_factory = lambda url: default_websocket_connection_factory(
                 url,
                 timeout_seconds=self.receive_timeout_seconds,
+                headers=self.connection_headers,
             )
 
     @property
@@ -256,3 +367,68 @@ def _is_timeout_exception(exc: Exception) -> bool:
     if isinstance(exc, TimeoutError):
         return True
     return exc.__class__.__name__ == "WebSocketTimeoutException"
+
+
+def _coerce_iso_date_from_timestamp(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        return datetime.fromisoformat(normalized).date().isoformat()
+    except ValueError:
+        return None
+
+
+def _alpaca_success_note(message: Mapping[str, Any]) -> str:
+    raw_message = message.get("msg")
+    if isinstance(raw_message, str) and raw_message.strip():
+        cleaned = raw_message.strip()
+        if cleaned.lower() == "connected":
+            return "alpaca websocket connected."
+        if cleaned.lower() == "authenticated":
+            return "alpaca websocket authenticated."
+        return f"alpaca websocket success: {cleaned}"
+    return "alpaca websocket reported a success control frame."
+
+
+def _alpaca_subscription_status_metadata(
+    message: Mapping[str, Any],
+) -> dict[str, Any]:
+    active_channel_counts: dict[str, int] = {}
+    for key, value in message.items():
+        if key == "T" or not isinstance(value, (list, tuple)):
+            continue
+        symbol_count = sum(
+            1
+            for item in value
+            if isinstance(item, str) and item.strip()
+        )
+        if symbol_count > 0:
+            active_channel_counts[key] = symbol_count
+
+    if active_channel_counts:
+        summary = ", ".join(
+            f"{channel}={count}"
+            for channel, count in sorted(active_channel_counts.items())
+        )
+        return {
+            "alpaca_T": "subscription",
+            "status_kind": "subscription",
+            "subscription_acknowledged": True,
+            "subscription_channels": list(sorted(active_channel_counts)),
+            "subscription_symbol_counts": dict(sorted(active_channel_counts.items())),
+            "note": f"alpaca websocket subscription acknowledged: {summary}",
+        }
+
+    warning = "alpaca websocket subscription acknowledgement reported no active channels."
+    return {
+        "alpaca_T": "subscription",
+        "status_kind": "subscription",
+        "subscription_acknowledged": False,
+        "subscription_channels": [],
+        "subscription_symbol_counts": {},
+        "warning": warning,
+        "note": warning,
+    }

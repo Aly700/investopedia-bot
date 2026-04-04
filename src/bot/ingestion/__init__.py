@@ -18,6 +18,7 @@ from .websocket_transport import (
     JsonWebsocketTransport,
     WebsocketConnection,
     default_websocket_connection_factory,
+    normalize_alpaca_stock_websocket_message,
     parse_json_websocket_message,
 )
 
@@ -35,5 +36,6 @@ __all__ = [
     "WebsocketConnection",
     "WebsocketMessageTransport",
     "default_websocket_connection_factory",
+    "normalize_alpaca_stock_websocket_message",
     "parse_json_websocket_message",
 ]

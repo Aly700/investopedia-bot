@@ -12,7 +12,7 @@ import pandas as pd
 
 from bot.config import AppConfig
 from bot.data.providers import DailyBarProvider, DataProviderConfigurationError, DataProviderError
-from bot.data.reference import create_reference_universe_provider
+from bot.data.reference import ReferenceUniverseProvider, create_reference_universe_provider
 from bot.strategy.regime_filter import BenchmarkRegimeSettings, regime_is_bullish
 
 
@@ -260,6 +260,7 @@ def load_symbol_sector_classifications(
     *,
     config: AppConfig,
     env_file: Path | None = None,
+    reference_provider: ReferenceUniverseProvider | None = None,
     as_of_date: date | None = None,
     refresh_cache: bool = False,
 ) -> dict[str, SymbolSectorClassification]:
@@ -272,15 +273,20 @@ def load_symbol_sector_classifications(
     classifications = _load_local_master_universe_classifications(config, normalized_symbols)
     unresolved_symbols = [symbol for symbol in normalized_symbols if symbol not in classifications]
     if unresolved_symbols:
-        try:
-            reference_provider = create_reference_universe_provider(config, env_file=env_file)
-        except DataProviderConfigurationError:
-            reference_provider = None
+        resolved_reference_provider = reference_provider
+        if resolved_reference_provider is None:
+            try:
+                resolved_reference_provider = create_reference_universe_provider(
+                    config,
+                    env_file=env_file,
+                )
+            except DataProviderConfigurationError:
+                resolved_reference_provider = None
 
-        if reference_provider is not None:
+        if resolved_reference_provider is not None:
             for symbol in unresolved_symbols:
                 try:
-                    details = reference_provider.fetch_ticker_details(
+                    details = resolved_reference_provider.fetch_ticker_details(
                         symbol,
                         as_of_date=as_of_date,
                         refresh_cache=refresh_cache,

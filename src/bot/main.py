@@ -9,6 +9,7 @@ from datetime import date
 from datetime import datetime, timezone
 from datetime import timedelta
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -73,6 +74,7 @@ from bot.data.candidate_journal import (
     update_candidate_score_journal,
 )
 from bot.data.earnings import (
+    EarningsCalendarProvider,
     EarningsRiskContext,
     build_earnings_risk_contexts,
     create_earnings_calendar_provider,
@@ -133,13 +135,15 @@ from bot.data.providers import (
     DataProviderConfigurationError,
     DataProviderError,
     create_daily_bar_provider,
+    provider_error_is_entitlement_limited,
+    provider_error_is_timeout,
 )
 from bot.data.volatility_context import (
     build_volatility_regime_context,
     volatility_context_history_start,
 )
-from bot.data.reference import create_reference_universe_provider
-from bot.data.universe import UniverseBuilder, load_candidate_symbols
+from bot.data.reference import ReferenceUniverseProvider, create_reference_data_provider, create_reference_universe_provider
+from bot.data.universe import UniverseBuilder, UniverseMember, load_candidate_symbols
 from bot.data.universe_pipeline import (
     UniverseProfileBuildResult,
     apply_universe_filters,
@@ -174,6 +178,7 @@ from bot.ingestion.market_data import PollingIngestionAdapter
 from bot.ingestion.streaming import LiveUpdateBufferSnapshot, WebsocketIngestionAdapter
 from bot.ingestion.websocket_transport import (
     JsonWebsocketTransport,
+    normalize_alpaca_stock_websocket_message,
     normalize_polygon_websocket_message,
 )
 from bot.indicators.volatility import atr
@@ -243,6 +248,14 @@ from bot.risk.portfolio_rules import (
     upsert_existing_position_snapshot,
 )
 from bot.risk.stops import trailing_stop_reference
+from bot.providers.bundle import (
+    ProviderBundle,
+    build_provider_bundle,
+    configured_provider_role_name as _bundle_configured_provider_role_name,
+    provider_role_metadata_from_config,
+)
+from bot.providers.capabilities import ProviderCapabilities
+import bot.research_assembly as research_assembly_module
 from bot.strategy.breakout_momentum import (
     BreakoutMomentumSettings,
     BreakoutStrategyPreset,
@@ -273,6 +286,10 @@ from bot.service.paper_validation import (
     write_local_paper_validation_smoke_result,
     write_local_paper_validation_summary,
 )
+from bot.workflow_status import (
+    build_workflow_input_metadata,
+    summarize_workflow_input_statuses,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -284,14 +301,462 @@ _TRADE_OUTCOME_SNAPSHOT_METADATA_KEY = "_trade_outcome_snapshot"
 @dataclass
 class _LiveMarketServiceBundle:
     supervisor: LiveMarketSupervisor
+    provider_bundle: ProviderBundle
     latest_outputs: dict[str, str]
     notification_router: NotificationRouter | None
 
 
+_ResearchProviderBundle = ProviderBundle
+
+
 def _configured_provider_name(config: object) -> str | None:
-    data_sources = getattr(config, "data_sources", None)
-    provider_name = getattr(data_sources, "provider", None)
-    return provider_name if isinstance(provider_name, str) and provider_name else None
+    return _bundle_configured_provider_role_name(
+        config,
+        "historical_bars",
+        fallback_to_legacy_provider=True,
+    )
+
+
+def _configured_reference_provider_name(config: object) -> str | None:
+    return _bundle_configured_provider_role_name(
+        config,
+        "reference_data",
+        fallback_to_legacy_provider=True,
+    )
+
+
+def _configured_earnings_provider_name(config: object) -> str | None:
+    return _bundle_configured_provider_role_name(
+        config,
+        "earnings_calendar",
+        fallback_to_legacy_provider=True,
+    )
+
+
+def _configured_stream_provider_name(config: object) -> str | None:
+    return _bundle_configured_provider_role_name(config, "stream_market_data")
+
+
+def _configured_execution_broker_name(config: object) -> str | None:
+    return _bundle_configured_provider_role_name(config, "execution_broker")
+
+
+def _configured_broker_update_stream_provider_name(config: object) -> str | None:
+    return _bundle_configured_provider_role_name(config, "broker_update_stream")
+
+
+def _provider_role_metadata(
+    config: object,
+    *,
+    include_stream: bool = False,
+    include_execution: bool = False,
+    stream_provider: str | None = None,
+    execution_broker: str | None = None,
+    broker_update_stream_provider: str | None = None,
+) -> dict[str, Any]:
+    return provider_role_metadata_from_config(
+        config,
+        include_stream=include_stream,
+        include_execution=include_execution,
+        stream_provider=stream_provider,
+        execution_broker=execution_broker,
+        broker_update_stream_provider=broker_update_stream_provider,
+    )
+
+
+def _provider_bundle_metadata(
+    provider_bundle: object,
+    *,
+    config: object,
+    include_stream: bool = False,
+    include_execution: bool = False,
+    stream_provider: str | None = None,
+    execution_broker: str | None = None,
+    broker_update_stream_provider: str | None = None,
+) -> dict[str, Any]:
+    provider_metadata = getattr(provider_bundle, "provider_metadata", None)
+    if callable(provider_metadata):
+        return provider_metadata(
+            include_stream=include_stream,
+            include_execution=include_execution,
+            stream_provider=stream_provider,
+            execution_broker=execution_broker,
+            broker_update_stream_provider=broker_update_stream_provider,
+        )
+    return _provider_role_metadata(
+        config,
+        include_stream=include_stream,
+        include_execution=include_execution,
+        stream_provider=stream_provider,
+        execution_broker=execution_broker,
+        broker_update_stream_provider=broker_update_stream_provider,
+    )
+
+
+def _configured_provider_role_name(
+    config: object,
+    role_name: str,
+    *,
+    fallback_to_legacy_provider: bool = False,
+) -> str | None:
+    return _bundle_configured_provider_role_name(
+        config,
+        role_name,
+        fallback_to_legacy_provider=fallback_to_legacy_provider,
+    )
+
+
+def _build_research_provider_bundle(
+    config: AppConfig,
+    *,
+    env_file: Path | None,
+) -> _ResearchProviderBundle:
+    return build_provider_bundle(
+        config,
+        env_file=env_file,
+        historical_bars_factory=create_daily_bar_provider,
+        reference_data_factory=create_reference_data_provider,
+        earnings_calendar_factory=create_earnings_calendar_provider,
+    )
+
+
+def _coerce_research_provider_bundle(
+    *,
+    config: AppConfig,
+    provider_bundle: ProviderBundle | None,
+    provider: DailyBarProvider | None,
+    reference_provider: ReferenceUniverseProvider | None,
+    earnings_provider: EarningsCalendarProvider | None,
+) -> ProviderBundle:
+    if provider_bundle is not None:
+        return provider_bundle
+    if provider is None:
+        raise ValueError("daily-summary requires a historical-bars provider.")
+    return ProviderBundle(
+        role_assignments={
+            "stream_market_data": _configured_stream_provider_name(config),
+            "historical_bars": _provider_name_or_fallback(
+                provider,
+                _configured_provider_name(config),
+            ),
+            "reference_data": _provider_name_or_fallback(
+                reference_provider,
+                _configured_reference_provider_name(config),
+            ),
+            "earnings_calendar": _provider_name_or_fallback(
+                earnings_provider,
+                _configured_earnings_provider_name(config),
+            ),
+            "execution_broker": _configured_execution_broker_name(config),
+            "broker_update_stream": _configured_broker_update_stream_provider_name(config),
+        },
+        historical_bars_provider=provider,
+        historical_bars_capabilities=getattr(provider, "capabilities", ProviderCapabilities()),
+        reference_data_provider=reference_provider,
+        reference_data_capabilities=getattr(
+            reference_provider,
+            "capabilities",
+            ProviderCapabilities(),
+        ),
+        earnings_calendar_provider=earnings_provider,
+        earnings_calendar_capabilities=getattr(
+            earnings_provider,
+            "capabilities",
+            ProviderCapabilities(),
+        ),
+        role_statuses={},
+    )
+
+
+def _coerce_daily_summary_provider_bundle(
+    *,
+    config: AppConfig,
+    provider_bundle: ProviderBundle | None,
+    provider: DailyBarProvider | None,
+    reference_provider: ReferenceUniverseProvider | None,
+    earnings_provider: EarningsCalendarProvider | None,
+) -> ProviderBundle:
+    return _coerce_research_provider_bundle(
+        config=config,
+        provider_bundle=provider_bundle,
+        provider=provider,
+        reference_provider=reference_provider,
+        earnings_provider=earnings_provider,
+    )
+
+
+def _provider_name_or_fallback(provider: object | None, fallback: str | None) -> str | None:
+    provider_name = getattr(provider, "provider_name", None)
+    if isinstance(provider_name, str) and provider_name.strip():
+        return provider_name.strip()
+    return fallback
+
+
+def _invoke_workflow_entrypoint(
+    callback: object,
+    args: argparse.Namespace,
+    /,
+    **kwargs: object,
+) -> object:
+    try:
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return cast(Any, callback)(args, **kwargs)
+
+    parameters = signature.parameters
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return cast(Any, callback)(args, **kwargs)
+
+    filtered_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in parameters
+    }
+    return cast(Any, callback)(args, **filtered_kwargs)
+
+
+def _runtime_app_config(runtime: object | None) -> object | None:
+    if runtime is None:
+        return None
+    app_config = getattr(runtime, "app_config", None)
+    if app_config is not None:
+        return app_config
+    nested_runtime = getattr(runtime, "runtime", None)
+    if nested_runtime is None:
+        return None
+    return getattr(nested_runtime, "app_config", None)
+
+
+def _resolved_stream_provider(
+    args: argparse.Namespace,
+    config: object | None = None,
+) -> str | None:
+    configured = _clean_optional_text(getattr(args, "stream_provider", None))
+    if configured is not None and configured.lower() != "auto":
+        return configured.lower()
+    configured_stream_provider = _configured_stream_provider_name(config)
+    if configured_stream_provider is not None:
+        return configured_stream_provider.lower()
+    websocket_url = _clean_optional_text(getattr(args, "websocket_url", None))
+    if websocket_url is None:
+        return None
+    lowered_url = websocket_url.lower()
+    if "alpaca" in lowered_url:
+        return "alpaca"
+    if "polygon" in lowered_url:
+        return "polygon"
+    return None
+
+
+def _stream_runtime_environment(env_file: Path | None) -> dict[str, str]:
+    merged = _read_env_file(env_file)
+    merged.update(dict(os.environ))
+    return merged
+
+
+def _subscription_messages_include_auth_action(
+    subscription_messages: Sequence[Mapping[str, Any] | str],
+) -> bool:
+    for message in subscription_messages:
+        if not isinstance(message, Mapping):
+            continue
+        action = message.get("action")
+        if isinstance(action, str) and action.strip().lower() == "auth":
+            return True
+    return False
+
+
+def _subscription_messages_include_subscribe_action(
+    subscription_messages: Sequence[Mapping[str, Any] | str],
+) -> bool:
+    for message in subscription_messages:
+        if not isinstance(message, Mapping):
+            continue
+        action = message.get("action")
+        if isinstance(action, str) and action.strip().lower() == "subscribe":
+            return True
+    return False
+
+
+def _alpaca_stream_credentials(
+    merged_environment: Mapping[str, str],
+) -> tuple[str | None, str | None]:
+    key_id = (
+        _clean_optional_text(merged_environment.get("ALPACA_API_KEY_ID"))
+        or _clean_optional_text(merged_environment.get("APCA_API_KEY_ID"))
+        or _clean_optional_text(merged_environment.get("ALPACA_BROKER_API_KEY"))
+    )
+    secret = (
+        _clean_optional_text(merged_environment.get("ALPACA_SECRET_KEY"))
+        or _clean_optional_text(merged_environment.get("APCA_API_SECRET_KEY"))
+        or _clean_optional_text(merged_environment.get("ALPACA_BROKER_SECRET_KEY"))
+    )
+    return key_id, secret
+
+
+def _alpaca_stream_uses_test_endpoint(websocket_url: str) -> bool:
+    normalized_url = websocket_url.strip().lower()
+    return normalized_url.endswith("/v2/test")
+
+
+def _alpaca_default_subscription_messages(
+    *,
+    candidate_path: Path,
+    portfolio_file: Path | None,
+    websocket_url: str,
+    test_symbol: str,
+) -> tuple[dict[str, Any], ...]:
+    if _alpaca_stream_uses_test_endpoint(websocket_url):
+        resolved_test_symbol = _clean_optional_text(test_symbol)
+        if resolved_test_symbol is None:
+            raise ValueError("alpaca_test_symbol cannot be empty for the Alpaca test stream.")
+        return (
+            {
+                "action": "subscribe",
+                "trades": [resolved_test_symbol.upper()],
+            },
+        )
+
+    candidate_symbols = load_candidate_symbols(candidate_path)
+    portfolio_symbols: list[str] = []
+    if portfolio_file is not None:
+        portfolio_symbols = [
+            position.symbol.strip().upper()
+            for position in _load_current_positions(portfolio_file)
+            if position.symbol.strip()
+        ]
+    subscribed_symbols = tuple(sorted({*candidate_symbols, *portfolio_symbols}))
+    if not subscribed_symbols:
+        raise ValueError(
+            "Alpaca websocket subscriptions require at least one candidate or portfolio symbol."
+        )
+    return (
+        {
+            "action": "subscribe",
+            "bars": list(subscribed_symbols),
+        },
+    )
+
+
+def _resolved_stream_subscription_messages(
+    args: argparse.Namespace,
+    *,
+    config: object | None = None,
+) -> tuple[Mapping[str, Any] | str, ...]:
+    explicit_messages = tuple(args.subscription_message or ())
+    if explicit_messages:
+        return explicit_messages
+    if _resolved_stream_provider(args, config=config) != "alpaca":
+        return explicit_messages
+    return _alpaca_default_subscription_messages(
+        candidate_path=args.candidate_path,
+        portfolio_file=args.portfolio_file,
+        websocket_url=args.websocket_url,
+        test_symbol=args.alpaca_test_symbol,
+    )
+
+
+def _resolved_stream_connection_headers(
+    args: argparse.Namespace,
+    *,
+    env_file: Path | None,
+    subscription_messages: Sequence[Mapping[str, Any] | str],
+    config: object | None = None,
+) -> Mapping[str, str] | None:
+    if _resolved_stream_provider(args, config=config) != "alpaca":
+        return None
+    if _subscription_messages_include_auth_action(subscription_messages):
+        return None
+    key_id, secret = _alpaca_stream_credentials(_stream_runtime_environment(env_file))
+    if key_id is None or secret is None:
+        raise ValueError(
+            "Alpaca websocket credentials are missing. Set ALPACA_API_KEY_ID and "
+            "ALPACA_SECRET_KEY (or APCA_API_KEY_ID/APCA_API_SECRET_KEY), or pass "
+            "an explicit auth subscription message."
+        )
+    return {
+        "APCA-API-KEY-ID": key_id,
+        "APCA-API-SECRET-KEY": secret,
+    }
+
+
+def _resolved_stream_message_normalizer(
+    args: argparse.Namespace,
+    *,
+    config: object | None = None,
+) -> Callable[[Mapping[str, Any]], dict[str, Any] | None] | None:
+    stream_provider = _resolved_stream_provider(args, config=config)
+    if stream_provider == "polygon":
+        return normalize_polygon_websocket_message
+    if stream_provider == "alpaca":
+        treat_trades_as_refresh = _alpaca_stream_uses_test_endpoint(args.websocket_url)
+        return lambda message: normalize_alpaca_stock_websocket_message(
+            message,
+            treat_trades_as_refresh=treat_trades_as_refresh,
+        )
+    return None
+
+
+def _subscription_message_channels(
+    subscription_messages: Sequence[Mapping[str, Any] | str],
+) -> set[str]:
+    channels: set[str] = set()
+    for message in subscription_messages:
+        if not isinstance(message, Mapping):
+            continue
+        action = message.get("action")
+        if not isinstance(action, str) or action.strip().lower() != "subscribe":
+            continue
+        for key, value in message.items():
+            if key == "action":
+                continue
+            if isinstance(value, (list, tuple)):
+                channels.add(key)
+    return channels
+
+
+def _resolved_stream_stale_after_seconds(
+    args: argparse.Namespace,
+    *,
+    subscription_messages: Sequence[Mapping[str, Any] | str],
+    config: object | None = None,
+) -> float:
+    stale_after_seconds = float(args.stale_after_seconds)
+    if _resolved_stream_provider(args, config=config) != "alpaca":
+        return stale_after_seconds
+    subscribed_channels = _subscription_message_channels(subscription_messages)
+    if subscribed_channels == {"bars"}:
+        return max(stale_after_seconds, 90.0)
+    return stale_after_seconds
+
+
+def _resolved_stream_startup_warnings(
+    args: argparse.Namespace,
+    *,
+    subscription_messages: Sequence[Mapping[str, Any] | str],
+    config: object | None = None,
+) -> tuple[str, ...]:
+    if _resolved_stream_provider(args, config=config) != "alpaca":
+        return ()
+    if _alpaca_stream_uses_test_endpoint(args.websocket_url):
+        return ()
+    subscribed_channels = _subscription_message_channels(subscription_messages)
+    if not subscribed_channels:
+        return (
+            "Alpaca websocket runtime has no subscribe action configured; no live market updates "
+            "will arrive until a subscribe message is sent.",
+        )
+    if "bars" in subscribed_channels:
+        return ()
+    return (
+        "Alpaca monitor-market cycles currently require `bars` subscriptions to drive "
+        "daily-summary, candidate-queue, and portfolio refresh triggers. Quotes-only, "
+        "trades-only, `dailyBars`, and `updatedBars` subscriptions will not refresh "
+        "recommendation state in this runtime.",
+    )
 
 
 def _add_notification_arguments(parser: argparse.ArgumentParser) -> None:
@@ -502,11 +967,22 @@ def _add_live_market_service_arguments(
         help="Websocket endpoint used for live market updates.",
     )
     parser.add_argument(
+        "--stream-provider",
+        choices=("auto", "polygon", "alpaca"),
+        default="auto",
+        help="Optional provider hint used for websocket auth and message normalization.",
+    )
+    parser.add_argument(
         "--subscription-message",
         action="append",
         default=None,
         type=_parse_json_message,
         help="Optional JSON websocket subscription message. Repeat to send multiple subscriptions.",
+    )
+    parser.add_argument(
+        "--alpaca-test-symbol",
+        default="FAKEPACA",
+        help="Test symbol to subscribe to when using Alpaca's always-on v2/test stream.",
     )
     parser.add_argument(
         "--transport-name",
@@ -2106,16 +2582,22 @@ def _handle_show_config(args: argparse.Namespace) -> int:
 def _handle_check_env(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
     validation = validate_environment(config, env_file=args.env_file)
+    role_summary = ", ".join(
+        f"{role}={provider}"
+        for role, provider in sorted(validation.role_assignments.items())
+    )
 
     if validation.is_valid:
         print(
-            f"Provider '{validation.provider}' is ready. "
+            "Configured data-provider roles are ready "
+            f"({role_summary or 'no roles configured'}). "
             f"Found: {', '.join(validation.present) or 'no credentials required'}."
         )
         return 0
 
     print(
-        f"Provider '{validation.provider}' is missing environment variables: "
+        "Configured data-provider roles "
+        f"({role_summary or 'no roles configured'}) are missing environment variables: "
         f"{', '.join(validation.missing)}.",
         file=sys.stderr,
     )
@@ -2139,7 +2621,7 @@ def _handle_fetch_data(args: argparse.Namespace) -> int:
         LOGGER.info("Saved %s rows to %s", len(bars), output_path)
 
     summary = {
-        "provider": config.data_sources.provider,
+        **_provider_role_metadata(config),
         "symbol": args.symbol.upper(),
         "rows": int(len(bars)),
         "start_date": args.start.isoformat(),
@@ -2263,7 +2745,7 @@ def _handle_build_universe(args: argparse.Namespace) -> int:
         )
 
     payload = {
-        "provider": config.data_sources.provider,
+        **_provider_role_metadata(config),
         "as_of_date": args.as_of.isoformat(),
         "lookback_days": lookback_days,
         "master_input": str(args.master_input.resolve()) if args.master_input is not None else None,
@@ -2320,7 +2802,7 @@ def _handle_build_universe_legacy(args: argparse.Namespace) -> int:
         return 0
 
     payload = {
-        "provider": config.data_sources.provider,
+        **_provider_role_metadata(config),
         "as_of_date": args.as_of.isoformat(),
         "lookback_days": resolved_lookback_days,
         "count": len(members),
@@ -2609,6 +3091,7 @@ def _handle_remove_position(args: argparse.Namespace) -> int:
 
 def _handle_review_portfolio(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
+    provider_bundle = _build_research_provider_bundle(config, env_file=args.env_file)
     request = LiveMarketCycleRequest(
         workflow="review-portfolio",
         as_of_date=args.as_of,
@@ -2620,12 +3103,19 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         provider_name=_configured_provider_name(config),
         portfolio_path=str(args.portfolio_file.resolve()),
         load_current_positions=lambda: _load_current_positions(args.portfolio_file),
-        create_provider=lambda: create_daily_bar_provider(config, env_file=args.env_file),
-        run_portfolio_review=lambda provider, current_positions: _run_portfolio_review_workflow(
-            args,
-            config=config,
-            provider=cast(Optional[DailyBarProvider], provider),
-            current_positions=current_positions,
+        create_provider=lambda: provider_bundle.historical_bars_provider,
+        run_portfolio_review=lambda provider, current_positions: cast(
+            PortfolioReviewReport,
+            _invoke_workflow_entrypoint(
+                _run_portfolio_review_workflow,
+                args,
+                config=config,
+                provider_bundle=provider_bundle,
+                provider=cast(Optional[DailyBarProvider], provider),
+                reference_provider=provider_bundle.reference_data_provider,
+                earnings_provider=provider_bundle.earnings_calendar_provider,
+                current_positions=current_positions,
+            ),
         ),
         benchmark_symbol=args.benchmark_symbol,
         refresh_cache=getattr(args, "refresh_cache", False),
@@ -2716,7 +3206,10 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
         "symbols_reviewed": report_payload["reviewed_symbols"],
         "state_change_count": cycle.state_change_count,
         "market_state_baseline_established": state_artifacts.baseline_established,
+        **_provider_bundle_metadata(provider_bundle, config=config),
         **action_counts,
+        "review_input_statuses": report_payload.get("metadata", {}).get("review_input_statuses"),
+        "workflow_input_summary": report_payload.get("metadata", {}).get("workflow_input_summary"),
         "outputs": {
             "portfolio_review_json": str(review_json_path),
             "portfolio_review_csv": str(review_csv_path),
@@ -2736,6 +3229,7 @@ def _handle_review_portfolio(args: argparse.Namespace) -> int:
 
 def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
+    provider_bundle = _build_research_provider_bundle(config, env_file=args.env_file)
     request = LiveMarketCycleRequest(
         workflow="review-portfolio-intraday",
         as_of_date=args.as_of,
@@ -2747,12 +3241,19 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         provider_name=_configured_provider_name(config),
         portfolio_path=str(args.portfolio_file.resolve()),
         load_current_positions=lambda: _load_current_positions(args.portfolio_file),
-        create_provider=lambda: create_daily_bar_provider(config, env_file=args.env_file),
-        run_intraday_review=lambda provider, current_positions: _run_portfolio_review_intraday_workflow(
-            args,
-            config=config,
-            provider=cast(Optional[DailyBarProvider], provider),
-            current_positions=current_positions,
+        create_provider=lambda: provider_bundle.historical_bars_provider,
+        run_intraday_review=lambda provider, current_positions: cast(
+            IntradayPortfolioReviewReport,
+            _invoke_workflow_entrypoint(
+                _run_portfolio_review_intraday_workflow,
+                args,
+                config=config,
+                provider_bundle=provider_bundle,
+                provider=cast(Optional[DailyBarProvider], provider),
+                reference_provider=provider_bundle.reference_data_provider,
+                earnings_provider=provider_bundle.earnings_calendar_provider,
+                current_positions=current_positions,
+            ),
         ),
         benchmark_symbol=args.benchmark_symbol,
         refresh_cache=getattr(args, "refresh_cache", False),
@@ -2847,7 +3348,10 @@ def _handle_review_portfolio_intraday(args: argparse.Namespace) -> int:
         "symbols_reviewed": report_payload["reviewed_symbols"],
         "state_change_count": cycle.state_change_count,
         "market_state_baseline_established": state_artifacts.baseline_established,
+        **_provider_bundle_metadata(provider_bundle, config=config),
         **action_counts,
+        "review_input_statuses": report_payload.get("metadata", {}).get("review_input_statuses"),
+        "workflow_input_summary": report_payload.get("metadata", {}).get("workflow_input_summary"),
         "outputs": {
             "portfolio_review_intraday_json": str(review_json_path),
             "portfolio_review_intraday_csv": str(review_csv_path),
@@ -2877,25 +3381,39 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         daily_summary_required=True,
         portfolio_review_required=False,
     )
+    provider_bundle = _build_research_provider_bundle(config, env_file=args.env_file)
     ingestion = PollingIngestionAdapter(
         provider_name=_configured_provider_name(config),
         portfolio_path=(
             str(args.portfolio_file.resolve()) if args.portfolio_file else None
         ),
         load_current_positions=lambda: _load_current_positions(args.portfolio_file),
-        create_provider=lambda: create_daily_bar_provider(config, env_file=args.env_file),
-        run_daily_summary=lambda provider, current_positions: _run_daily_summary_workflow(
-            args,
-            config=config,
-            provider=cast(DailyBarProvider, provider),
-            current_positions=current_positions,
-        ),
-        run_portfolio_review=(
-            lambda provider, current_positions: _run_portfolio_review_workflow(
+        create_provider=lambda: provider_bundle.historical_bars_provider,
+        run_daily_summary=lambda provider, current_positions: cast(
+            dict[str, object],
+            _invoke_workflow_entrypoint(
+                _run_daily_summary_workflow,
                 args,
                 config=config,
-                provider=cast(Optional[DailyBarProvider], provider),
+                provider=cast(DailyBarProvider, provider),
+                reference_provider=provider_bundle.reference_data_provider,
+                earnings_provider=provider_bundle.earnings_calendar_provider,
                 current_positions=current_positions,
+            ),
+        ),
+        run_portfolio_review=(
+            lambda provider, current_positions: cast(
+                PortfolioReviewReport,
+                _invoke_workflow_entrypoint(
+                    _run_portfolio_review_workflow,
+                    args,
+                    config=config,
+                    provider_bundle=provider_bundle,
+                    provider=cast(Optional[DailyBarProvider], provider),
+                    reference_provider=provider_bundle.reference_data_provider,
+                    earnings_provider=provider_bundle.earnings_calendar_provider,
+                    current_positions=current_positions,
+                ),
             )
             if args.portfolio_file is not None
             else None
@@ -2968,6 +3486,11 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         outputs["candidate_score_journal"] = str(candidate_score_journal_path)
 
     payload = {
+        **_provider_role_metadata(
+            config,
+            include_stream=True,
+            include_execution=True,
+        ),
         "as_of_date": args.as_of.isoformat(),
         "portfolio_file": str(args.portfolio_file.resolve()) if args.portfolio_file else None,
         "preset_names": list(report_payload["preset_names"]),
@@ -3028,10 +3551,20 @@ def _handle_run_live_market_service(args: argparse.Namespace) -> int:
         output_dir=output_dir,
     )
     status = bundle.supervisor.run(max_iterations=args.max_iterations)
+    provider_metadata = _provider_bundle_metadata(
+        bundle.provider_bundle,
+        config=config,
+        include_stream=True,
+        include_execution=True,
+        stream_provider=bundle.supervisor.stream_provider,
+        execution_broker=bundle.supervisor.execution_broker,
+        broker_update_stream_provider=bundle.supervisor.broker_update_stream_provider,
+    )
     payload = {
         "command": "run-live-market-service",
         "as_of_date": args.as_of.isoformat(),
         "websocket_url": args.websocket_url,
+        **provider_metadata,
         "transport_name": args.transport_name,
         "portfolio_file": (
             str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
@@ -3055,7 +3588,37 @@ def _build_live_market_service_bundle(
     if args.include_intraday_review and args.portfolio_file is None:
         raise ValueError("--include-intraday-review requires --portfolio-file.")
 
-    provider = create_daily_bar_provider(config, env_file=env_file)
+    stream_provider = _resolved_stream_provider(args, config=config)
+    execution_broker = _configured_execution_broker_name(config)
+    broker_update_stream_provider = _configured_broker_update_stream_provider_name(config)
+    provider_bundle = _build_research_provider_bundle(config, env_file=env_file)
+    provider_metadata = _provider_bundle_metadata(
+        provider_bundle,
+        config=config,
+        include_stream=True,
+        include_execution=True,
+        stream_provider=stream_provider,
+        execution_broker=execution_broker,
+        broker_update_stream_provider=broker_update_stream_provider,
+    )
+    provider = provider_bundle.historical_bars_provider
+    subscription_messages = _resolved_stream_subscription_messages(args, config=config)
+    connection_headers = _resolved_stream_connection_headers(
+        args,
+        env_file=env_file,
+        subscription_messages=subscription_messages,
+        config=config,
+    )
+    stale_after_seconds = _resolved_stream_stale_after_seconds(
+        args,
+        subscription_messages=subscription_messages,
+        config=config,
+    )
+    startup_warnings = _resolved_stream_startup_warnings(
+        args,
+        subscription_messages=subscription_messages,
+        config=config,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     request = LiveMarketCycleRequest(
         workflow="monitor-market",
@@ -3074,7 +3637,8 @@ def _build_live_market_service_bundle(
     )
     transport = JsonWebsocketTransport(
         url=args.websocket_url,
-        subscription_messages=tuple(args.subscription_message or ()),
+        subscription_messages=subscription_messages,
+        connection_headers=connection_headers,
         receive_timeout_seconds=args.receive_timeout_seconds,
         max_messages_per_read=args.max_messages_per_poll,
         transport_name=args.transport_name,
@@ -3089,7 +3653,10 @@ def _build_live_market_service_bundle(
             config=config,
             current_positions=current_positions,
             snapshot=snapshot,
+            provider_bundle=provider_bundle,
             provider=provider,
+            reference_provider=provider_bundle.reference_data_provider,
+            earnings_provider=provider_bundle.earnings_calendar_provider,
         ),
         run_portfolio_review=(
             lambda snapshot, current_positions: _run_streaming_portfolio_review_workflow(
@@ -3097,7 +3664,10 @@ def _build_live_market_service_bundle(
                 config=config,
                 current_positions=current_positions,
                 snapshot=snapshot,
+                provider_bundle=provider_bundle,
                 provider=provider,
+                reference_provider=provider_bundle.reference_data_provider,
+                earnings_provider=provider_bundle.earnings_calendar_provider,
             )
             if args.portfolio_file is not None
             else None
@@ -3108,18 +3678,17 @@ def _build_live_market_service_bundle(
                 config=config,
                 current_positions=current_positions,
                 snapshot=snapshot,
+                provider_bundle=provider_bundle,
                 provider=provider,
+                reference_provider=provider_bundle.reference_data_provider,
+                earnings_provider=provider_bundle.earnings_calendar_provider,
             )
             if args.portfolio_file is not None and args.include_intraday_review
             else None
         ),
-        provider_name=_configured_provider_name(config),
+        provider_name=stream_provider or transport.transport_name,
         flush_interval_seconds=args.flush_interval_seconds,
-        message_normalizer=(
-            normalize_polygon_websocket_message
-            if "polygon" in args.websocket_url.lower()
-            else None
-        ),
+        message_normalizer=_resolved_stream_message_normalizer(args, config=config),
     )
     latest_outputs: dict[str, str] = {}
     notification_router = _build_notification_router(
@@ -3173,17 +3742,40 @@ def _build_live_market_service_bundle(
             adapter=adapter,
             request=request,
             poll_interval_seconds=args.poll_interval_seconds,
-            stale_after_seconds=args.stale_after_seconds,
+            stale_after_seconds=stale_after_seconds,
             max_messages_per_poll=args.max_messages_per_poll,
             reconnect_backoff=ReconnectBackoffPolicy(
                 initial_delay_seconds=args.initial_reconnect_delay_seconds,
                 multiplier=args.reconnect_backoff_multiplier,
                 max_delay_seconds=args.max_reconnect_delay_seconds,
             ),
+            stream_provider=provider_metadata.get("stream_provider"),
+            historical_provider=provider_metadata.get("historical_provider"),
+            reference_provider=provider_metadata.get("reference_provider"),
+            earnings_provider=provider_metadata.get("earnings_provider"),
+            execution_broker=provider_metadata.get("execution_broker"),
+            broker_update_stream_provider=provider_metadata.get(
+                "broker_update_stream_provider"
+            ),
+            provider_roles=provider_metadata.get("provider_roles", {}),
+            degraded_provider_roles=provider_metadata.get(
+                "degraded_provider_roles",
+                (),
+            ),
+            unavailable_provider_roles=provider_metadata.get(
+                "unavailable_provider_roles",
+                (),
+            ),
+            expect_subscription_ack=(
+                stream_provider == "alpaca"
+                and _subscription_messages_include_subscribe_action(subscription_messages)
+            ),
+            startup_warnings=startup_warnings,
             handle_cycle_result=handle_cycle_result,
             status_store=LiveMarketServiceStatusStore(config.project_root),
             notification_router=notification_router,
         ),
+        provider_bundle=provider_bundle,
         latest_outputs=latest_outputs,
         notification_router=notification_router,
     )
@@ -3246,6 +3838,31 @@ def _handle_run_local_staging_runtime(args: argparse.Namespace) -> int:
 
     bundle = bundle_holder.get("live_market_bundle")
     supervisor_status = runtime.last_supervisor_result
+    runtime_app_config = _runtime_app_config(runtime)
+    provider_metadata = (
+        _provider_bundle_metadata(
+            bundle.provider_bundle,
+            config=runtime_app_config,
+            include_stream=True,
+            include_execution=True,
+            stream_provider=_resolved_stream_provider(args, config=runtime_app_config),
+            execution_broker=_configured_execution_broker_name(runtime_app_config),
+            broker_update_stream_provider=_configured_broker_update_stream_provider_name(
+                runtime_app_config
+            ),
+        )
+        if bundle is not None
+        else _provider_role_metadata(
+            runtime_app_config,
+            include_stream=True,
+            include_execution=True,
+            stream_provider=_resolved_stream_provider(args, config=runtime_app_config),
+            execution_broker=_configured_execution_broker_name(runtime_app_config),
+            broker_update_stream_provider=_configured_broker_update_stream_provider_name(
+                runtime_app_config
+            ),
+        )
+    )
     payload = {
         "command": "run-local-staging-runtime",
         "runtime_root": str(runtime.paths.runtime_root),
@@ -3261,6 +3878,7 @@ def _handle_run_local_staging_runtime(args: argparse.Namespace) -> int:
         "dashboard_url": runtime.dashboard_url,
         "as_of_date": args.as_of.isoformat(),
         "websocket_url": args.websocket_url,
+        **provider_metadata,
         "transport_name": args.transport_name,
         "portfolio_file": (
             str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
@@ -3428,11 +4046,37 @@ def _handle_run_local_paper_validation(args: argparse.Namespace) -> int:
         raise ValueError(str(runtime_failure)) from runtime_failure
     bundle = bundle_holder.get("live_market_bundle")
     supervisor_status = runtime.last_supervisor_result
+    runtime_app_config = _runtime_app_config(runtime)
+    provider_metadata = (
+        _provider_bundle_metadata(
+            bundle.provider_bundle,
+            config=runtime_app_config,
+            include_stream=True,
+            include_execution=True,
+            stream_provider=_resolved_stream_provider(args, config=runtime_app_config),
+            execution_broker=_configured_execution_broker_name(runtime_app_config),
+            broker_update_stream_provider=_configured_broker_update_stream_provider_name(
+                runtime_app_config
+            ),
+        )
+        if bundle is not None
+        else _provider_role_metadata(
+            runtime_app_config,
+            include_stream=True,
+            include_execution=True,
+            stream_provider=_resolved_stream_provider(args, config=runtime_app_config),
+            execution_broker=_configured_execution_broker_name(runtime_app_config),
+            broker_update_stream_provider=_configured_broker_update_stream_provider_name(
+                runtime_app_config
+            ),
+        )
+    )
     payload = {
         "command": "run-local-paper-validation",
         "validation_profile": profile.to_dict(),
         "as_of_date": args.as_of.isoformat(),
         "websocket_url": args.websocket_url,
+        **provider_metadata,
         "transport_name": args.transport_name,
         "portfolio_file": (
             str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
@@ -3551,6 +4195,11 @@ def _handle_run_local_paper_validation_smoke(args: argparse.Namespace) -> int:
     smoke_result = build_local_paper_validation_smoke_result(
         profile,
         as_of_date=args.as_of,
+        websocket_url=args.websocket_url,
+        stream_provider=_resolved_stream_provider(
+            args,
+            config=_runtime_app_config(runtime),
+        ),
         max_iterations=args.max_iterations,
         summary=summary,
         review_paths=review_paths,
@@ -3569,11 +4218,37 @@ def _handle_run_local_paper_validation_smoke(args: argparse.Namespace) -> int:
     )
     bundle = bundle_holder.get("live_market_bundle")
     supervisor_status = runtime.last_supervisor_result if runtime is not None else None
+    runtime_app_config = _runtime_app_config(runtime)
+    provider_metadata = (
+        _provider_bundle_metadata(
+            bundle.provider_bundle,
+            config=runtime_app_config,
+            include_stream=True,
+            include_execution=True,
+            stream_provider=_resolved_stream_provider(args, config=runtime_app_config),
+            execution_broker=_configured_execution_broker_name(runtime_app_config),
+            broker_update_stream_provider=_configured_broker_update_stream_provider_name(
+                runtime_app_config
+            ),
+        )
+        if bundle is not None
+        else _provider_role_metadata(
+            runtime_app_config,
+            include_stream=True,
+            include_execution=True,
+            stream_provider=_resolved_stream_provider(args, config=runtime_app_config),
+            execution_broker=_configured_execution_broker_name(runtime_app_config),
+            broker_update_stream_provider=_configured_broker_update_stream_provider_name(
+                runtime_app_config
+            ),
+        )
+    )
     payload = {
         "command": "run-local-paper-validation-smoke",
         "validation_profile": profile.to_dict(),
         "as_of_date": args.as_of.isoformat(),
         "websocket_url": args.websocket_url,
+        **provider_metadata,
         "transport_name": args.transport_name,
         "portfolio_file": (
             str(args.portfolio_file.resolve()) if args.portfolio_file is not None else None
@@ -3863,6 +4538,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
     earnings_contexts = _load_earnings_contexts(
         config=config,
         env_file=getattr(args, "env_file", None),
+        provider=None,
         symbols=[member.symbol for member in universe_members],
         as_of_date=args.as_of,
         earnings_watch_days=config.strategy.signals.earnings_watch_days,
@@ -3931,6 +4607,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         config=config,
         env_file=getattr(args, "env_file", None),
         provider=provider,
+        reference_provider=None,
         symbol_frames=symbol_frames,
         as_of_date=args.as_of,
         history_start=sector_history_start,
@@ -3944,6 +4621,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         current_positions,
         config=config,
         env_file=getattr(args, "env_file", None),
+        reference_provider=None,
         as_of_date=args.as_of,
         refresh_cache=args.refresh_cache,
         log_label="generate-orders",
@@ -4156,7 +4834,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
     )
 
     payload = {
-        "provider": config.data_sources.provider,
+        **_provider_role_metadata(config),
         "as_of_date": args.as_of.isoformat(),
         "equity": current_equity,
         "current_drawdown": float(args.current_drawdown),
@@ -4718,7 +5396,7 @@ def _handle_walkforward(args: argparse.Namespace) -> int:
     outputs = write_walkforward_reports(result, output_dir)
 
     payload = {
-        "provider": config.data_sources.provider,
+        **_provider_role_metadata(config),
         "start_date": args.start.isoformat(),
         "end_date": args.end.isoformat(),
         "train_days": args.train_days,
@@ -4851,7 +5529,7 @@ def _handle_compare_strategies(args: argparse.Namespace) -> int:
     )
 
     payload = {
-        "provider": config.data_sources.provider,
+        **_provider_role_metadata(config),
         "start_date": args.start.isoformat(),
         "end_date": args.end.isoformat(),
         "objective": args.objective,
@@ -4868,13 +5546,20 @@ def _handle_compare_strategies(args: argparse.Namespace) -> int:
 
 def _handle_daily_summary(args: argparse.Namespace) -> int:
     config = load_app_config(config_dir=args.config_dir)
-    provider = create_daily_bar_provider(config, env_file=args.env_file)
+    provider_bundle = _build_research_provider_bundle(config, env_file=args.env_file)
     current_positions = _load_current_positions(args.portfolio_file)
-    workflow = _run_daily_summary_workflow(
-        args,
-        config=config,
-        provider=provider,
-        current_positions=current_positions,
+    workflow = cast(
+        dict[str, object],
+        _invoke_workflow_entrypoint(
+            _run_daily_summary_workflow,
+            args,
+            config=config,
+            provider_bundle=provider_bundle,
+            provider=provider_bundle.historical_bars_provider,
+            reference_provider=provider_bundle.reference_data_provider,
+            earnings_provider=provider_bundle.earnings_calendar_provider,
+            current_positions=current_positions,
+        ),
     )
     summary = workflow["summary"]
     presets = workflow["presets"]
@@ -4884,6 +5569,13 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
     execution_batch = workflow["execution_batch"]
     ranked_evaluations = workflow["ranked_evaluations"]
     summary_payload = summary.to_dict()
+    summary_metadata = summary_payload.get("metadata", {})
+    research_input_statuses = workflow.get("research_input_statuses")
+    if research_input_statuses is None and isinstance(summary_metadata, Mapping):
+        research_input_statuses = summary_metadata.get("research_input_statuses")
+    workflow_input_summary = workflow.get("workflow_input_summary")
+    if workflow_input_summary is None and isinstance(summary_metadata, Mapping):
+        workflow_input_summary = summary_metadata.get("workflow_input_summary")
     candidate_score_journal_path = workflow.get("candidate_score_journal_path")
     trade_feedback_log_path = _append_trade_feedback_events_safe(
         project_root=config.project_root,
@@ -4946,7 +5638,11 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         outputs["trade_feedback_log"] = str(trade_feedback_log_path)
 
     payload = {
-        "provider": config.data_sources.provider,
+        **_provider_role_metadata(
+            config,
+            include_stream=True,
+            include_execution=True,
+        ),
         "as_of_date": args.as_of.isoformat(),
         "preset_names": [preset.name for preset in presets],
         "preset_selection_source": preset_selection_source,
@@ -4957,6 +5653,8 @@ def _handle_daily_summary(args: argparse.Namespace) -> int:
         "relative_volume_policy": summary.relative_volume_policy,
         "relative_volume_policy_by_preset": summary.relative_volume_policy_by_preset,
         "recommended_preset": summary.recommended_preset,
+        "research_input_statuses": research_input_statuses,
+        "workflow_input_summary": workflow_input_summary,
         "market_breadth_pct_above_200ma": (
             summary.market_context.market_breadth_pct_above_200ma
             if summary.market_context is not None
@@ -6115,11 +6813,269 @@ def _benchmark_symbol_override(raw_value: object) -> str | None:
     return raw_value.strip().upper()
 
 
+def _load_earnings_contexts_result(
+    *,
+    config: AppConfig,
+    env_file: Path | None,
+    provider: EarningsCalendarProvider | None,
+    symbols: Sequence[str],
+    as_of_date: date,
+    earnings_watch_days: int,
+    refresh_cache: bool,
+    log_label: str,
+) -> research_assembly_module.ResearchDataResult[dict[str, EarningsRiskContext]]:
+    return research_assembly_module.load_earnings_contexts_result(
+        config=config,
+        env_file=env_file,
+        provider=provider,
+        symbols=symbols,
+        as_of_date=as_of_date,
+        earnings_watch_days=earnings_watch_days,
+        refresh_cache=refresh_cache,
+        log_label=log_label,
+    )
+
+
+def _load_position_sector_classifications_result(
+    current_positions: Sequence[ExistingPosition],
+    *,
+    config: AppConfig,
+    env_file: Path | None,
+    reference_provider: ReferenceUniverseProvider | None,
+    as_of_date: date,
+    refresh_cache: bool,
+    log_label: str,
+) -> research_assembly_module.ResearchDataResult[dict[str, SymbolSectorClassification]]:
+    return research_assembly_module.load_position_sector_classifications_result(
+        current_positions,
+        config=config,
+        env_file=env_file,
+        reference_provider=reference_provider,
+        as_of_date=as_of_date,
+        refresh_cache=refresh_cache,
+        log_label=log_label,
+    )
+
+
+def _load_sector_contexts_result(
+    *,
+    config: AppConfig,
+    env_file: Path | None,
+    provider: DailyBarProvider,
+    reference_provider: ReferenceUniverseProvider | None,
+    symbol_frames: Mapping[str, pd.DataFrame],
+    as_of_date: date,
+    history_start: date,
+    benchmark_sma_fast: int,
+    benchmark_sma_slow: int,
+    relative_strength_window: int,
+    refresh_cache: bool,
+    log_label: str,
+) -> research_assembly_module.ResearchDataResult[dict[str, SectorFeatureContext]]:
+    return research_assembly_module.load_sector_contexts_result(
+        config=config,
+        env_file=env_file,
+        provider=provider,
+        reference_provider=reference_provider,
+        symbol_frames=symbol_frames,
+        as_of_date=as_of_date,
+        history_start=history_start,
+        benchmark_sma_fast=benchmark_sma_fast,
+        benchmark_sma_slow=benchmark_sma_slow,
+        relative_strength_window=relative_strength_window,
+        refresh_cache=refresh_cache,
+        log_label=log_label,
+    )
+
+
+def _load_volatility_context_result(
+    *,
+    provider: DailyBarProvider,
+    as_of_date: date,
+    vix_caution_threshold: float | None,
+    vix_entry_block_threshold: float | None,
+    refresh_cache: bool,
+    log_label: str,
+) -> research_assembly_module.ResearchDataResult[dict[str, float | str | bool | None]]:
+    return research_assembly_module.load_volatility_context_result(
+        provider=provider,
+        as_of_date=as_of_date,
+        vix_caution_threshold=vix_caution_threshold,
+        vix_entry_block_threshold=vix_entry_block_threshold,
+        refresh_cache=refresh_cache,
+        log_label=log_label,
+    )
+
+
+def _load_daily_summary_benchmark_frame_result(
+    *,
+    args: argparse.Namespace,
+    config: AppConfig,
+    provider: DailyBarProvider,
+    symbol_frames: Mapping[str, pd.DataFrame],
+    fetch_start: date,
+    universe_members: Sequence[UniverseMember],
+    log_label: str = "daily-summary",
+) -> research_assembly_module.ResearchDataResult[research_assembly_module.BenchmarkFrameData]:
+    return research_assembly_module.load_daily_summary_benchmark_frame_result(
+        args=args,
+        config=config,
+        provider=provider,
+        symbol_frames=symbol_frames,
+        fetch_start=fetch_start,
+        universe_members=universe_members,
+        log_label=log_label,
+    )
+
+
+def _load_review_position_daily_symbol_frames_result(
+    current_positions: Sequence[ExistingPosition],
+    *,
+    provider: DailyBarProvider,
+    history_start: date,
+    as_of_date: date,
+    refresh_cache: bool,
+    log_label: str,
+) -> research_assembly_module.ResearchDataResult[
+    research_assembly_module.ReviewPositionDailyFramesData
+]:
+    return research_assembly_module.load_position_daily_symbol_frames_result(
+        current_positions,
+        provider=provider,
+        history_start=history_start,
+        as_of_date=as_of_date,
+        refresh_cache=refresh_cache,
+        log_label=log_label,
+    )
+
+
+def _load_portfolio_review_benchmark_frame_result(
+    *,
+    provider: DailyBarProvider,
+    benchmark_symbol: str | None,
+    fetch_start: date,
+    as_of_date: date,
+    refresh_cache: bool,
+    log_label: str,
+) -> research_assembly_module.ResearchDataResult[research_assembly_module.BenchmarkFrameData]:
+    return research_assembly_module.load_review_benchmark_frame_result(
+        provider=provider,
+        benchmark_symbol=benchmark_symbol,
+        fetch_start=fetch_start,
+        as_of_date=as_of_date,
+        refresh_cache=refresh_cache,
+        log_label=log_label,
+    )
+
+
+def _load_intraday_review_benchmark_metrics_result(
+    *,
+    provider: DailyBarProvider,
+    benchmark_symbol: str | None,
+    as_of_date: date,
+    interval_minutes: int,
+    refresh_cache: bool,
+    log_label: str,
+    metrics_builder: Callable[[pd.DataFrame], Mapping[str, float | str | None]] | None = None,
+) -> research_assembly_module.ResearchDataResult[
+    research_assembly_module.IntradayBenchmarkMetricsData
+]:
+    return research_assembly_module.load_intraday_benchmark_metrics_result(
+        provider=provider,
+        benchmark_symbol=benchmark_symbol,
+        as_of_date=as_of_date,
+        interval_minutes=interval_minutes,
+        refresh_cache=refresh_cache,
+        log_label=log_label,
+        metrics_builder=metrics_builder or _intraday_session_metrics,
+    )
+
+
+def _assemble_daily_summary_research_inputs(
+    *,
+    args: argparse.Namespace,
+    config: AppConfig,
+    provider_bundle: ProviderBundle,
+    current_positions: Sequence[ExistingPosition],
+    fetch_start: date,
+    log_label: str = "daily-summary",
+) -> research_assembly_module.DailySummaryResearchInputs:
+    assembler = research_assembly_module.DailySummaryResearchAssembler(
+        config=config,
+        provider_bundle=provider_bundle,
+        benchmark_loader=_load_daily_summary_benchmark_frame_result,
+        earnings_loader=_load_earnings_contexts_result,
+        position_classification_loader=_load_position_sector_classifications_result,
+        sector_context_loader=_load_sector_contexts_result,
+        volatility_loader=_load_volatility_context_result,
+    )
+    return assembler.assemble(
+        args=args,
+        current_positions=current_positions,
+        fetch_start=fetch_start,
+        log_label=log_label,
+    )
+
+
+def _assemble_portfolio_review_research_inputs(
+    *,
+    args: argparse.Namespace,
+    config: AppConfig,
+    provider_bundle: ProviderBundle,
+    current_positions: Sequence[ExistingPosition],
+    position_plans: Sequence[Mapping[str, object]],
+    log_label: str = "review-portfolio",
+) -> research_assembly_module.PortfolioReviewResearchInputs:
+    assembler = research_assembly_module.PortfolioReviewResearchAssembler(
+        config=config,
+        provider_bundle=provider_bundle,
+        benchmark_loader=_load_portfolio_review_benchmark_frame_result,
+        earnings_loader=_load_earnings_contexts_result,
+        position_daily_frames_loader=_load_review_position_daily_symbol_frames_result,
+        sector_context_loader=_load_sector_contexts_result,
+    )
+    return assembler.assemble(
+        args=args,
+        current_positions=current_positions,
+        position_plans=position_plans,
+        log_label=log_label,
+    )
+
+
+def _assemble_intraday_review_research_inputs(
+    *,
+    args: argparse.Namespace,
+    config: AppConfig,
+    provider_bundle: ProviderBundle,
+    current_positions: Sequence[ExistingPosition],
+    benchmark_symbol: str | None,
+    log_label: str = "review-portfolio-intraday",
+) -> research_assembly_module.IntradayReviewResearchInputs:
+    assembler = research_assembly_module.IntradayReviewResearchAssembler(
+        config=config,
+        provider_bundle=provider_bundle,
+        benchmark_loader=_load_intraday_review_benchmark_metrics_result,
+        earnings_loader=_load_earnings_contexts_result,
+        position_daily_frames_loader=_load_review_position_daily_symbol_frames_result,
+        sector_context_loader=_load_sector_contexts_result,
+        intraday_metrics_builder=_intraday_session_metrics,
+    )
+    return assembler.assemble(
+        args=args,
+        current_positions=current_positions,
+        benchmark_symbol=benchmark_symbol,
+        log_label=log_label,
+    )
+
+
 def _run_daily_summary_workflow(
     args: argparse.Namespace,
     *,
     config: AppConfig,
     provider: DailyBarProvider,
+    provider_bundle: ProviderBundle | None = None,
+    reference_provider: ReferenceUniverseProvider | None = None,
+    earnings_provider: EarningsCalendarProvider | None = None,
     current_positions: list[ExistingPosition] | None = None,
 ) -> dict[str, object]:
     presets, preset_selection_source = _resolve_daily_summary_presets(args, config)
@@ -6142,15 +7098,6 @@ def _run_daily_summary_workflow(
     if args.current_drawdown < 0:
         raise ValueError("current_drawdown must be non-negative.")
 
-    builder = UniverseBuilder(provider, config.strategy.universe)
-    universe_members = builder.screen_candidates(
-        args.candidate_path,
-        as_of_date=args.as_of,
-        lookback_days=args.lookback_days,
-        refresh_cache=args.refresh_cache,
-        enforce_max_symbols=False,
-    )
-
     fetch_start = _comparison_warmup_start(
         start_date=args.as_of,
         atr_window=config.strategy.risk.atr_length,
@@ -6172,45 +7119,47 @@ def _run_daily_summary_workflow(
         ),
         enable_regime_filter=not args.disable_regime_filter,
     )
-
-    symbol_frames: dict[str, pd.DataFrame] = {}
-    for member in universe_members:
-        try:
-            bars = provider.fetch_daily_bars(
-                member.symbol,
-                fetch_start,
-                args.as_of,
-                refresh_cache=args.refresh_cache,
-            )
-        except DataProviderError as exc:
-            LOGGER.warning("Skipping %s due to provider error: %s", member.symbol, exc)
-            continue
-        if bars.empty:
-            LOGGER.warning(
-                "Skipping %s because no bars were returned in the requested range.",
-                member.symbol,
-            )
-            continue
-        symbol_frames[member.symbol] = bars
-
-    benchmark_frame = None
-    benchmark_symbol = None
+    resolved_provider_bundle = _coerce_daily_summary_provider_bundle(
+        config=config,
+        provider_bundle=provider_bundle,
+        provider=provider,
+        reference_provider=reference_provider,
+        earnings_provider=earnings_provider,
+    )
+    research_inputs = _assemble_daily_summary_research_inputs(
+        args=args,
+        config=config,
+        provider_bundle=resolved_provider_bundle,
+        current_positions=resolved_current_positions,
+        fetch_start=fetch_start,
+        log_label="daily-summary",
+    )
+    candidate_data = (
+        research_inputs.candidate_data.value
+        if research_inputs.candidate_data.value is not None
+        else research_assembly_module.CandidateUniverseData(
+            fetch_start=fetch_start,
+            universe_members=(),
+            symbol_frames={},
+            skipped_symbols=(),
+        )
+    )
+    universe_members = list(candidate_data.universe_members)
+    symbol_frames = dict(candidate_data.symbol_frames)
     benchmark_override = _benchmark_symbol_override(args.benchmark_symbol)
-    if not args.disable_regime_filter and universe_members:
-        benchmark_symbol = benchmark_override or config.strategy.signals.benchmark_symbol
-        if benchmark_symbol in symbol_frames:
-            benchmark_frame = symbol_frames[benchmark_symbol]
-        else:
-            benchmark_frame = provider.fetch_daily_bars(
-                benchmark_symbol,
-                fetch_start,
-                args.as_of,
-                refresh_cache=args.refresh_cache,
-            )
-        if benchmark_frame.empty:
-            raise ValueError(
-                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
-            )
+    benchmark_symbol = (
+        research_inputs.benchmark.value.symbol
+        if research_inputs.benchmark.value is not None
+        else None
+    )
+    benchmark_frame = (
+        research_inputs.benchmark.value.frame
+        if research_inputs.benchmark.value is not None
+        else None
+    )
+    benchmark_context_available = (
+        benchmark_frame is not None and not benchmark_frame.empty
+    )
 
     constraints = PortfolioConstraints.from_configs(
         config.strategy.risk,
@@ -6229,23 +7178,8 @@ def _run_daily_summary_workflow(
         preset.name: []
         for preset in presets
     }
-    earnings_contexts = _load_earnings_contexts(
-        config=config,
-        env_file=getattr(args, "env_file", None),
-        symbols=[member.symbol for member in universe_members],
-        as_of_date=args.as_of,
-        earnings_watch_days=config.strategy.signals.earnings_watch_days,
-        refresh_cache=args.refresh_cache,
-        log_label="daily-summary",
-    )
-    current_position_classifications = _load_position_sector_classifications(
-        resolved_current_positions,
-        config=config,
-        env_file=getattr(args, "env_file", None),
-        as_of_date=args.as_of,
-        refresh_cache=args.refresh_cache,
-        log_label="daily-summary",
-    )
+    earnings_contexts = research_inputs.earnings_contexts.value or {}
+    current_position_classifications = research_inputs.position_classifications.value or {}
     portfolio_holding_exposures = _build_portfolio_holding_exposures(
         resolved_current_positions,
         current_position_classifications,
@@ -6256,23 +7190,7 @@ def _run_daily_summary_workflow(
             current_positions=resolved_current_positions,
         )
     )
-    sector_contexts = _load_sector_contexts(
-        config=config,
-        env_file=getattr(args, "env_file", None),
-        provider=provider,
-        symbol_frames=symbol_frames,
-        as_of_date=args.as_of,
-        history_start=sector_context_history_start(
-            args.as_of,
-            benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
-            relative_strength_window=config.strategy.signals.sector_relative_strength_window,
-        ),
-        benchmark_sma_fast=config.strategy.signals.benchmark_sma_fast,
-        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
-        relative_strength_window=config.strategy.signals.sector_relative_strength_window,
-        refresh_cache=args.refresh_cache,
-        log_label="daily-summary",
-    )
+    sector_contexts = research_inputs.sector_contexts.value or {}
     breadth_metrics = _compute_entry_market_breadth(
         symbol_frames,
         as_of_date=args.as_of,
@@ -6291,16 +7209,7 @@ def _run_daily_summary_workflow(
             breadth_metrics["market_breadth_pct_above_50ma"]
         ),
         market_breadth_state=breadth_metrics["market_breadth_state"],
-        **_load_volatility_context(
-            provider=provider,
-            as_of_date=args.as_of,
-            vix_caution_threshold=config.strategy.signals.vix_caution_threshold,
-            vix_entry_block_threshold=(
-                config.strategy.signals.vix_entry_block_threshold
-            ),
-            refresh_cache=args.refresh_cache,
-            log_label="daily-summary",
-        ),
+        **(research_inputs.volatility_context.value or {}),
     )
     candidate_score_journal_store = CandidateScoreJournalStore(config.project_root)
     candidate_score_journal = candidate_score_journal_store.load()
@@ -6322,6 +7231,11 @@ def _run_daily_summary_workflow(
             strategy_settings = replace(
                 strategy_settings,
                 benchmark_symbol=benchmark_override,
+            )
+        if strategy_settings.enable_regime_filter and not benchmark_context_available:
+            strategy_settings = replace(
+                strategy_settings,
+                enable_regime_filter=False,
             )
         market_context = build_market_context(
             as_of_date=args.as_of,
@@ -6523,6 +7437,10 @@ def _run_daily_summary_workflow(
         [evaluation.candidate for evaluation in ranked_evaluations],
         as_of_date=args.as_of,
     )
+    research_input_statuses = research_inputs.result_metadata()
+    workflow_input_summary = summarize_workflow_input_statuses(
+        research_input_statuses
+    ).to_dict()
     summary = build_daily_research_summary(
         as_of_date=args.as_of,
         execution_batch=execution_batch,
@@ -6537,6 +7455,10 @@ def _run_daily_summary_workflow(
         preset_selection_source=preset_selection_source,
         force_require_relative_volume_confirmation=bool(args.require_relative_volume),
         pending_order_summary=pending_order_reservation_state.to_dict(),
+        metadata=build_workflow_input_metadata(
+            "research_input_statuses",
+            research_input_statuses,
+        ),
     )
     return {
         "summary": summary,
@@ -6548,6 +7470,9 @@ def _run_daily_summary_workflow(
         "current_equity": current_equity,
         "pending_order_summary": pending_order_reservation_state.to_dict(),
         "candidate_score_journal_path": journal_path,
+        "research_inputs": research_inputs,
+        "research_input_statuses": research_input_statuses,
+        "workflow_input_summary": workflow_input_summary,
     }
 
 
@@ -6686,7 +7611,10 @@ def _run_portfolio_review_intraday_workflow(
     args: argparse.Namespace,
     *,
     config: AppConfig,
+    provider_bundle: ProviderBundle | None = None,
     provider: DailyBarProvider | None,
+    reference_provider: ReferenceUniverseProvider | None = None,
+    earnings_provider: EarningsCalendarProvider | None = None,
     current_positions: list[ExistingPosition] | None = None,
 ) -> IntradayPortfolioReviewReport:
     resolved_current_positions = (
@@ -6732,64 +7660,36 @@ def _run_portfolio_review_intraday_workflow(
     ]
 
     benchmark_symbol = base_settings.benchmark_symbol
-    benchmark_intraday_metrics: Mapping[str, float | str | None] | None = None
-    if benchmark_symbol:
-        benchmark_frame = provider.fetch_intraday_bars(
-            benchmark_symbol,
-            args.as_of,
-            interval_minutes=args.interval_minutes,
-            refresh_cache=True,
-        )
-        if not benchmark_frame.empty:
-            benchmark_intraday_metrics = _intraday_session_metrics(benchmark_frame)
-
-    earnings_contexts = _load_earnings_contexts(
+    resolved_provider_bundle = _coerce_research_provider_bundle(
         config=config,
-        env_file=getattr(args, "env_file", None),
-        symbols=[position.symbol for position in resolved_current_positions],
-        as_of_date=args.as_of,
-        earnings_watch_days=config.strategy.signals.earnings_watch_days,
-        refresh_cache=False,
+        provider_bundle=provider_bundle,
+        provider=provider,
+        reference_provider=reference_provider,
+        earnings_provider=earnings_provider,
+    )
+    research_inputs = _assemble_intraday_review_research_inputs(
+        args=args,
+        config=config,
+        provider_bundle=resolved_provider_bundle,
+        current_positions=resolved_current_positions,
+        benchmark_symbol=benchmark_symbol,
         log_label="review-portfolio-intraday",
     )
-    intraday_sector_history_start = sector_context_history_start(
-        args.as_of,
-        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
-        relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+    benchmark_intraday_metrics = (
+        research_inputs.benchmark_intraday_metrics.value.metrics
+        if research_inputs.benchmark_intraday_metrics.value is not None
+        else None
     )
-    sector_contexts: dict[str, SectorFeatureContext] = {}
-    if hasattr(provider, "fetch_daily_bars"):
-        intraday_sector_symbol_frames: dict[str, pd.DataFrame] = {}
-        for position in resolved_current_positions:
-            try:
-                bars = provider.fetch_daily_bars(
-                    position.symbol,
-                    intraday_sector_history_start,
-                    args.as_of,
-                    refresh_cache=False,
-                )
-            except DataProviderError as exc:
-                LOGGER.warning(
-                    "Skipping sector context for held symbol %s due to provider error: %s",
-                    position.symbol,
-                    exc,
-                )
-                continue
-            if not bars.empty:
-                intraday_sector_symbol_frames[position.symbol] = bars
-        sector_contexts = _load_sector_contexts(
-            config=config,
-            env_file=getattr(args, "env_file", None),
-            provider=provider,
-            symbol_frames=intraday_sector_symbol_frames,
-            as_of_date=args.as_of,
-            history_start=intraday_sector_history_start,
-            benchmark_sma_fast=config.strategy.signals.benchmark_sma_fast,
-            benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
-            relative_strength_window=config.strategy.signals.sector_relative_strength_window,
-            refresh_cache=False,
-            log_label="review-portfolio-intraday",
+    if (
+        benchmark_symbol is not None
+        and research_inputs.benchmark_intraday_metrics.status == "failed"
+    ):
+        raise ValueError(
+            research_inputs.benchmark_intraday_metrics.message
+            or f"Intraday benchmark context is unavailable for regime symbol '{benchmark_symbol}'."
         )
+    earnings_contexts = research_inputs.earnings_contexts.value or {}
+    sector_contexts = research_inputs.sector_contexts.value or {}
 
     rows: list[PortfolioReviewRow] = []
     intraday_observations: dict[str, IntradayStateObservation] = {}
@@ -6833,6 +7733,10 @@ def _run_portfolio_review_intraday_workflow(
         rows=rows,
         current_positions=resolved_current_positions,
         benchmark_symbol=benchmark_symbol,
+        metadata=build_workflow_input_metadata(
+            "review_input_statuses",
+            research_inputs.result_metadata(),
+        ),
     )
 
 
@@ -7262,7 +8166,10 @@ def _run_portfolio_review_workflow(
     args: argparse.Namespace,
     *,
     config: AppConfig,
+    provider_bundle: ProviderBundle | None = None,
     provider: DailyBarProvider | None,
+    reference_provider: ReferenceUniverseProvider | None = None,
+    earnings_provider: EarningsCalendarProvider | None = None,
     current_positions: list[ExistingPosition] | None = None,
 ) -> PortfolioReviewReport:
     resolved_current_positions = (
@@ -7307,72 +8214,42 @@ def _run_portfolio_review_workflow(
         for position in resolved_current_positions
     ]
 
-    benchmark_symbol = (
-        base_settings.benchmark_symbol
-        if any(plan["settings"].enable_regime_filter for plan in position_plans)
-        else None
-    )
-    benchmark_frame = None
-    if benchmark_symbol is not None:
-        earliest_fetch_start = min(plan["fetch_start"] for plan in position_plans)
-        benchmark_frame = provider.fetch_daily_bars(
-            benchmark_symbol,
-            earliest_fetch_start,
-            args.as_of,
-            refresh_cache=args.refresh_cache,
-        )
-        if benchmark_frame.empty:
-            raise ValueError(
-                f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
-            )
-
-    earnings_contexts = _load_earnings_contexts(
+    resolved_provider_bundle = _coerce_research_provider_bundle(
         config=config,
-        env_file=getattr(args, "env_file", None),
-        symbols=[position.symbol for position in resolved_current_positions],
-        as_of_date=args.as_of,
-        earnings_watch_days=config.strategy.signals.earnings_watch_days,
-        refresh_cache=args.refresh_cache,
+        provider_bundle=provider_bundle,
+        provider=provider,
+        reference_provider=reference_provider,
+        earnings_provider=earnings_provider,
+    )
+    research_inputs = _assemble_portfolio_review_research_inputs(
+        args=args,
+        config=config,
+        provider_bundle=resolved_provider_bundle,
+        current_positions=resolved_current_positions,
+        position_plans=position_plans,
         log_label="review-portfolio",
     )
-    daily_sector_history_start = sector_context_history_start(
-        args.as_of,
-        benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
-        relative_strength_window=config.strategy.signals.sector_relative_strength_window,
+    benchmark_symbol = (
+        research_inputs.benchmark.value.symbol
+        if research_inputs.benchmark.value is not None
+        else None
     )
-    sector_contexts: dict[str, SectorFeatureContext] = {}
-    if hasattr(provider, "fetch_daily_bars"):
-        daily_sector_symbol_frames: dict[str, pd.DataFrame] = {}
-        for position in resolved_current_positions:
-            try:
-                bars = provider.fetch_daily_bars(
-                    position.symbol,
-                    daily_sector_history_start,
-                    args.as_of,
-                    refresh_cache=args.refresh_cache,
-                )
-            except DataProviderError as exc:
-                LOGGER.warning(
-                    "Skipping sector context for held symbol %s due to provider error: %s",
-                    position.symbol,
-                    exc,
-                )
-                continue
-            if not bars.empty:
-                daily_sector_symbol_frames[position.symbol] = bars
-        sector_contexts = _load_sector_contexts(
-            config=config,
-            env_file=getattr(args, "env_file", None),
-            provider=provider,
-            symbol_frames=daily_sector_symbol_frames,
-            as_of_date=args.as_of,
-            history_start=daily_sector_history_start,
-            benchmark_sma_fast=config.strategy.signals.benchmark_sma_fast,
-            benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
-            relative_strength_window=config.strategy.signals.sector_relative_strength_window,
-            refresh_cache=args.refresh_cache,
-            log_label="review-portfolio",
+    benchmark_frame = (
+        research_inputs.benchmark.value.frame
+        if research_inputs.benchmark.value is not None
+        else None
+    )
+    if benchmark_symbol is not None and (
+        research_inputs.benchmark.status == "failed"
+        or benchmark_frame is None
+        or benchmark_frame.empty
+    ):
+        raise ValueError(
+            research_inputs.benchmark.message
+            or f"No benchmark data was available for regime symbol '{benchmark_symbol}'."
         )
+    earnings_contexts = research_inputs.earnings_contexts.value or {}
+    sector_contexts = research_inputs.sector_contexts.value or {}
 
     rows: list[PortfolioReviewRow] = []
     position_trajectory_observations: dict[str, PositionTrajectoryObservation] = {}
@@ -7413,6 +8290,10 @@ def _run_portfolio_review_workflow(
         rows=rows,
         current_positions=resolved_current_positions,
         benchmark_symbol=benchmark_symbol,
+        metadata=build_workflow_input_metadata(
+            "review_input_statuses",
+            research_inputs.result_metadata(),
+        ),
     )
 
 
@@ -7896,29 +8777,26 @@ def _load_earnings_contexts(
     *,
     config: AppConfig,
     env_file: Path | None,
+    provider: EarningsCalendarProvider | None,
     symbols: Sequence[str],
     as_of_date: date,
     earnings_watch_days: int,
     refresh_cache: bool,
     log_label: str,
 ) -> dict[str, EarningsRiskContext]:
-    normalized_symbols = sorted({symbol.strip().upper() for symbol in symbols if symbol.strip()})
-    if not normalized_symbols:
-        return {}
-
-    try:
-        provider = create_earnings_calendar_provider(config, env_file=env_file)
-        return build_earnings_risk_contexts(
-            normalized_symbols,
-            as_of_date=as_of_date,
+    return (
+        _load_earnings_contexts_result(
+            config=config,
+            env_file=env_file,
             provider=provider,
-            risk_window_days=earnings_watch_days,
-            lookahead_calendar_days=max(30, earnings_watch_days + 7),
+            symbols=symbols,
+            as_of_date=as_of_date,
+            earnings_watch_days=earnings_watch_days,
             refresh_cache=refresh_cache,
-        )
-    except (DataProviderConfigurationError, DataProviderError, ValueError) as exc:
-        LOGGER.warning("Earnings context unavailable for %s: %s", log_label, exc)
-        return {}
+            log_label=log_label,
+        ).value
+        or {}
+    )
 
 
 def _load_sector_contexts(
@@ -7926,6 +8804,7 @@ def _load_sector_contexts(
     config: AppConfig,
     env_file: Path | None,
     provider: DailyBarProvider,
+    reference_provider: ReferenceUniverseProvider | None,
     symbol_frames: Mapping[str, pd.DataFrame],
     as_of_date: date,
     history_start: date,
@@ -7935,36 +8814,23 @@ def _load_sector_contexts(
     refresh_cache: bool,
     log_label: str,
 ) -> dict[str, SectorFeatureContext]:
-    normalized_symbol_frames = {
-        symbol.strip().upper(): frame
-        for symbol, frame in symbol_frames.items()
-        if symbol.strip() and not frame.empty
-    }
-    if not normalized_symbol_frames:
-        return {}
-
-    try:
-        classifications = load_symbol_sector_classifications(
-            tuple(normalized_symbol_frames),
+    return (
+        _load_sector_contexts_result(
             config=config,
             env_file=env_file,
-            as_of_date=as_of_date,
-            refresh_cache=refresh_cache,
-        )
-        return build_sector_feature_contexts(
-            normalized_symbol_frames,
             provider=provider,
+            reference_provider=reference_provider,
+            symbol_frames=symbol_frames,
             as_of_date=as_of_date,
             history_start=history_start,
-            sector_classifications=classifications,
             benchmark_sma_fast=benchmark_sma_fast,
             benchmark_sma_slow=benchmark_sma_slow,
             relative_strength_window=relative_strength_window,
             refresh_cache=refresh_cache,
-        )
-    except (DataProviderConfigurationError, DataProviderError, ValueError) as exc:
-        LOGGER.warning("Sector context unavailable for %s: %s", log_label, exc)
-        return {}
+            log_label=log_label,
+        ).value
+        or {}
+    )
 
 
 def _load_volatility_context(
@@ -7976,24 +8842,53 @@ def _load_volatility_context(
     refresh_cache: bool,
     log_label: str,
 ) -> dict[str, float | str | bool | None]:
-    try:
-        return build_volatility_regime_context(
+    return (
+        _load_volatility_context_result(
             provider=provider,
             as_of_date=as_of_date,
-            history_start=volatility_context_history_start(as_of_date),
-            caution_threshold=vix_caution_threshold,
-            entry_block_threshold=vix_entry_block_threshold,
+            vix_caution_threshold=vix_caution_threshold,
+            vix_entry_block_threshold=vix_entry_block_threshold,
             refresh_cache=refresh_cache,
-        )
-    except ValueError as exc:
-        LOGGER.warning("Volatility context unavailable for %s: %s", log_label, exc)
-        return {
-            "vix_close": None,
-            "vix_sma_short": None,
-            "vix_sma_long": None,
-            "volatility_regime_state": None,
-            "volatility_regime_risk_off": None,
-        }
+            log_label=log_label,
+        ).value
+        or {}
+    )
+
+
+def _load_daily_summary_benchmark_frame(
+    *,
+    args: argparse.Namespace,
+    config: AppConfig,
+    provider: DailyBarProvider,
+    symbol_frames: Mapping[str, pd.DataFrame],
+    fetch_start: date,
+    universe_members: Sequence[UniverseMember],
+) -> tuple[str | None, pd.DataFrame | None]:
+    result = _load_daily_summary_benchmark_frame_result(
+        args=args,
+        config=config,
+        provider=provider,
+        symbol_frames=symbol_frames,
+        fetch_start=fetch_start,
+        universe_members=universe_members,
+        log_label="daily-summary",
+    )
+    if result.value is None:
+        return None, None
+    return result.value.symbol, result.value.frame
+
+
+def _warn_missing_benchmark_context_for_regime_filter(
+    benchmark_symbol: str,
+    *,
+    log_label: str,
+    error: BaseException | None = None,
+) -> None:
+    research_assembly_module._log_missing_benchmark_context_warning(
+        benchmark_symbol=benchmark_symbol,
+        log_label=log_label,
+        error=error,
+    )
 
 
 def _warn_missing_sector_context_for_entry(
@@ -8015,24 +8910,23 @@ def _load_position_sector_classifications(
     *,
     config: AppConfig,
     env_file: Path | None,
+    reference_provider: ReferenceUniverseProvider | None,
     as_of_date: date,
     refresh_cache: bool,
     log_label: str,
 ) -> dict[str, SymbolSectorClassification]:
-    if not current_positions:
-        return {}
-
-    try:
-        return load_symbol_sector_classifications(
-            [position.symbol for position in current_positions],
+    return (
+        _load_position_sector_classifications_result(
+            current_positions,
             config=config,
             env_file=env_file,
+            reference_provider=reference_provider,
             as_of_date=as_of_date,
             refresh_cache=refresh_cache,
-        )
-    except (DataProviderConfigurationError, DataProviderError, ValueError) as exc:
-        LOGGER.warning("Portfolio heat context unavailable for %s: %s", log_label, exc)
-        return {}
+            log_label=log_label,
+        ).value
+        or {}
+    )
 
 
 def _build_portfolio_holding_exposures(
@@ -8334,13 +9228,19 @@ def _run_streaming_daily_summary_workflow(
     config: AppConfig,
     current_positions: list[ExistingPosition],
     snapshot: LiveUpdateBufferSnapshot,
+    provider_bundle: ProviderBundle | None = None,
     provider: DailyBarProvider,
+    reference_provider: ReferenceUniverseProvider | None = None,
+    earnings_provider: EarningsCalendarProvider | None = None,
 ) -> dict[str, object]:
     _ = snapshot
     return _run_daily_summary_workflow(
         args,
         config=config,
+        provider_bundle=provider_bundle,
         provider=provider,
+        reference_provider=reference_provider,
+        earnings_provider=earnings_provider,
         current_positions=current_positions,
     )
 
@@ -8351,13 +9251,19 @@ def _run_streaming_portfolio_review_workflow(
     config: AppConfig,
     current_positions: list[ExistingPosition],
     snapshot: LiveUpdateBufferSnapshot,
+    provider_bundle: ProviderBundle | None = None,
     provider: DailyBarProvider,
+    reference_provider: ReferenceUniverseProvider | None = None,
+    earnings_provider: EarningsCalendarProvider | None = None,
 ) -> PortfolioReviewReport:
     _ = snapshot
     return _run_portfolio_review_workflow(
         args,
         config=config,
+        provider_bundle=provider_bundle,
         provider=provider,
+        reference_provider=reference_provider,
+        earnings_provider=earnings_provider,
         current_positions=current_positions,
     )
 
@@ -8368,13 +9274,19 @@ def _run_streaming_intraday_review_workflow(
     config: AppConfig,
     current_positions: list[ExistingPosition],
     snapshot: LiveUpdateBufferSnapshot,
+    provider_bundle: ProviderBundle | None = None,
     provider: DailyBarProvider,
+    reference_provider: ReferenceUniverseProvider | None = None,
+    earnings_provider: EarningsCalendarProvider | None = None,
 ) -> IntradayPortfolioReviewReport:
     _ = snapshot
     return _run_portfolio_review_intraday_workflow(
         args,
         config=config,
+        provider_bundle=provider_bundle,
         provider=provider,
+        reference_provider=reference_provider,
+        earnings_provider=earnings_provider,
         current_positions=current_positions,
     )
 

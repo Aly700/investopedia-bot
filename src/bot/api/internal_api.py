@@ -29,6 +29,10 @@ from bot.state.market_state import (
     MarketStateSnapshot,
     diff_market_state_snapshots,
 )
+from bot.workflow_status import (
+    build_workflow_input_overview,
+    summarize_workflow_input_statuses,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -279,6 +283,10 @@ class InternalApiQueryService:
                 key=lambda item: item[0],
             )
         ]
+        workflow_input_summaries = _load_workflow_input_summaries_for_date(
+            self.project_root,
+            as_of_date=current_snapshot.as_of_date,
+        )
         return _endpoint_response(
             endpoint="portfolio",
             available=True,
@@ -309,6 +317,18 @@ class InternalApiQueryService:
                     for state in action_states
                     if state["action"] == "RAISE STOP"
                 ],
+                "workflow_input_overview": build_workflow_input_overview(
+                    {
+                        workflow_name: summary
+                        for workflow_name, summary in workflow_input_summaries.items()
+                        if workflow_name in {"portfolio_review", "intraday_review"}
+                    }
+                ).to_dict(),
+                "workflow_input_summaries": {
+                    workflow_name: summary
+                    for workflow_name, summary in workflow_input_summaries.items()
+                    if workflow_name in {"portfolio_review", "intraday_review"}
+                },
             },
         )
 
@@ -494,6 +514,10 @@ def _market_state_recommendation_state(
     latest_monitor_market_output_path, latest_monitor_market_output_date = (
         _latest_monitor_market_output(project_root)
     )
+    workflow_input_summaries = _load_workflow_input_summaries_for_date(
+        project_root,
+        as_of_date=current_snapshot.as_of_date,
+    )
     empty_reasons: list[str] = []
     if not current_snapshot.approved_candidate_queue:
         if current_snapshot.top_rejected_reasons_summary:
@@ -518,6 +542,10 @@ def _market_state_recommendation_state(
         "queue_empty": not current_snapshot.approved_candidate_queue,
         "top_priority_empty": not top_priority_candidates,
         "empty_reasons": empty_reasons,
+        "workflow_input_overview": build_workflow_input_overview(
+            workflow_input_summaries
+        ).to_dict(),
+        "workflow_input_summaries": workflow_input_summaries,
         "context_notes": _market_state_recommendation_context_notes(
             current_snapshot=current_snapshot,
             latest_monitor_market_output_date=latest_monitor_market_output_date,
@@ -570,18 +598,19 @@ def _market_state_recommendation_context_notes(
 
 
 def _latest_monitor_market_output(project_root: Path) -> tuple[Path | None, date | None]:
-    monitor_market_root = project_root / "data" / "processed" / "monitor_market"
-    if not monitor_market_root.exists():
-        return None, None
-    try:
-        candidate_paths = list(monitor_market_root.rglob("market_monitor.json"))
-    except OSError as exc:
-        LOGGER.warning(
-            "Ignoring monitor-market artifact lookup under %s because the directory could not be scanned: %s",
-            monitor_market_root,
-            exc,
-        )
-        return None, None
+    candidate_paths: list[Path] = []
+    for root_name in ("monitor_market", "live_market"):
+        monitor_market_root = project_root / "data" / "processed" / root_name
+        if not monitor_market_root.exists():
+            continue
+        try:
+            candidate_paths.extend(monitor_market_root.rglob("market_monitor.json"))
+        except OSError as exc:
+            LOGGER.warning(
+                "Ignoring monitor-market artifact lookup under %s because the directory could not be scanned: %s",
+                monitor_market_root,
+                exc,
+            )
     latest_candidate: tuple[date, int, Path] | None = None
     for path in candidate_paths:
         try:
@@ -595,6 +624,102 @@ def _latest_monitor_market_output(project_root: Path) -> tuple[Path | None, date
     if latest_candidate is None:
         return None, None
     return latest_candidate[2], latest_candidate[0]
+
+
+def _load_workflow_input_summaries_for_date(
+    project_root: Path,
+    *,
+    as_of_date: date,
+) -> dict[str, dict[str, Any]]:
+    artifact_specs = {
+        "daily_summary": (
+            "daily_summary.json",
+            "research_input_statuses",
+            ("live_market", "monitor_market", "daily_summary"),
+        ),
+        "portfolio_review": (
+            "portfolio_review.json",
+            "review_input_statuses",
+            ("live_market", "monitor_market", "portfolio_review"),
+        ),
+        "intraday_review": (
+            "portfolio_review_intraday.json",
+            "review_input_statuses",
+            ("live_market", "portfolio_review_intraday"),
+        ),
+    }
+    results: dict[str, dict[str, Any]] = {}
+    for workflow_name, (filename, raw_status_key, roots) in artifact_specs.items():
+        payload = _load_latest_workflow_artifact_payload_for_date(
+            project_root,
+            as_of_date=as_of_date,
+            filename=filename,
+            processed_roots=roots,
+        )
+        if payload is None:
+            continue
+        summary = _workflow_input_summary_from_artifact_payload(
+            payload,
+            raw_status_key=raw_status_key,
+        )
+        if summary is not None:
+            results[workflow_name] = summary
+    return results
+
+
+def _load_latest_workflow_artifact_payload_for_date(
+    project_root: Path,
+    *,
+    as_of_date: date,
+    filename: str,
+    processed_roots: Sequence[str],
+) -> Mapping[str, Any] | None:
+    best_candidate: tuple[int, Mapping[str, Any]] | None = None
+    for priority, root_name in enumerate(processed_roots):
+        path = (
+            project_root
+            / "data"
+            / "processed"
+            / root_name
+            / as_of_date.isoformat()
+            / filename
+        )
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            LOGGER.warning(
+                "Ignoring workflow artifact %s because it could not be loaded: %s",
+                path,
+                exc,
+            )
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        candidate = (priority, dict(payload))
+        if best_candidate is None or candidate[0] < best_candidate[0]:
+            best_candidate = candidate
+    if best_candidate is None:
+        return None
+    return best_candidate[1]
+
+
+def _workflow_input_summary_from_artifact_payload(
+    payload: Mapping[str, Any],
+    *,
+    raw_status_key: str,
+) -> dict[str, Any] | None:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    summary = metadata.get("workflow_input_summary")
+    if isinstance(summary, Mapping):
+        return dict(summary)
+    raw_statuses = metadata.get(raw_status_key)
+    if not isinstance(raw_statuses, Mapping):
+        return None
+    return summarize_workflow_input_statuses(raw_statuses).to_dict()
 
 
 @dataclass(frozen=True)

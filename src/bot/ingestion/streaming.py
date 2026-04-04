@@ -30,6 +30,7 @@ LOGGER = get_logger(__name__)
 STREAM_CONTROL_EVENT_TYPES = (
     "disconnect",
     "reconnect",
+    "status",
 )
 STREAMING_MARKET_EVENT_TYPES = MARKET_DATA_INGESTION_UPDATE_TYPES + STREAM_CONTROL_EVENT_TYPES
 
@@ -125,7 +126,12 @@ class StreamingIngestionPollResult:
     accepted_count: int
     skipped_count: int
     warnings: tuple[str, ...] = ()
+    control_events: tuple[StreamingMarketDataEvent, ...] = ()
     connected: bool = False
+    last_raw_message_at_utc: str | None = None
+    last_raw_message_type: str | None = None
+    last_accepted_message_type: str | None = None
+    last_dropped_message_reason: str | None = None
 
     @property
     def warning_count(self) -> int:
@@ -304,8 +310,15 @@ class WebsocketIngestionAdapter:
         accepted_count = 0
         skipped_count = 0
         warnings: list[str] = []
+        control_events: list[StreamingMarketDataEvent] = []
+        last_raw_message_type: str | None = None
+        last_accepted_message_type: str | None = None
+        last_dropped_message_reason: str | None = None
         for message in messages:
             received_count += 1
+            raw_message_type = _raw_stream_message_type(message)
+            if raw_message_type is not None:
+                last_raw_message_type = raw_message_type
             if self.message_normalizer is not None:
                 try:
                     normalized = self.message_normalizer(message)
@@ -313,9 +326,11 @@ class WebsocketIngestionAdapter:
                     skipped_count += 1
                     warning = f"skipped malformed stream message: {exc}"
                     warnings.append(warning)
+                    last_dropped_message_reason = warning
                     LOGGER.warning("%s", warning)
                     continue
                 if normalized is None:
+                    last_dropped_message_reason = _stream_message_drop_reason(message)
                     continue
                 message = normalized
             try:
@@ -324,25 +339,55 @@ class WebsocketIngestionAdapter:
                 skipped_count += 1
                 warning = f"skipped malformed stream message: {exc}"
                 warnings.append(warning)
+                last_dropped_message_reason = warning
                 LOGGER.warning("%s", warning)
                 continue
+            last_accepted_message_type = event.event_type
+            if event.is_control_event:
+                control_events.append(event)
+            control_warning = _stream_control_warning(event)
+            if control_warning is not None:
+                warnings.append(control_warning)
+                LOGGER.warning("%s", control_warning)
+            else:
+                control_note = _stream_control_note(event)
+                if control_note is not None:
+                    LOGGER.info("%s", control_note)
             accepted_count += 1
             if event.event_type == "disconnect":
+                try:
+                    self.transport.disconnect()
+                except OSError as exc:
+                    warning = f"websocket transport disconnect failed: {exc}"
+                    warnings.append(warning)
+                    LOGGER.warning("%s", warning)
                 self._connected = False
-                continue
+                break
             if event.event_type == "reconnect":
                 self._connected = True
+                continue
+            if event.event_type == "status":
                 continue
             update = event.to_ingestion_update()
             if update is None:
                 continue
             self._buffer.add_update(update, observed_at_utc=observed_at)
+        last_raw_message_at_utc = (
+            observed_at.astimezone(timezone.utc).isoformat()
+            if received_count > 0
+            else None
+        )
         return StreamingIngestionPollResult(
             received_count=received_count,
             accepted_count=accepted_count,
             skipped_count=skipped_count,
             warnings=tuple(warnings),
+            control_events=tuple(control_events),
             connected=self._connected,
+            last_raw_message_at_utc=last_raw_message_at_utc,
+            last_raw_message_type=last_raw_message_type,
+            last_accepted_message_type=last_accepted_message_type,
+            last_dropped_message_reason=last_dropped_message_reason,
         )
 
     def flush_ready_cycle_ingestion(
@@ -389,9 +434,36 @@ class WebsocketIngestionAdapter:
         now_utc: datetime,
         force: bool,
     ) -> MarketCycleIngestionEnvelope | None:
+        buffered_updates = self._buffer.current_updates(as_of_date=request.as_of_date)
+        if not buffered_updates:
+            if force:
+                raise ValueError(
+                    f"No buffered streaming updates are available for {request.as_of_date.isoformat()}."
+                )
+            return None
+        if (
+            not force
+            and not self._buffer.flush_due(
+                as_of_date=request.as_of_date,
+                now_utc=now_utc,
+                flush_interval=timedelta(seconds=self.flush_interval_seconds),
+            )
+        ):
+            return None
+
+        current_positions: tuple[ExistingPosition, ...] = ()
+        current_positions_loaded = False
+        current_position_symbols: tuple[str, ...] = ()
+        if request.include_portfolio_review or request.include_intraday_review:
+            current_positions = tuple(self.load_current_positions())
+            current_positions_loaded = True
+            current_position_symbols = _current_position_symbols(current_positions)
         updates = _resolved_monitor_updates(
-            self._buffer.current_updates(as_of_date=request.as_of_date),
+            buffered_updates,
             include_daily_summary=request.include_daily_summary,
+            include_portfolio_review=request.include_portfolio_review,
+            include_intraday_review=request.include_intraday_review,
+            current_position_symbols=current_position_symbols,
         )
         if not updates:
             if force:
@@ -418,17 +490,9 @@ class WebsocketIngestionAdapter:
                     + "."
                 )
             return None
-        if (
-            not force
-            and not self._buffer.flush_due(
-                as_of_date=request.as_of_date,
-                now_utc=now_utc,
-                flush_interval=timedelta(seconds=self.flush_interval_seconds),
-            )
-        ):
-            return None
+        if not current_positions_loaded:
+            current_positions = tuple(self.load_current_positions())
 
-        current_positions = tuple(self.load_current_positions())
         snapshot = LiveUpdateBufferSnapshot(
             as_of_date=request.as_of_date,
             updates=updates,
@@ -484,22 +548,25 @@ def _resolved_monitor_updates(
     updates: Sequence[MarketDataIngestionUpdate],
     *,
     include_daily_summary: bool,
+    include_portfolio_review: bool = False,
+    include_intraday_review: bool = False,
+    current_position_symbols: Sequence[str] = (),
 ) -> tuple[MarketDataIngestionUpdate, ...]:
     """Normalize live quote updates into the monitor-market trigger shape.
 
     Streaming feeds commonly emit quote-bar batches instead of the polling-style
     ``candidate_universe_refresh_batch`` update. The daily-summary path only
     needs evidence that fresh candidate symbols arrived for the session, so
-    synthesize that refresh update from quote bars when necessary.
+    synthesize that refresh update from quote bars when necessary. Trades-only
+    and quotes-only subscriptions do not currently satisfy those required
+    monitor-market trigger updates.
     """
 
     resolved_updates = tuple(updates)
-    if not include_daily_summary:
+    if not include_daily_summary and not include_portfolio_review and not include_intraday_review:
         return resolved_updates
 
     update_types = {update.update_type for update in resolved_updates}
-    if "candidate_universe_refresh_batch" in update_types:
-        return resolved_updates
 
     quote_bar_update = next(
         (
@@ -512,16 +579,42 @@ def _resolved_monitor_updates(
     if quote_bar_update is None:
         return resolved_updates
 
-    synthetic_refresh = MarketDataIngestionUpdate(
-        update_type="candidate_universe_refresh_batch",
-        as_of_date=quote_bar_update.as_of_date,
-        symbols=quote_bar_update.symbols,
-        metadata={
-            **dict(quote_bar_update.metadata),
-            "synthetic_from_update_type": "quote_bar_batch_refresh",
-        },
-    )
-    return sort_ingestion_updates((*resolved_updates, synthetic_refresh))
+    synthesized_updates = list(resolved_updates)
+    synthetic_metadata = {
+        **dict(quote_bar_update.metadata),
+        "synthetic_from_update_type": "quote_bar_batch_refresh",
+    }
+    if include_daily_summary and "candidate_universe_refresh_batch" not in update_types:
+        synthesized_updates.append(
+            MarketDataIngestionUpdate(
+                update_type="candidate_universe_refresh_batch",
+                as_of_date=quote_bar_update.as_of_date,
+                symbols=quote_bar_update.symbols,
+                metadata=synthetic_metadata,
+            )
+        )
+    if (
+        (include_portfolio_review or include_intraday_review)
+        and "portfolio_symbol_refresh_batch" not in update_types
+    ):
+        normalized_position_symbols = {
+            symbol.strip().upper()
+            for symbol in current_position_symbols
+            if isinstance(symbol, str) and symbol.strip()
+        }
+        relevant_portfolio_symbols = tuple(
+            sorted(set(quote_bar_update.symbols) & normalized_position_symbols)
+        )
+        if relevant_portfolio_symbols or not normalized_position_symbols:
+            synthesized_updates.append(
+                MarketDataIngestionUpdate(
+                    update_type="portfolio_symbol_refresh_batch",
+                    as_of_date=quote_bar_update.as_of_date,
+                    symbols=relevant_portfolio_symbols,
+                    metadata=synthetic_metadata,
+                )
+            )
+    return sort_ingestion_updates(synthesized_updates)
 
 
 def _merge_updates(
@@ -539,6 +632,58 @@ def _merge_updates(
         symbols=merged_symbols,
         metadata=merged_metadata,
     )
+
+
+def _current_position_symbols(
+    current_positions: Sequence[ExistingPosition],
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                position.symbol.strip().upper()
+                for position in current_positions
+                if isinstance(position, ExistingPosition) and position.symbol.strip()
+            }
+        )
+    )
+def _raw_stream_message_type(message: Mapping[str, Any]) -> str | None:
+    for key in ("type", "T", "ev"):
+        raw_value = message.get(key)
+        if not isinstance(raw_value, str):
+            continue
+        cleaned = raw_value.strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def _stream_message_drop_reason(message: Mapping[str, Any]) -> str:
+    raw_type = _raw_stream_message_type(message)
+    if raw_type is not None:
+        return f"stream message was dropped by the normalizer (raw_type={raw_type})."
+    return "stream message was dropped by the normalizer."
+
+
+def _stream_control_warning(
+    event: StreamingMarketDataEvent,
+) -> str | None:
+    if not event.is_control_event:
+        return None
+    warning = event.metadata.get("warning")
+    if isinstance(warning, str) and warning.strip():
+        return warning.strip()
+    return None
+
+
+def _stream_control_note(
+    event: StreamingMarketDataEvent,
+) -> str | None:
+    if not event.is_control_event:
+        return None
+    note = event.metadata.get("note")
+    if isinstance(note, str) and note.strip():
+        return note.strip()
+    return None
 
 
 def _streaming_daily_summary_callback(

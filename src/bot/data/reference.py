@@ -8,6 +8,7 @@ import json
 import logging
 from pathlib import Path
 import re
+import socket
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -19,6 +20,8 @@ from bot.data.providers import (
     DataProviderConfigurationError,
     DataProviderRequestError,
     load_provider_environment,
+    provider_capabilities_for_role,
+    resolve_provider_credentials,
 )
 
 
@@ -29,6 +32,7 @@ class ReferenceUniverseProvider(ABC):
     """Abstract interface for master-universe and symbol-reference lookups."""
 
     provider_name: str
+    capabilities = provider_capabilities_for_role("reference_data", "polygon")
 
     def __init__(
         self,
@@ -100,6 +104,10 @@ class ReferenceUniverseProvider(ABC):
             raise DataProviderRequestError(
                 f"{self.provider_name} request failed: {exc.reason}"
             ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise DataProviderRequestError(
+                f"{self.provider_name} request timed out: {exc}"
+            ) from exc
 
         try:
             return json.loads(payload)
@@ -113,6 +121,7 @@ class PolygonReferenceUniverseProvider(ReferenceUniverseProvider):
     """Polygon reference-data adapter for master universe construction."""
 
     provider_name = "polygon"
+    capabilities = provider_capabilities_for_role("reference_data", provider_name)
     tickers_url = "https://api.polygon.io/v3/reference/tickers"
     grouped_daily_url = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks"
 
@@ -454,7 +463,7 @@ class ReferenceDataCache:
         return path
 
 
-def create_reference_universe_provider(
+def create_reference_data_provider(
     config: AppConfig,
     *,
     env_file: Path | None = None,
@@ -463,26 +472,39 @@ def create_reference_universe_provider(
 ) -> ReferenceUniverseProvider:
     """Create the configured reference-data provider for universe building."""
 
-    provider_name = config.data_sources.provider.lower()
-    if provider_name != "polygon":
-        raise DataProviderConfigurationError(
-            "Master-universe fetching is currently implemented for the polygon provider only. "
-            "Switch config/data_sources.yaml to polygon or pass --master-input."
-        )
-
-    active_provider_config = config.data_sources.active_provider()
-    merged_environment = load_provider_environment(env_file=env_file, environment=environment)
-    api_key = merged_environment.get(active_provider_config.api_key_env, "").strip()
-    if not api_key:
-        raise DataProviderConfigurationError(
-            f"Missing API key for provider '{provider_name}'. "
-            f"Set {active_provider_config.api_key_env} in the shell environment or .env file."
-        )
+    credentials = resolve_provider_credentials(
+        config,
+        role_name="reference_data",
+        env_file=env_file,
+        environment=environment,
+    )
+    provider_name = credentials.provider_name
+    provider_capabilities_for_role("reference_data", provider_name)
 
     resolved_cache_dir = cache_dir or (
         config.project_root / config.universe_builder.master.reference_cache_dir
     )
-    return PolygonReferenceUniverseProvider(api_key=api_key, cache_dir=resolved_cache_dir)
+    return PolygonReferenceUniverseProvider(
+        api_key=credentials.api_key,
+        cache_dir=resolved_cache_dir,
+    )
+
+
+def create_reference_universe_provider(
+    config: AppConfig,
+    *,
+    env_file: Path | None = None,
+    environment: Mapping[str, str] | None = None,
+    cache_dir: Path | None = None,
+) -> ReferenceUniverseProvider:
+    """Backward-compatible alias for the reference-data provider factory."""
+
+    return create_reference_data_provider(
+        config,
+        env_file=env_file,
+        environment=environment,
+        cache_dir=cache_dir,
+    )
 
 
 def _normalize_symbol(symbol: str) -> str:

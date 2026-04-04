@@ -334,6 +334,7 @@ class DailyResearchSummary:
     market_context: MarketContext | None = None
     force_require_relative_volume_confirmation: bool = False
     pending_order_summary: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def recommended_preset(self) -> str | None:
@@ -427,6 +428,7 @@ class DailyResearchSummary:
                 if self.pending_order_summary is not None
                 else None
             ),
+            "metadata": dict(self.metadata),
             "candidate_count": len(self.rows),
             "approved_count": len(approved_rows),
             "rejected_count": len(rejected_rows),
@@ -631,6 +633,7 @@ class PortfolioReviewReport:
     benchmark_symbol: str | None
     current_positions: tuple[ExistingPosition, ...]
     rows: tuple[PortfolioReviewRow, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly review report payload."""
@@ -652,6 +655,7 @@ class PortfolioReviewReport:
             "current_positions": [position.to_dict() for position in self.current_positions],
             **action_counts,
             "rows": [row.to_dict() for row in self.rows],
+            "metadata": dict(self.metadata),
         }
 
 
@@ -666,6 +670,7 @@ class IntradayPortfolioReviewReport:
     benchmark_symbol: str | None
     current_positions: tuple[ExistingPosition, ...]
     rows: tuple[PortfolioReviewRow, ...]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly intraday review payload."""
@@ -689,6 +694,7 @@ class IntradayPortfolioReviewReport:
             "current_positions": [position.to_dict() for position in self.current_positions],
             **action_counts,
             "rows": [row.to_dict() for row in self.rows],
+            "metadata": dict(self.metadata),
         }
 
     def to_brief(self) -> str:
@@ -1022,6 +1028,7 @@ def build_portfolio_review_report(
     rows: Sequence[PortfolioReviewRow],
     current_positions: Sequence[ExistingPosition],
     benchmark_symbol: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> PortfolioReviewReport:
     """Build a portfolio review report from row-level management suggestions."""
 
@@ -1031,6 +1038,7 @@ def build_portfolio_review_report(
         benchmark_symbol=benchmark_symbol,
         current_positions=tuple(current_positions),
         rows=tuple(rows),
+        metadata=dict(metadata or {}),
     )
 
 
@@ -1042,6 +1050,7 @@ def build_intraday_portfolio_review_report(
     rows: Sequence[PortfolioReviewRow],
     current_positions: Sequence[ExistingPosition],
     benchmark_symbol: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> IntradayPortfolioReviewReport:
     """Build an intraday portfolio review report from row-level suggestions."""
 
@@ -1053,6 +1062,7 @@ def build_intraday_portfolio_review_report(
         benchmark_symbol=benchmark_symbol,
         current_positions=tuple(current_positions),
         rows=tuple(rows),
+        metadata=dict(metadata or {}),
     )
 
 
@@ -1501,6 +1511,7 @@ def build_daily_research_summary(
     preset_selection_source: str | None = None,
     force_require_relative_volume_confirmation: bool = False,
     pending_order_summary: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any] | None = None,
 ) -> DailyResearchSummary:
     """Build a consolidated daily preset summary from evaluated candidates."""
 
@@ -1559,6 +1570,7 @@ def build_daily_research_summary(
             if pending_order_summary is not None
             else None
         ),
+        metadata=dict(metadata or {}),
     )
 
 

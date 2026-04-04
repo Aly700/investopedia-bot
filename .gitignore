@@ -1,22 +1,61 @@
+# Secrets and local environment
+.env
+.env.*
+.envrc
+!.env.example
+!.env.local.example
+
+# Python environments, caches, and build outputs
 .venv/
+venv/
+env/
 __pycache__/
+**/__pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
 *.pyc
-.env
-.env.local
+*.pyo
+*.pyd
 .coverage
+.coverage.*
 htmlcov/
 build/
 dist/
 *.egg-info/
-.DS_Store
-data/raw/*
-data/cache/*
-data/processed/*
-data/logs/*
-notebooks/.ipynb_checkpoints/
-!.gitkeep
 
+# Editor and OS junk
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+.claude/
+.codex/
+*.swp
+*.swo
+*.tmp
+
+# Runtime logs and local process artifacts
+*.log
+*.pid
 .runtime/
+runtime-root/
+hot-state/
+paper_validation_profile.json
+
+# Local data, caches, and generated runtime outputs
+data/raw/*
+data/cache/
+data/processed/
+data/logs/
+data/local_paper_validation*/
+data/local_staging_runtime*/
+
+# Notebook/editor generated state
+notebooks/.ipynb_checkpoints/
+
+# Keep intentional placeholders
+!.gitkeep

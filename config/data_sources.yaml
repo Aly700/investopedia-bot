@@ -1,4 +1,11 @@
-provider: polygon
+provider: alpaca
+
+roles:
+  stream_market_data: alpaca
+  historical_bars: alpaca
+  reference_data: polygon
+  earnings_calendar: polygon
+  execution_broker: alpaca
 
 alphavantage:
   api_key_env: ALPHAVANTAGE_API_KEY
@@ -8,3 +15,9 @@ tiingo:
 
 polygon:
   api_key_env: POLYGON_API_KEY
+
+alpaca:
+  api_key_env: ALPACA_API_KEY_ID
+  api_secret_env: ALPACA_SECRET_KEY
+  default_feed: sip
+  default_adjustment: split

@@ -9,6 +9,7 @@ import threading
 import pytest
 
 import bot.main as main_module
+import bot.service.paper_validation as paper_validation_module
 from bot.api.control_api import (
     OperatorControlAuditRecord,
     OperatorControlState,
@@ -21,6 +22,7 @@ from bot.data.trade_feedback import TradeFeedbackEvent, TradeFeedbackLogStore
 from bot.main import build_parser
 from bot.service.live_market_service import LiveMarketServiceStatus, LiveMarketServiceStatusStore
 from bot.service.paper_validation import (
+    build_local_paper_validation_smoke_result,
     build_local_paper_validation_profile,
     build_local_paper_validation_runtime_config,
     build_local_paper_validation_summary,
@@ -242,6 +244,52 @@ def test_local_paper_validation_summary_writes_clean_review_outputs(
             + "\n",
             encoding="utf-8",
         )
+        live_output_dir = runtime.profile.default_live_output_dir(
+            as_of_date=date(2024, 1, 5)
+        )
+        live_output_dir.mkdir(parents=True, exist_ok=True)
+        (live_output_dir / "daily_summary.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {
+                        "research_input_statuses": {
+                            "benchmark": {"status": "ok"},
+                            "volatility_context": {
+                                "status": "unavailable",
+                                "issue_code": "unsupported_capability",
+                            },
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (live_output_dir / "portfolio_review.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {
+                        "review_input_statuses": {
+                            "benchmark": {"status": "ok"},
+                            "position_daily_symbol_frames": {"status": "degraded"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        (live_output_dir / "portfolio_review_intraday.json").write_text(
+            json.dumps(
+                {
+                    "metadata": {
+                        "review_input_statuses": {
+                            "benchmark_intraday_metrics": {"status": "ok"},
+                            "position_daily_symbol_frames": {"status": "degraded"},
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
 
         summary = build_local_paper_validation_summary(
             runtime.profile,
@@ -277,11 +325,23 @@ def test_local_paper_validation_summary_writes_clean_review_outputs(
         assert payload["paper_integrity"]["paper_only_intact"] is True
         assert payload["daily_review"]["service"]["healthy"] is True
         assert payload["daily_review"]["paper_integrity"]["broker_target_stayed_paper"] is True
+        assert payload["daily_review"]["review_inputs"]["portfolio_review"]["benchmark"]["status"] == "ok"
+        assert payload["daily_review"]["review_inputs"]["intraday_review"]["position_daily_symbol_frames"]["status"] == "degraded"
+        assert payload["daily_review"]["workflow_input_summaries"]["daily_summary"]["unavailable_count"] == 1
+        assert payload["daily_review"]["workflow_input_summaries"]["portfolio_review"]["degraded_count"] == 1
+        assert payload["daily_review"]["workflow_input_overview"]["workflow_count"] == 3
+        assert payload["daily_review"]["workflow_input_overview"]["problematic_workflow_count"] == 3
         assert isinstance(payload["operator_checklist"], list)
         assert "Paper guardrail active" in outputs["paper_validation_brief"].read_text(
             encoding="utf-8"
         )
         assert "Safety" in outputs["paper_validation_daily_review"].read_text(
+            encoding="utf-8"
+        )
+        assert "Workflow inputs" in outputs["paper_validation_daily_review"].read_text(
+            encoding="utf-8"
+        )
+        assert "Workflows=3" in outputs["paper_validation_daily_review"].read_text(
             encoding="utf-8"
         )
         assert "What changed" in outputs["paper_validation_changes_today"].read_text(
@@ -689,6 +749,155 @@ def test_run_local_paper_validation_smoke_writes_passed_result_artifacts(
     assert payload["paper_only_intact"] is True
     assert payload["review_artifacts_written"] is True
     assert payload["successful_cycle_count"] == 1
+
+
+def test_build_local_paper_validation_smoke_result_allows_alpaca_test_stream_transport_only_smoke(
+    tmp_path: Path,
+) -> None:
+    profile = build_local_paper_validation_profile(
+        project_root=_repo_root(),
+        validation_root=tmp_path / "validation-root",
+    )
+    service_status_path = _write_smoke_service_status(
+        profile,
+        service_state="connected",
+        cycle_count=0,
+        last_successful_flush_at_utc=None,
+        last_cycle_status=None,
+    )
+    summary = _FakeSmokeSummary(
+        as_of_date=date(2024, 1, 5),
+        service_status_path=service_status_path,
+        cycle_count=0,
+        last_successful_cycle_at_utc=None,
+    )
+    review_output_dir = profile.default_review_output_dir(as_of_date=date(2024, 1, 5))
+    review_output_dir.mkdir(parents=True, exist_ok=True)
+    review_paths = {
+        "paper_validation_summary_json": review_output_dir / "paper_validation_summary.json",
+        "paper_validation_checkpoint_json": review_output_dir / "paper_validation_checkpoint.json",
+        "paper_validation_brief": review_output_dir / "paper_validation_brief.txt",
+    }
+    for path in review_paths.values():
+        path.write_text("{}", encoding="utf-8")
+
+    result = build_local_paper_validation_smoke_result(
+        profile,
+        as_of_date=date(2024, 1, 5),
+        websocket_url="wss://stream.data.alpaca.markets/v2/test",
+        stream_provider="alpaca",
+        max_iterations=10,
+        summary=summary,
+        review_paths=review_paths,
+        internal_api_probe={"available": True},
+        control_api_probe={"available": True},
+        dashboard_probe={"available": True},
+        startup_succeeded=True,
+        runtime_stopped_cleanly=True,
+    )
+
+    assert result.passed is True
+    assert result.successful_cycle_count == 0
+    assert result.blocking_issues == ()
+    assert any(
+        "historical/recommendation path remains unvalidated" in warning
+        for warning in result.warnings
+    )
+
+
+def test_build_local_paper_validation_smoke_result_keeps_no_cycle_blocking_off_test_stream(
+    tmp_path: Path,
+) -> None:
+    profile = build_local_paper_validation_profile(
+        project_root=_repo_root(),
+        validation_root=tmp_path / "validation-root",
+    )
+    service_status_path = _write_smoke_service_status(
+        profile,
+        service_state="connected",
+        cycle_count=0,
+        last_successful_flush_at_utc=None,
+        last_cycle_status=None,
+    )
+    summary = _FakeSmokeSummary(
+        as_of_date=date(2024, 1, 5),
+        service_status_path=service_status_path,
+        cycle_count=0,
+        last_successful_cycle_at_utc=None,
+    )
+    review_output_dir = profile.default_review_output_dir(as_of_date=date(2024, 1, 5))
+    review_output_dir.mkdir(parents=True, exist_ok=True)
+    review_paths = {
+        "paper_validation_summary_json": review_output_dir / "paper_validation_summary.json",
+        "paper_validation_checkpoint_json": review_output_dir / "paper_validation_checkpoint.json",
+        "paper_validation_brief": review_output_dir / "paper_validation_brief.txt",
+    }
+    for path in review_paths.values():
+        path.write_text("{}", encoding="utf-8")
+
+    result = build_local_paper_validation_smoke_result(
+        profile,
+        as_of_date=date(2024, 1, 5),
+        websocket_url="wss://stream.data.alpaca.markets/v2/sip",
+        stream_provider="alpaca",
+        max_iterations=10,
+        summary=summary,
+        review_paths=review_paths,
+        internal_api_probe={"available": True},
+        control_api_probe={"available": True},
+        dashboard_probe={"available": True},
+        startup_succeeded=True,
+        runtime_stopped_cleanly=True,
+    )
+
+    assert result.passed is False
+    assert "No successful market cycle completed during the smoke run." in result.blocking_issues
+
+
+def test_health_checkpoint_payload_includes_explicit_provider_roles() -> None:
+    payload = paper_validation_module._build_health_checkpoint_payload(
+        {
+            "available": True,
+            "data": {
+                "updated_at_utc": "2024-01-05T15:05:00+00:00",
+                "status": {
+                    "service_state": "connected",
+                    "connected": True,
+                    "stream_provider": "alpaca",
+                    "historical_provider": "polygon",
+                    "reference_provider": "polygon",
+                    "earnings_provider": "polygon",
+                    "execution_broker": "alpaca",
+                    "broker_update_stream_provider": None,
+                    "provider_roles": {
+                        "stream_market_data": {
+                            "provider": "alpaca",
+                            "configured": True,
+                            "available": True,
+                        },
+                        "historical_bars": {
+                            "provider": "polygon",
+                            "configured": True,
+                            "available": True,
+                            "degraded": True,
+                        },
+                    },
+                    "degraded_provider_roles": ["historical_bars"],
+                    "unavailable_provider_roles": [],
+                },
+            },
+        }
+    )
+
+    assert payload["stream_provider"] == "alpaca"
+    assert payload["historical_provider"] == "polygon"
+    assert payload["reference_provider"] == "polygon"
+    assert payload["earnings_provider"] == "polygon"
+    assert payload["execution_broker"] == "alpaca"
+    assert payload["broker_update_stream_provider"] is None
+    assert payload["provider_roles"]["stream_market_data"]["provider"] == "alpaca"
+    assert payload["degraded_provider_roles"] == ["historical_bars"]
+    assert payload["unavailable_provider_roles"] == []
 
 
 def test_run_local_paper_validation_smoke_failure_still_writes_result_artifacts(
@@ -1135,6 +1344,16 @@ class _FakeSmokeSummary:
     service_status_path: Path
     cycle_count: int
     last_successful_cycle_at_utc: str | None = "2024-01-05T15:01:00+00:00"
+    stream_provider: str | None = "alpaca"
+    historical_provider: str | None = "polygon"
+    reference_provider: str | None = "polygon"
+    earnings_provider: str | None = "polygon"
+    execution_broker: str | None = None
+    broker_update_stream_provider: str | None = None
+    subscription_status: str | None = "acknowledged"
+    last_subscription_message: str | None = "alpaca websocket subscription acknowledged: trades=1"
+    last_message_at_utc: str | None = "2024-01-05T15:00:30+00:00"
+    last_error: str | None = None
     paper_only_intact: bool = True
     execution_mode_current: str = "paper"
     execution_submission_enabled: bool = True
@@ -1160,7 +1379,17 @@ class _FakeSmokeSummary:
             "connected": True,
             "stale": False,
             "cycle_count": self.cycle_count,
+            "last_message_at_utc": self.last_message_at_utc,
             "last_successful_flush_at_utc": self.last_successful_cycle_at_utc,
+            "stream_provider": self.stream_provider,
+            "historical_provider": self.historical_provider,
+            "reference_provider": self.reference_provider,
+            "earnings_provider": self.earnings_provider,
+            "execution_broker": self.execution_broker,
+            "broker_update_stream_provider": self.broker_update_stream_provider,
+            "subscription_status": self.subscription_status,
+            "last_subscription_message": self.last_subscription_message,
+            "last_error": self.last_error,
         }
 
     @property

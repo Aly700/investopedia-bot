@@ -28,12 +28,20 @@ Set one validation root for the main run and keep it stable for the full week:
 export BOT_VALIDATION_ROOT="$PWD/data/local_paper_validation_week1"
 export BOT_CANDIDATES="$PWD/data/raw/candidate_symbols_quality_liquid.txt"
 export BOT_PORTFOLIO="$PWD/data/processed/portfolio/current_positions.json"
-export BOT_WS_URL="wss://<your-market-websocket>"
+export BOT_WS_URL="wss://stream.data.alpaca.markets/v2/test"
 export BOT_DATE="$(date +%F)"
 export BOT_NOTIFY_URL="https://<your-notification-webhook>"
+export ALPACA_API_KEY_ID="<your-alpaca-key>"
+export ALPACA_SECRET_KEY="<your-alpaca-secret>"
 ```
 
 If you do not want notifications for the proving run, leave `BOT_NOTIFY_URL` unset and mark notification review as `needs_review`, not `pass`.
+
+For Alpaca smoke validation, keep `BOT_WS_URL` on `wss://stream.data.alpaca.markets/v2/test` first. Move to your paid real-time stock feed URL only after the smoke run is clean.
+
+For Alpaca `v2/test`, treat the bounded smoke run primarily as a websocket transport/auth/subscription proof. A clean test-stream smoke can still leave the historical/recommendation path unvalidated if the first daily-summary cycle does not complete inside the bounded window.
+
+For real market-hours validation, keep the runtime on Alpaca `bars` subscriptions. Quotes-only, trades-only, `dailyBars`, and `updatedBars` feeds do not drive the monitor-market candidate/recommendation refresh path in this runtime.
 
 Optional launch additions:
 
@@ -49,6 +57,7 @@ Bounded Day-1 smoke run:
 PYTHONPATH=src .venv/bin/python -m bot.main run-local-paper-validation-smoke \
   "$BOT_CANDIDATES" \
   --websocket-url "$BOT_WS_URL" \
+  --stream-provider alpaca \
   --validation-root "$BOT_VALIDATION_ROOT" \
   --as-of "$BOT_DATE" \
   --format yaml
@@ -65,6 +74,7 @@ Always-on proving run:
 PYTHONPATH=src .venv/bin/python -m bot.main run-local-paper-validation \
   "$BOT_CANDIDATES" \
   --websocket-url "$BOT_WS_URL" \
+  --stream-provider alpaca \
   --validation-root "$BOT_VALIDATION_ROOT" \
   --as-of "$BOT_DATE" \
   --format yaml

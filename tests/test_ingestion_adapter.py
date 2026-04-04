@@ -16,7 +16,10 @@ from bot.ingestion.streaming import (
     StreamingMarketDataEvent,
     WebsocketIngestionAdapter,
 )
-from bot.ingestion.websocket_transport import normalize_polygon_websocket_message
+from bot.ingestion.websocket_transport import (
+    normalize_alpaca_stock_websocket_message,
+    normalize_polygon_websocket_message,
+)
 from bot.orchestration.live_runner import (
     LiveMarketCycleRequest,
     LiveMarketRunner,
@@ -704,6 +707,263 @@ def test_polygon_normalized_event_drives_cycle_eligible_buffer_update() -> None:
         now_utc=t0 + timedelta(seconds=2),
         flush_interval=timedelta(seconds=1),
     )
+
+
+def test_alpaca_bar_message_normalizes_to_quote_bar_refresh() -> None:
+    alpaca_message = {
+        "T": "b",
+        "S": "AAPL",
+        "o": 150.5,
+        "h": 151.5,
+        "l": 150.0,
+        "c": 151.0,
+        "v": 100,
+        "vw": 150.75,
+        "n": 25,
+        "t": "2024-01-05T14:30:00Z",
+    }
+
+    normalized = normalize_alpaca_stock_websocket_message(alpaca_message)
+
+    assert normalized is not None
+    assert normalized["type"] == "quote_bar_batch_refresh"
+    assert normalized["symbols"] == ["AAPL"]
+    assert normalized["as_of_date"] == "2024-01-05"
+    event = StreamingMarketDataEvent.from_message(normalized)
+    assert event.event_type == "quote_bar_batch_refresh"
+
+
+def test_alpaca_test_trade_message_can_drive_refresh_when_enabled() -> None:
+    alpaca_message = {
+        "T": "t",
+        "S": "FAKEPACA",
+        "p": 100.0,
+        "s": 1,
+        "t": "2024-01-05T14:30:00.000Z",
+    }
+
+    normalized = normalize_alpaca_stock_websocket_message(
+        alpaca_message,
+        treat_trades_as_refresh=True,
+    )
+
+    assert normalized is not None
+    assert normalized["type"] == "quote_bar_batch_refresh"
+    assert normalized["symbols"] == ["FAKEPACA"]
+    assert normalized["as_of_date"] == "2024-01-05"
+
+
+def test_alpaca_control_messages_surface_status_and_disconnect_events() -> None:
+    success_message = normalize_alpaca_stock_websocket_message(
+        {"T": "success", "msg": "connected"}
+    )
+    subscription_message = normalize_alpaca_stock_websocket_message(
+        {"T": "subscription", "bars": ["AAPL"]}
+    )
+    error_message = normalize_alpaca_stock_websocket_message(
+        {"T": "error", "code": 406, "msg": "connection limit exceeded"}
+    )
+
+    assert success_message is not None
+    assert success_message["type"] == "status"
+    assert success_message["metadata"]["note"] == "alpaca websocket connected."
+    assert subscription_message is not None
+    assert subscription_message["type"] == "status"
+    assert subscription_message["metadata"]["status_kind"] == "subscription"
+    assert subscription_message["metadata"]["subscription_acknowledged"] is True
+    assert error_message is not None
+    assert error_message["type"] == "disconnect"
+    assert error_message["metadata"]["warning"] == (
+        "alpaca websocket error 406: connection limit exceeded"
+    )
+
+
+def test_websocket_adapter_surfaces_alpaca_control_errors_as_warnings() -> None:
+    adapter = WebsocketIngestionAdapter(
+        transport_name="alpaca-test",
+        transport=FakeWebsocketTransport(
+            [[{"T": "error", "code": 406, "msg": "connection limit exceeded"}]]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        flush_interval_seconds=1,
+        message_normalizer=normalize_alpaca_stock_websocket_message,
+    )
+    adapter.connect()
+
+    poll_result = adapter.poll_messages(
+        observed_at_utc=datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    )
+
+    assert poll_result.connected is False
+    assert poll_result.warning_count == 1
+    assert poll_result.warnings == (
+        "alpaca websocket error 406: connection limit exceeded",
+    )
+    assert adapter.transport.disconnect_calls == 1
+
+
+def test_websocket_adapter_collects_alpaca_subscription_acknowledgements() -> None:
+    adapter = WebsocketIngestionAdapter(
+        transport_name="alpaca-test",
+        transport=FakeWebsocketTransport(
+            [[{"T": "success", "msg": "authenticated"}, {"T": "subscription", "bars": ["AAPL"]}]]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        flush_interval_seconds=1,
+        message_normalizer=normalize_alpaca_stock_websocket_message,
+    )
+    adapter.connect()
+
+    poll_result = adapter.poll_messages(
+        observed_at_utc=datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    )
+
+    assert poll_result.connected is True
+    assert [event.event_type for event in poll_result.control_events] == ["status", "status"]
+    assert poll_result.control_events[-1].metadata["subscription_acknowledged"] is True
+
+
+def test_websocket_adapter_records_raw_drop_diagnostics_for_ignored_alpaca_messages() -> None:
+    adapter = WebsocketIngestionAdapter(
+        transport_name="alpaca-test",
+        transport=FakeWebsocketTransport(
+            [[{"T": "x", "S": "AAPL", "t": "2024-01-05T14:30:00Z"}]]
+        ),
+        portfolio_path=None,
+        load_current_positions=lambda: (),
+        flush_interval_seconds=1,
+        message_normalizer=normalize_alpaca_stock_websocket_message,
+    )
+    observed_at = datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+    adapter.connect()
+
+    poll_result = adapter.poll_messages(observed_at_utc=observed_at)
+
+    assert poll_result.received_count == 1
+    assert poll_result.accepted_count == 0
+    assert poll_result.connected is True
+    assert poll_result.last_raw_message_at_utc == "2024-01-05T14:30:00+00:00"
+    assert poll_result.last_raw_message_type == "x"
+    assert poll_result.last_accepted_message_type is None
+    assert poll_result.last_dropped_message_reason == (
+        "stream message was dropped by the normalizer (raw_type=x)."
+    )
+
+
+def test_websocket_ingestion_adapter_synthesizes_portfolio_refresh_from_quote_bars() -> None:
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=date(2024, 1, 5),
+        portfolio_path="/tmp/portfolio.csv",
+        include_daily_summary=True,
+        include_portfolio_review=True,
+        daily_summary_required=True,
+        portfolio_review_required=False,
+    )
+    adapter = WebsocketIngestionAdapter(
+        transport_name="alpaca-test",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "type": "quote_bar_batch_refresh",
+                        "as_of_date": "2024-01-05",
+                        "symbols": ["AAPL", "MSFT"],
+                    }
+                ]
+            ]
+        ),
+        portfolio_path="/tmp/portfolio.csv",
+        load_current_positions=lambda: (
+            ExistingPosition(
+                symbol="MSFT",
+                shares=5,
+                average_entry_price=100.0,
+                current_stop=95.0,
+            ),
+        ),
+        run_daily_summary=lambda snapshot, current_positions: {"summary": {}},
+        run_portfolio_review=lambda snapshot, current_positions: build_portfolio_review_report(
+            as_of_date=date(2024, 1, 5),
+            rows=[],
+            current_positions=list(current_positions),
+        ),
+        flush_interval_seconds=1,
+    )
+    adapter.connect()
+    t0 = datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+
+    adapter.poll_messages(observed_at_utc=t0)
+    envelope = adapter.flush_ready_cycle_ingestion(
+        request,
+        now_utc=t0 + timedelta(seconds=2),
+    )
+
+    assert envelope is not None
+    update_types = {update.update_type for update in envelope.updates}
+    assert "candidate_universe_refresh_batch" in update_types
+    assert "portfolio_symbol_refresh_batch" in update_types
+    portfolio_update = next(
+        update
+        for update in envelope.updates
+        if update.update_type == "portfolio_symbol_refresh_batch"
+    )
+    assert portfolio_update.symbols == ("MSFT",)
+
+
+def test_websocket_ingestion_adapter_defers_position_load_until_flush_due() -> None:
+    request = LiveMarketCycleRequest(
+        workflow="monitor-market",
+        as_of_date=date(2024, 1, 5),
+        include_daily_summary=True,
+        daily_summary_required=True,
+    )
+    load_calls = 0
+
+    def load_positions() -> tuple[ExistingPosition, ...]:
+        nonlocal load_calls
+        load_calls += 1
+        return ()
+
+    adapter = WebsocketIngestionAdapter(
+        transport_name="alpaca-test",
+        transport=FakeWebsocketTransport(
+            [
+                [
+                    {
+                        "type": "quote_bar_batch_refresh",
+                        "as_of_date": "2024-01-05",
+                        "symbols": ["AAPL"],
+                    }
+                ]
+            ]
+        ),
+        portfolio_path=None,
+        load_current_positions=load_positions,
+        run_daily_summary=lambda snapshot, current_positions: {"summary": _daily_summary()},
+        flush_interval_seconds=5,
+    )
+    adapter.connect()
+    started_at = datetime(2024, 1, 5, 14, 30, tzinfo=timezone.utc)
+
+    adapter.poll_messages(observed_at_utc=started_at)
+    assert (
+        adapter.flush_ready_cycle_ingestion(
+            request,
+            now_utc=started_at + timedelta(seconds=4),
+        )
+        is None
+    )
+
+    envelope = adapter.flush_ready_cycle_ingestion(
+        request,
+        now_utc=started_at + timedelta(seconds=5),
+    )
+
+    assert envelope is not None
+    assert load_calls == 1
 
 
 def test_websocket_ingestion_adapter_handles_disconnect_and_reconnect() -> None:

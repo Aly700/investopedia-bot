@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, timedelta
 import json
 from pathlib import Path
@@ -10,7 +11,9 @@ import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 
+import bot.data.earnings as earnings_module
 import bot.data.providers as providers_module
+import bot.data.reference as reference_module
 from bot.config import UniverseConfig, load_app_config
 from bot.data.candidate_journal import (
     CandidateJournalEntry,
@@ -23,7 +26,9 @@ from bot.data.candidate_journal import (
 )
 from bot.data.earnings import (
     EarningsCalendarProvider,
+    PolygonEarningsCalendarProvider,
     build_earnings_risk_contexts,
+    create_earnings_calendar_provider,
     trading_days_until,
 )
 from bot.data.intraday_state_journal import (
@@ -90,11 +95,20 @@ from bot.data.normalize import (
     normalize_intraday_bars,
 )
 from bot.data.providers import (
+    AlpacaDailyBarProvider,
+    DataProviderConfigurationError,
     DataProviderRequestError,
     DailyBarProvider,
     PolygonDailyBarProvider,
+    create_historical_bars_provider,
     create_daily_bar_provider,
     load_provider_environment,
+    provider_capabilities_for_role,
+)
+from bot.data.reference import (
+    PolygonReferenceUniverseProvider,
+    create_reference_data_provider,
+    create_reference_universe_provider,
 )
 from bot.data.universe import UniverseBuilder, load_candidate_symbols
 from bot.execution.interface import ExecutionBatch, ExecutionOrder
@@ -731,14 +745,270 @@ def test_build_sector_feature_contexts_degrades_gracefully_without_mappings(tmp_
 
 def test_create_provider_uses_configured_provider() -> None:
     config = load_app_config()
-    api_key_env = config.data_sources.active_provider().api_key_env
+    provider_config = config.data_sources.active_provider()
     provider = create_daily_bar_provider(
         config,
-        environment={api_key_env: "demo-key"},
+        environment={
+            provider_config.api_key_env: "demo-key",
+            **(
+                {provider_config.api_secret_env: "demo-secret"}
+                if provider_config.api_secret_env is not None
+                else {}
+            ),
+        },
         cache_dir=Path("/tmp/investopedia-provider-cache"),
     )
 
     assert provider.provider_name == config.data_sources.provider.lower()
+
+
+def test_create_providers_use_explicit_role_assignments_when_present() -> None:
+    base_config = load_app_config()
+    config = replace(
+        base_config,
+        data_sources=replace(
+            base_config.data_sources,
+            roles=base_config.data_sources.roles.__class__(
+                historical_bars="tiingo",
+                reference_data="polygon",
+                earnings_calendar="polygon",
+            ),
+        ),
+    )
+    environment = {
+        "TIINGO_API_KEY": "tiingo-demo-key",
+        "POLYGON_API_KEY": "polygon-demo-key",
+    }
+
+    daily_provider = create_daily_bar_provider(
+        config,
+        environment=environment,
+        cache_dir=Path("/tmp/investopedia-provider-cache"),
+    )
+    reference_provider = create_reference_universe_provider(
+        config,
+        environment=environment,
+        cache_dir=Path("/tmp/investopedia-reference-cache"),
+    )
+    earnings_provider = create_earnings_calendar_provider(
+        config,
+        environment=environment,
+        cache_dir=Path("/tmp/investopedia-earnings-cache"),
+    )
+
+    assert daily_provider.provider_name == "tiingo"
+    assert reference_provider.provider_name == "polygon"
+    assert earnings_provider.provider_name == "polygon"
+
+
+def test_create_historical_bars_provider_supports_alpaca_role_assignments() -> None:
+    base_config = load_app_config()
+    config = replace(
+        base_config,
+        data_sources=replace(
+            base_config.data_sources,
+            roles=base_config.data_sources.roles.__class__(
+                historical_bars="alpaca",
+                reference_data="polygon",
+                earnings_calendar="polygon",
+            ),
+        ),
+    )
+
+    provider = create_historical_bars_provider(
+        config,
+        environment={
+            "ALPACA_API_KEY_ID": "alpaca-key",
+            "ALPACA_SECRET_KEY": "alpaca-secret",
+        },
+        cache_dir=Path("/tmp/investopedia-provider-cache"),
+    )
+
+    assert isinstance(provider, AlpacaDailyBarProvider)
+    assert provider.provider_name == "alpaca"
+    assert provider.capabilities.supports_daily_bars is True
+    assert provider.capabilities.supports_intraday_bars is True
+
+
+def test_provider_capabilities_are_role_specific() -> None:
+    historical_caps = provider_capabilities_for_role("historical_bars", "alpaca")
+    reference_caps = provider_capabilities_for_role("reference_data", "polygon")
+    earnings_caps = provider_capabilities_for_role("earnings_calendar", "polygon")
+
+    assert historical_caps.supports_daily_bars is True
+    assert historical_caps.supports_earnings_calendar is False
+    assert historical_caps.supports_reference_universe is False
+    assert historical_caps.supports_intraday_bars is True
+    assert reference_caps.supports_reference_universe is True
+    assert reference_caps.supports_batch_symbol_fetch is True
+    assert earnings_caps.supports_earnings_calendar is True
+
+
+def test_reference_provider_rejects_unsupported_role_assignment_with_role_specific_error() -> None:
+    base_config = load_app_config()
+    config = replace(
+        base_config,
+        data_sources=replace(
+            base_config.data_sources,
+            roles=base_config.data_sources.roles.__class__(
+                historical_bars="polygon",
+                reference_data="alpaca",
+                earnings_calendar="polygon",
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        DataProviderConfigurationError,
+        match="Unsupported provider assignment for role 'reference_data': requested 'alpaca'",
+    ):
+        create_reference_data_provider(
+            config,
+            environment={
+                "ALPACA_API_KEY_ID": "alpaca-key",
+                "ALPACA_SECRET_KEY": "alpaca-secret",
+            },
+            cache_dir=Path("/tmp/investopedia-reference-cache"),
+        )
+
+
+def test_earnings_provider_rejects_unsupported_role_assignment_with_role_specific_error() -> None:
+    base_config = load_app_config()
+    config = replace(
+        base_config,
+        data_sources=replace(
+            base_config.data_sources,
+            roles=base_config.data_sources.roles.__class__(
+                historical_bars="polygon",
+                reference_data="polygon",
+                earnings_calendar="alpaca",
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        DataProviderConfigurationError,
+        match="Unsupported provider assignment for role 'earnings_calendar': requested 'alpaca'",
+    ):
+        create_earnings_calendar_provider(
+            config,
+            environment={
+                "ALPACA_API_KEY_ID": "alpaca-key",
+                "ALPACA_SECRET_KEY": "alpaca-secret",
+            },
+            cache_dir=Path("/tmp/investopedia-earnings-cache"),
+        )
+
+
+def test_historical_provider_requires_alpaca_key_and_secret_with_role_specific_error() -> None:
+    base_config = load_app_config()
+    config = replace(
+        base_config,
+        data_sources=replace(
+            base_config.data_sources,
+            roles=base_config.data_sources.roles.__class__(
+                historical_bars="alpaca",
+                reference_data="polygon",
+                earnings_calendar="polygon",
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        DataProviderConfigurationError,
+        match="Role 'historical_bars' is configured as 'alpaca' but required credentials are missing: ALPACA_SECRET_KEY.",
+    ):
+        create_historical_bars_provider(
+            config,
+            environment={"ALPACA_API_KEY_ID": "alpaca-key"},
+            cache_dir=Path("/tmp/investopedia-provider-cache"),
+        )
+
+
+def test_alpaca_historical_provider_normalizes_daily_and_intraday_bars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = AlpacaDailyBarProvider(
+        api_key="alpaca-key",
+        api_secret="alpaca-secret",
+        cache_dir=tmp_path,
+        default_feed="sip",
+        default_adjustment="split",
+    )
+    payloads = [
+        {
+            "bars": [
+                {
+                    "t": "2024-01-04T05:00:00Z",
+                    "o": 100.0,
+                    "h": 102.0,
+                    "l": 99.0,
+                    "c": 101.0,
+                    "v": 1000,
+                }
+            ],
+            "next_page_token": None,
+        },
+        {
+            "bars": [
+                {
+                    "t": "2024-01-05T14:30:00Z",
+                    "o": 101.0,
+                    "h": 103.0,
+                    "l": 100.5,
+                    "c": 102.5,
+                    "v": 250,
+                    "vw": 102.0,
+                }
+            ],
+            "next_page_token": None,
+        },
+    ]
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self.payload).encode("utf-8")
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+    requested_urls: list[str] = []
+    request_headers: list[Mapping[str, str]] = []
+
+    def fake_urlopen(request: object, timeout: int) -> _FakeResponse:
+        requested_urls.append(request.full_url)
+        request_headers.append(dict(request.headers))
+        return _FakeResponse(payloads.pop(0))
+
+    monkeypatch.setattr(providers_module, "urlopen", fake_urlopen)
+
+    daily_bars = provider.fetch_daily_bars("AAPL", date(2024, 1, 4), date(2024, 1, 4))
+    intraday_bars = provider.fetch_intraday_bars("AAPL", date(2024, 1, 5), interval_minutes=15)
+
+    assert len(requested_urls) == 2
+    assert "timeframe=1Day" in requested_urls[0]
+    assert "feed=sip" in requested_urls[0]
+    assert "adjustment=split" in requested_urls[0]
+    assert "timeframe=15Min" in requested_urls[1]
+    normalized_headers = {
+        key.lower(): value
+        for key, value in request_headers[0].items()
+    }
+    assert normalized_headers["apca-api-key-id"] == "alpaca-key"
+    assert normalized_headers["apca-api-secret-key"] == "alpaca-secret"
+    assert daily_bars["date"].dt.date.tolist() == [date(2024, 1, 4)]
+    assert daily_bars["close"].tolist() == [101.0]
+    assert intraday_bars["datetime"].dt.strftime("%Y-%m-%dT%H:%M:%S").tolist() == [
+        "2024-01-05T14:30:00"
+    ]
+    assert intraday_bars["vwap"].tolist() == [102.0]
 
 
 @pytest.mark.parametrize(
@@ -767,6 +1037,60 @@ def test_polygon_provider_wraps_raw_network_timeouts_as_provider_errors(
             date(2024, 1, 5),
             refresh_cache=True,
         )
+
+
+@pytest.mark.parametrize(
+    ("provider", "module"),
+    (
+        (
+            lambda tmp_path: PolygonEarningsCalendarProvider(
+                api_key="test-key",
+                cache_dir=tmp_path,
+            ),
+            earnings_module,
+        ),
+        (
+            lambda tmp_path: PolygonReferenceUniverseProvider(
+                api_key="test-key",
+                cache_dir=tmp_path,
+            ),
+            reference_module,
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "raw_timeout",
+    (
+        TimeoutError("Operation timed out"),
+        socket.timeout("The read operation timed out"),
+    ),
+)
+def test_non_bar_providers_wrap_raw_network_timeouts_as_provider_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider,
+    module,
+    raw_timeout: BaseException,
+) -> None:
+    resolved_provider = provider(tmp_path)
+
+    def fake_urlopen(*args: object, **kwargs: object) -> object:
+        raise raw_timeout
+
+    monkeypatch.setattr(module, "urlopen", fake_urlopen)
+
+    with pytest.raises(DataProviderRequestError, match="request timed out"):
+        if isinstance(resolved_provider, PolygonEarningsCalendarProvider):
+            resolved_provider.fetch_upcoming_earnings(
+                start_date=date(2024, 1, 2),
+                end_date=date(2024, 1, 5),
+                refresh_cache=True,
+            )
+        else:
+            resolved_provider.fetch_ticker_details(
+                "AAPL",
+                refresh_cache=True,
+            )
 
 
 def test_candidate_score_journal_updates_and_persists_repeated_candidates(

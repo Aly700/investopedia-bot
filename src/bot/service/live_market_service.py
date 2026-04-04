@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from bot.data.state_persistence import (
     StateArtifactPath,
@@ -15,7 +15,7 @@ from bot.data.state_persistence import (
     load_json_mapping_file,
     write_json_file,
 )
-from bot.ingestion.streaming import WebsocketIngestionAdapter
+from bot.ingestion.streaming import StreamingMarketDataEvent, WebsocketIngestionAdapter
 from bot.logging_utils import get_logger
 from bot.notifications import (
     NotificationEvent,
@@ -28,8 +28,6 @@ from bot.orchestration.live_runner import (
     LiveMarketCycleResult,
     LiveMarketRunner,
 )
-
-
 LOGGER = get_logger(__name__)
 
 LIVE_MARKET_SERVICE_STATUS_SCHEMA_VERSION = 1
@@ -83,12 +81,32 @@ class LiveMarketServiceStatus:
     cycle_count: int = 0
     warning_count: int = 0
     last_message_at_utc: str | None = None
+    last_raw_message_at_utc: str | None = None
+    last_accepted_message_at_utc: str | None = None
     last_connected_at_utc: str | None = None
     last_successful_flush_at_utc: str | None = None
     last_warning: str | None = None
     last_error: str | None = None
     last_cycle_status: str | None = None
     last_cycle_warning_count: int = 0
+    raw_message_count: int = 0
+    accepted_message_count: int = 0
+    skipped_message_count: int = 0
+    last_raw_message_type: str | None = None
+    last_accepted_message_type: str | None = None
+    last_dropped_message_reason: str | None = None
+    stream_provider: str | None = None
+    historical_provider: str | None = None
+    reference_provider: str | None = None
+    earnings_provider: str | None = None
+    execution_broker: str | None = None
+    broker_update_stream_provider: str | None = None
+    provider_roles: dict[str, Any] = field(default_factory=dict)
+    degraded_provider_roles: tuple[str, ...] = ()
+    unavailable_provider_roles: tuple[str, ...] = ()
+    subscription_status: str | None = None
+    last_subscription_message: str | None = None
+    last_subscription_at_utc: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,12 +117,32 @@ class LiveMarketServiceStatus:
             "cycle_count": self.cycle_count,
             "warning_count": self.warning_count,
             "last_message_at_utc": self.last_message_at_utc,
+            "last_raw_message_at_utc": self.last_raw_message_at_utc,
+            "last_accepted_message_at_utc": self.last_accepted_message_at_utc,
             "last_connected_at_utc": self.last_connected_at_utc,
             "last_successful_flush_at_utc": self.last_successful_flush_at_utc,
             "last_warning": self.last_warning,
             "last_error": self.last_error,
             "last_cycle_status": self.last_cycle_status,
             "last_cycle_warning_count": self.last_cycle_warning_count,
+            "raw_message_count": self.raw_message_count,
+            "accepted_message_count": self.accepted_message_count,
+            "skipped_message_count": self.skipped_message_count,
+            "last_raw_message_type": self.last_raw_message_type,
+            "last_accepted_message_type": self.last_accepted_message_type,
+            "last_dropped_message_reason": self.last_dropped_message_reason,
+            "stream_provider": self.stream_provider,
+            "historical_provider": self.historical_provider,
+            "reference_provider": self.reference_provider,
+            "earnings_provider": self.earnings_provider,
+            "execution_broker": self.execution_broker,
+            "broker_update_stream_provider": self.broker_update_stream_provider,
+            "provider_roles": dict(self.provider_roles),
+            "degraded_provider_roles": list(self.degraded_provider_roles),
+            "unavailable_provider_roles": list(self.unavailable_provider_roles),
+            "subscription_status": self.subscription_status,
+            "last_subscription_message": self.last_subscription_message,
+            "last_subscription_at_utc": self.last_subscription_at_utc,
         }
 
     @classmethod
@@ -120,6 +158,12 @@ class LiveMarketServiceStatus:
             cycle_count=_non_negative_int(payload.get("cycle_count"), "cycle_count"),
             warning_count=_non_negative_int(payload.get("warning_count"), "warning_count"),
             last_message_at_utc=_optional_iso8601_datetime(payload.get("last_message_at_utc")),
+            last_raw_message_at_utc=_optional_iso8601_datetime(
+                payload.get("last_raw_message_at_utc")
+            ),
+            last_accepted_message_at_utc=_optional_iso8601_datetime(
+                payload.get("last_accepted_message_at_utc")
+            ),
             last_connected_at_utc=_optional_iso8601_datetime(
                 payload.get("last_connected_at_utc")
             ),
@@ -132,6 +176,43 @@ class LiveMarketServiceStatus:
             last_cycle_warning_count=_non_negative_int(
                 payload.get("last_cycle_warning_count"),
                 "last_cycle_warning_count",
+            ),
+            raw_message_count=_non_negative_int(
+                payload.get("raw_message_count"),
+                "raw_message_count",
+            ),
+            accepted_message_count=_non_negative_int(
+                payload.get("accepted_message_count"),
+                "accepted_message_count",
+            ),
+            skipped_message_count=_non_negative_int(
+                payload.get("skipped_message_count"),
+                "skipped_message_count",
+            ),
+            last_raw_message_type=_optional_text(payload.get("last_raw_message_type")),
+            last_accepted_message_type=_optional_text(
+                payload.get("last_accepted_message_type")
+            ),
+            last_dropped_message_reason=_optional_text(
+                payload.get("last_dropped_message_reason")
+            ),
+            stream_provider=_optional_text(payload.get("stream_provider")),
+            historical_provider=_optional_text(payload.get("historical_provider")),
+            reference_provider=_optional_text(payload.get("reference_provider")),
+            earnings_provider=_optional_text(payload.get("earnings_provider")),
+            execution_broker=_optional_text(payload.get("execution_broker")),
+            broker_update_stream_provider=_optional_text(
+                payload.get("broker_update_stream_provider")
+            ),
+            provider_roles=_string_mapping(payload.get("provider_roles")),
+            degraded_provider_roles=_string_sequence(payload.get("degraded_provider_roles")),
+            unavailable_provider_roles=_string_sequence(
+                payload.get("unavailable_provider_roles")
+            ),
+            subscription_status=_optional_text(payload.get("subscription_status")),
+            last_subscription_message=_optional_text(payload.get("last_subscription_message")),
+            last_subscription_at_utc=_optional_iso8601_datetime(
+                payload.get("last_subscription_at_utc")
             ),
         )
 
@@ -235,6 +316,17 @@ class LiveMarketSupervisor:
     stale_after_seconds: float = 30.0
     max_messages_per_poll: int | None = None
     reconnect_backoff: ReconnectBackoffPolicy = field(default_factory=ReconnectBackoffPolicy)
+    stream_provider: str | None = None
+    historical_provider: str | None = None
+    reference_provider: str | None = None
+    earnings_provider: str | None = None
+    execution_broker: str | None = None
+    broker_update_stream_provider: str | None = None
+    provider_roles: dict[str, Any] = field(default_factory=dict)
+    degraded_provider_roles: Sequence[str] = ()
+    unavailable_provider_roles: Sequence[str] = ()
+    expect_subscription_ack: bool = False
+    startup_warnings: Sequence[str] = ()
     sleep: Callable[[float], None] = time.sleep
     now_utc: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     flush_on_shutdown: bool = True
@@ -243,12 +335,28 @@ class LiveMarketSupervisor:
     notification_router: NotificationRouter | None = None
     status: LiveMarketServiceStatus = field(default_factory=LiveMarketServiceStatus, init=False)
     _stop_requested: bool = field(default=False, init=False, repr=False)
+    _startup_warnings_emitted: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.poll_interval_seconds < 0:
             raise ValueError("poll_interval_seconds must be greater than or equal to zero.")
         if self.stale_after_seconds <= 0:
             raise ValueError("stale_after_seconds must be greater than zero.")
+        self.status.stream_provider = _optional_text(self.stream_provider)
+        self.status.historical_provider = _optional_text(self.historical_provider)
+        self.status.reference_provider = _optional_text(self.reference_provider)
+        self.status.earnings_provider = _optional_text(self.earnings_provider)
+        self.status.execution_broker = _optional_text(self.execution_broker)
+        self.status.broker_update_stream_provider = _optional_text(
+            self.broker_update_stream_provider
+        )
+        self.status.provider_roles = dict(self.provider_roles)
+        self.status.degraded_provider_roles = _string_sequence(
+            self.degraded_provider_roles
+        )
+        self.status.unavailable_provider_roles = _string_sequence(
+            self.unavailable_provider_roles
+        )
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -258,6 +366,7 @@ class LiveMarketSupervisor:
 
         now = self.now_utc()
         previous_service_state = self.status.service_state
+        self._emit_startup_warnings()
         if not self.adapter.connected:
             self._attempt_connect(now)
             if not self.adapter.connected:
@@ -276,8 +385,24 @@ class LiveMarketSupervisor:
         if poll_result.warning_count:
             for warning in poll_result.warnings:
                 self._record_warning(warning)
+        self._apply_control_events(
+            poll_result.control_events,
+            observed_at_utc=now.astimezone(timezone.utc).isoformat(),
+        )
+        self.status.raw_message_count += poll_result.received_count
+        self.status.accepted_message_count += poll_result.accepted_count
+        self.status.skipped_message_count += poll_result.skipped_count
+        if poll_result.last_raw_message_at_utc is not None:
+            self.status.last_message_at_utc = poll_result.last_raw_message_at_utc
+            self.status.last_raw_message_at_utc = poll_result.last_raw_message_at_utc
+        if poll_result.last_raw_message_type is not None:
+            self.status.last_raw_message_type = poll_result.last_raw_message_type
         if poll_result.accepted_count > 0:
-            self.status.last_message_at_utc = now.astimezone(timezone.utc).isoformat()
+            self.status.last_accepted_message_at_utc = now.astimezone(timezone.utc).isoformat()
+        if poll_result.last_accepted_message_type is not None:
+            self.status.last_accepted_message_type = poll_result.last_accepted_message_type
+        if poll_result.received_count > 0:
+            self.status.last_dropped_message_reason = poll_result.last_dropped_message_reason
         if not poll_result.connected:
             self.status.connected = False
             self.status.stale = False
@@ -369,6 +494,12 @@ class LiveMarketSupervisor:
         self.status.last_error = None
         self.status.last_connected_at_utc = now.astimezone(timezone.utc).isoformat()
         self.status.service_state = "connected"
+        if self.expect_subscription_ack:
+            self.status.subscription_status = "pending"
+            self.status.last_subscription_message = (
+                "Awaiting Alpaca subscription acknowledgement."
+            )
+            self.status.last_subscription_at_utc = None
 
     def _refresh_liveness(self, now: datetime) -> None:
         self.status.connected = self.adapter.connected
@@ -381,7 +512,11 @@ class LiveMarketSupervisor:
                 )
             self.status.stale = False
             return
-        reference_timestamp = self.status.last_message_at_utc or self.status.last_connected_at_utc
+        reference_timestamp = (
+            self.status.last_raw_message_at_utc
+            or self.status.last_message_at_utc
+            or self.status.last_connected_at_utc
+        )
         if reference_timestamp is None:
             self.status.service_state = "connected"
             self.status.stale = False
@@ -399,7 +534,9 @@ class LiveMarketSupervisor:
         if self.status.service_state != "stale" or not self.adapter.connected:
             return False
         reference_timestamp = (
-            self.status.last_message_at_utc or self.status.last_connected_at_utc
+            self.status.last_raw_message_at_utc
+            or self.status.last_message_at_utc
+            or self.status.last_connected_at_utc
         )
         stale_seconds = self.stale_after_seconds
         if reference_timestamp is not None:
@@ -410,6 +547,9 @@ class LiveMarketSupervisor:
             f"{stale_seconds:.1f}s (threshold={self.stale_after_seconds:.1f}s); "
             "forcing reconnect."
         )
+        diagnostic_suffix = _stale_feed_diagnostic_suffix(self.status)
+        if diagnostic_suffix:
+            warning = f"{warning} {diagnostic_suffix}"
         self._record_warning(warning)
         self.status.last_error = warning
         try:
@@ -517,6 +657,44 @@ class LiveMarketSupervisor:
         except Exception as exc:
             LOGGER.warning("Notification routing failed: %s", exc)
 
+    def _apply_control_events(
+        self,
+        control_events: Sequence[StreamingMarketDataEvent],
+        *,
+        observed_at_utc: str,
+    ) -> None:
+        for event in control_events:
+            status_kind = _optional_text(event.metadata.get("status_kind"))
+            if status_kind == "subscription":
+                acknowledged = _optional_bool(
+                    event.metadata.get("subscription_acknowledged")
+                )
+                self.status.subscription_status = (
+                    "acknowledged" if acknowledged else "warning"
+                )
+                self.status.last_subscription_message = (
+                    _optional_text(event.metadata.get("note"))
+                    or _optional_text(event.metadata.get("warning"))
+                )
+                self.status.last_subscription_at_utc = observed_at_utc
+                continue
+            if status_kind == "error":
+                self.status.subscription_status = "error"
+                self.status.last_subscription_message = (
+                    _optional_text(event.metadata.get("warning"))
+                    or _optional_text(event.metadata.get("msg"))
+                )
+                self.status.last_subscription_at_utc = observed_at_utc
+
+    def _emit_startup_warnings(self) -> None:
+        if self._startup_warnings_emitted:
+            return
+        self._startup_warnings_emitted = True
+        for warning in self.startup_warnings:
+            cleaned = _optional_text(warning)
+            if cleaned is not None:
+                self._record_warning(cleaned)
+
 
 def _optional_text(value: object) -> str | None:
     if not isinstance(value, str):
@@ -548,6 +726,45 @@ def _non_negative_int(value: object, field_name: str) -> int:
     if coerced < 0:
         raise ValueError(f"{field_name} cannot be negative.")
     return coerced
+
+
+def _string_mapping(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        str(key): nested_value
+        for key, nested_value in value.items()
+        if isinstance(key, str) and key.strip()
+    }
+
+
+def _string_sequence(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        cleaned = _optional_text(value)
+        return (cleaned,) if cleaned is not None else ()
+    if not isinstance(value, Sequence):
+        return ()
+    values: list[str] = []
+    for item in value:
+        cleaned = _optional_text(item)
+        if cleaned is not None:
+            values.append(cleaned)
+    return tuple(values)
+
+
+def _stale_feed_diagnostic_suffix(status: LiveMarketServiceStatus) -> str:
+    details: list[str] = []
+    if status.last_raw_message_type is not None:
+        details.append(f"last_raw_message_type={status.last_raw_message_type}")
+    if status.last_accepted_message_type is not None:
+        details.append(f"last_accepted_message_type={status.last_accepted_message_type}")
+    if status.last_dropped_message_reason is not None:
+        details.append(f"last_dropped_message_reason={status.last_dropped_message_reason}")
+    if not details:
+        return ""
+    return "Diagnostics: " + "; ".join(details) + "."
 
 
 def run_live_market_service(

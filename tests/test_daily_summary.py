@@ -4,6 +4,7 @@ import csv
 from dataclasses import replace
 import json
 from datetime import date, timedelta
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ import pandas as pd
 import pytest
 
 import bot.main as main_module
+import bot.research_assembly as research_assembly_module
 from bot.config import load_app_config
 from bot.data.candidate_journal import default_candidate_score_journal_path
 from bot.data.earnings import EarningsRiskContext
@@ -41,7 +43,7 @@ from bot.data.trade_feedback import (
     load_trade_feedback_events,
 )
 from bot.data.sector_context import SectorFeatureContext, SymbolSectorClassification
-from bot.data.providers import DataProviderError
+from bot.data.providers import DataProviderError, DataProviderRequestError
 from bot.execution.interface import ExecutionBatch, ExecutionOrder
 from bot.execution.manual_executor import ManualExecutor
 from bot.execution.prioritization import (
@@ -80,6 +82,27 @@ from bot.risk.portfolio_rules import (
 from bot.risk.position_sizing import PositionSizingResult
 from bot.strategy.breakout_momentum import BreakoutStrategyPreset, build_default_breakout_presets
 from bot.strategy.signal_models import StrategySignal
+
+
+def _research_result(
+    *,
+    role_name: str,
+    operation: str,
+    value,
+    provider_name: str = "test",
+    status: str = "ok",
+    issue_code: str | None = None,
+    message: str | None = None,
+) -> research_assembly_module.ResearchDataResult:
+    return research_assembly_module.ResearchDataResult(
+        role_name=role_name,
+        operation=operation,
+        provider_name=provider_name,
+        status=status,
+        value=value,
+        issue_code=issue_code,
+        message=message,
+    )
 
 
 def test_build_daily_research_summary_ranks_approved_candidates_before_rejected() -> None:
@@ -947,6 +970,7 @@ def test_daily_research_summary_handles_empty_no_signal_days(tmp_path: Path) -> 
     assert payload["approved_candidates"] == []
     assert payload["rejected_candidates"] == []
     assert payload["current_position_count"] == 0
+    assert payload["metadata"] == {}
     assert payload["recommended_preset"] is None
     assert opportunity_rows == []
     assert preset_rows[0]["no_signal_count"] == "2"
@@ -1965,6 +1989,10 @@ def test_handle_review_portfolio_writes_position_trajectory_journal(
     assert payload["state_change_count"] == 0
     assert payload["market_state_baseline_established"] is True
     assert payload["watch_closely_count"] == 1
+    assert payload["review_input_statuses"]["position_daily_symbol_frames"]["status"] == "degraded"
+    assert "position_daily_symbol_frames" in payload["workflow_input_summary"][
+        "problematic_inputs"
+    ]
     assert Path(payload["outputs"]["portfolio_review_json"]).exists()
     assert Path(payload["outputs"]["portfolio_review_csv"]).exists()
     assert Path(payload["outputs"]["position_trajectory_journal"]).exists()
@@ -1975,9 +2003,16 @@ def test_handle_review_portfolio_writes_position_trajectory_journal(
     journal_payload = json.loads(
         Path(payload["outputs"]["position_trajectory_journal"]).read_text(encoding="utf-8")
     )
+    report_payload = json.loads(
+        Path(payload["outputs"]["portfolio_review_json"]).read_text(encoding="utf-8")
+    )
     assert journal_payload["symbols"]["AAPL"]["observations"][0]["suggested_action"] == (
         "WATCH CLOSELY"
     )
+    assert report_payload["metadata"]["review_input_statuses"]["position_daily_symbol_frames"]["status"] == "degraded"
+    assert "position_daily_symbol_frames" in report_payload["metadata"][
+        "workflow_input_summary"
+    ]["problematic_inputs"]
 
 
 def test_handle_review_portfolio_same_day_position_trajectory_is_idempotent(
@@ -2539,6 +2574,11 @@ def test_handle_review_portfolio_intraday_writes_outputs(
     assert payload["exit_candidate_count"] == 1
     assert payload["state_change_count"] == 0
     assert payload["market_state_baseline_established"] is True
+    assert payload["review_input_statuses"]["benchmark_intraday_metrics"]["status"] == "ok"
+    assert payload["review_input_statuses"]["position_daily_symbol_frames"]["status"] == "degraded"
+    assert "position_daily_symbol_frames" in payload["workflow_input_summary"][
+        "problematic_inputs"
+    ]
     assert Path(payload["outputs"]["portfolio_review_intraday_json"]).exists()
     assert Path(payload["outputs"]["portfolio_review_intraday_csv"]).exists()
     assert Path(payload["outputs"]["portfolio_review_intraday_brief"]).exists()
@@ -2547,6 +2587,13 @@ def test_handle_review_portfolio_intraday_writes_outputs(
     assert Path(payload["outputs"]["market_state_changes_json"]).exists()
     assert Path(payload["outputs"]["market_state_changes_text"]).exists()
     assert provider.refresh_values == [True, True]
+    report_payload = json.loads(
+        Path(payload["outputs"]["portfolio_review_intraday_json"]).read_text(encoding="utf-8")
+    )
+    assert report_payload["metadata"]["review_input_statuses"]["benchmark_intraday_metrics"]["status"] == "ok"
+    assert "position_daily_symbol_frames" in report_payload["metadata"][
+        "workflow_input_summary"
+    ]["problematic_inputs"]
 
 
 def test_handle_review_portfolio_intraday_same_timestamp_state_is_idempotent(
@@ -3011,18 +3058,23 @@ def test_run_daily_summary_workflow_rejects_candidate_near_earnings(
     )
     monkeypatch.setattr(
         main_module,
-        "_load_earnings_contexts",
-        lambda **kwargs: {
-            "AAPL": EarningsRiskContext(
-                symbol="AAPL",
-                earnings_date=date(2024, 1, 9),
-                earnings_days_away=2,
-                is_earnings_risk=True,
-                status="confirmed",
-                name="Q1 earnings",
-                source="polygon",
-            )
-        },
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={
+                "AAPL": EarningsRiskContext(
+                    symbol="AAPL",
+                    earnings_date=date(2024, 1, 9),
+                    earnings_days_away=2,
+                    is_earnings_risk=True,
+                    status="confirmed",
+                    name="Q1 earnings",
+                    source="polygon",
+                )
+            },
+        ),
     )
 
     class FakeProvider:
@@ -3100,25 +3152,39 @@ def test_run_daily_summary_workflow_rejects_candidate_on_weak_sector_context(
             SimpleNamespace(symbol="AAPL")
         ],
     )
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
     monkeypatch.setattr(
         main_module,
-        "_load_sector_contexts",
-        lambda **kwargs: {
-            "AAPL": SectorFeatureContext(
-                symbol="AAPL",
-                sector_name="Technology",
-                industry_name="Application software",
-                sector_etf_symbol="XLK",
-                sector_regime_passed=False,
-                sector_return=-0.04,
-                symbol_return=-0.08,
-                relative_strength_vs_sector=-0.04,
-                relative_strength_window=20,
-                sector_trend_state="weak",
-                mapping_source="test",
-            )
-        },
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={
+                "AAPL": SectorFeatureContext(
+                    symbol="AAPL",
+                    sector_name="Technology",
+                    industry_name="Application software",
+                    sector_etf_symbol="XLK",
+                    sector_regime_passed=False,
+                    sector_return=-0.04,
+                    symbol_return=-0.08,
+                    relative_strength_vs_sector=-0.04,
+                    relative_strength_window=20,
+                    sector_trend_state="weak",
+                    mapping_source="test",
+                )
+            },
+        ),
     )
 
     class FakeProvider:
@@ -3200,52 +3266,71 @@ def test_run_daily_summary_workflow_rejects_candidate_on_portfolio_heat_and_repo
             SimpleNamespace(symbol="AAPL")
         ],
     )
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
     monkeypatch.setattr(
         main_module,
-        "_load_sector_contexts",
-        lambda **kwargs: {
-            "AAPL": SectorFeatureContext(
-                symbol="AAPL",
-                sector_name="Technology",
-                industry_name="Software",
-                sector_etf_symbol="XLK",
-                sector_regime_passed=True,
-                sector_return=0.04,
-                symbol_return=0.06,
-                relative_strength_vs_sector=0.02,
-                relative_strength_window=20,
-                sector_trend_state="supportive",
-                mapping_source="test",
-            )
-        },
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
     )
     monkeypatch.setattr(
         main_module,
-        "_load_position_sector_classifications",
-        lambda *args, **kwargs: {
-            "MSFT": SymbolSectorClassification(
-                symbol="MSFT",
-                sector="Technology",
-                industry="Software",
-                sector_etf_symbol="XLK",
-                mapping_source="test",
-            ),
-            "NVDA": SymbolSectorClassification(
-                symbol="NVDA",
-                sector="Technology",
-                industry="Semiconductors",
-                sector_etf_symbol="XLK",
-                mapping_source="test",
-            ),
-            "AMD": SymbolSectorClassification(
-                symbol="AMD",
-                sector="Technology",
-                industry="Semiconductors",
-                sector_etf_symbol="XLK",
-                mapping_source="test",
-            ),
-        },
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={
+                "AAPL": SectorFeatureContext(
+                    symbol="AAPL",
+                    sector_name="Technology",
+                    industry_name="Software",
+                    sector_etf_symbol="XLK",
+                    sector_regime_passed=True,
+                    sector_return=0.04,
+                    symbol_return=0.06,
+                    relative_strength_vs_sector=0.02,
+                    relative_strength_window=20,
+                    sector_trend_state="supportive",
+                    mapping_source="test",
+                )
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_position_sector_classifications_result",
+        lambda *args, **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_position_sector_classifications",
+            provider_name="polygon",
+            value={
+                "MSFT": SymbolSectorClassification(
+                    symbol="MSFT",
+                    sector="Technology",
+                    industry="Software",
+                    sector_etf_symbol="XLK",
+                    mapping_source="test",
+                ),
+                "NVDA": SymbolSectorClassification(
+                    symbol="NVDA",
+                    sector="Technology",
+                    industry="Semiconductors",
+                    sector_etf_symbol="XLK",
+                    mapping_source="test",
+                ),
+                "AMD": SymbolSectorClassification(
+                    symbol="AMD",
+                    sector="Technology",
+                    industry="Semiconductors",
+                    sector_etf_symbol="XLK",
+                    mapping_source="test",
+                ),
+            },
+        ),
     )
 
     class FakeProvider:
@@ -3346,52 +3431,71 @@ def test_run_daily_summary_workflow_serializes_projected_portfolio_heat_metadata
             SimpleNamespace(symbol="AAPL")
         ],
     )
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
     monkeypatch.setattr(
         main_module,
-        "_load_sector_contexts",
-        lambda **kwargs: {
-            "AAPL": SectorFeatureContext(
-                symbol="AAPL",
-                sector_name="Technology",
-                industry_name="Software",
-                sector_etf_symbol="XLK",
-                sector_regime_passed=True,
-                sector_return=0.03,
-                symbol_return=0.05,
-                relative_strength_vs_sector=0.02,
-                relative_strength_window=20,
-                sector_trend_state="supportive",
-                mapping_source="test",
-            )
-        },
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
     )
     monkeypatch.setattr(
         main_module,
-        "_load_position_sector_classifications",
-        lambda *args, **kwargs: {
-            "MSFT": SymbolSectorClassification(
-                symbol="MSFT",
-                sector="Technology",
-                industry="Software",
-                sector_etf_symbol="XLK",
-                mapping_source="test",
-            ),
-            "NVDA": SymbolSectorClassification(
-                symbol="NVDA",
-                sector="Technology",
-                industry="Semiconductors",
-                sector_etf_symbol="XLK",
-                mapping_source="test",
-            ),
-            "JPM": SymbolSectorClassification(
-                symbol="JPM",
-                sector="Financials",
-                industry="Banks",
-                sector_etf_symbol="XLF",
-                mapping_source="test",
-            ),
-        },
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={
+                "AAPL": SectorFeatureContext(
+                    symbol="AAPL",
+                    sector_name="Technology",
+                    industry_name="Software",
+                    sector_etf_symbol="XLK",
+                    sector_regime_passed=True,
+                    sector_return=0.03,
+                    symbol_return=0.05,
+                    relative_strength_vs_sector=0.02,
+                    relative_strength_window=20,
+                    sector_trend_state="supportive",
+                    mapping_source="test",
+                )
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_position_sector_classifications_result",
+        lambda *args, **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_position_sector_classifications",
+            provider_name="polygon",
+            value={
+                "MSFT": SymbolSectorClassification(
+                    symbol="MSFT",
+                    sector="Technology",
+                    industry="Software",
+                    sector_etf_symbol="XLK",
+                    mapping_source="test",
+                ),
+                "NVDA": SymbolSectorClassification(
+                    symbol="NVDA",
+                    sector="Technology",
+                    industry="Semiconductors",
+                    sector_etf_symbol="XLK",
+                    mapping_source="test",
+                ),
+                "JPM": SymbolSectorClassification(
+                    symbol="JPM",
+                    sector="Financials",
+                    industry="Banks",
+                    sector_etf_symbol="XLF",
+                    mapping_source="test",
+                ),
+            },
+        ),
     )
     monkeypatch.setattr(
         main_module,
@@ -3404,14 +3508,19 @@ def test_run_daily_summary_workflow_serializes_projected_portfolio_heat_metadata
     )
     monkeypatch.setattr(
         main_module,
-        "_load_volatility_context",
-        lambda **kwargs: {
-            "vix_close": 20.0,
-            "vix_sma_short": 19.5,
-            "vix_sma_long": 18.8,
-            "volatility_regime_state": "calm",
-            "volatility_regime_risk_off": False,
-        },
+        "_load_volatility_context_result",
+        lambda **kwargs: _research_result(
+            role_name="historical_bars",
+            operation="load_volatility_context",
+            provider_name="alpaca",
+            value={
+                "vix_close": 20.0,
+                "vix_sma_short": 19.5,
+                "vix_sma_long": 18.8,
+                "volatility_regime_state": "calm",
+                "volatility_regime_risk_off": False,
+            },
+        ),
     )
 
     class FakeProvider:
@@ -3491,8 +3600,26 @@ def test_run_daily_summary_workflow_warns_and_proceeds_without_sector_context(
             SimpleNamespace(symbol="AAPL")
         ],
     )
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
 
     class FakeProvider:
         def fetch_daily_bars(
@@ -3567,8 +3694,26 @@ def test_run_daily_summary_workflow_updates_candidate_score_journal_across_days(
             SimpleNamespace(symbol="AAPL")
         ],
     )
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
 
     class FakeProvider:
         def fetch_daily_bars(
@@ -3643,6 +3788,154 @@ def test_run_daily_summary_workflow_updates_candidate_score_journal_across_days(
     assert "setup=high-confidence repeat signal, persisted for 2 sessions, approved on 2 sessions" in second_summary["approved_candidates"][0]["rationale"]
 
 
+def test_load_earnings_contexts_degrades_entitlement_failures_with_clear_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = replace(load_app_config(), project_root=tmp_path)
+    monkeypatch.setattr(
+        research_assembly_module,
+        "create_earnings_calendar_provider",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            DataProviderRequestError(
+                'polygon request failed with HTTP 403: {"status":"NOT_AUTHORIZED","error":"You are not entitled to this data"}'
+            )
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        contexts = main_module._load_earnings_contexts(
+            config=config,
+            env_file=None,
+            provider=None,
+            symbols=["AAPL", "MSFT"],
+            as_of_date=date(2024, 1, 5),
+            earnings_watch_days=7,
+            refresh_cache=False,
+            log_label="daily-summary",
+        )
+
+    assert contexts == {}
+    assert "not entitled to earnings-calendar data" in caplog.text
+    assert "continuing without earnings gate" in caplog.text
+
+
+def test_run_daily_summary_workflow_warns_and_proceeds_without_benchmark_context(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = load_app_config()
+    args = build_parser().parse_args(
+        [
+            "daily-summary",
+            "data/raw/candidate_symbols.txt",
+            "--as-of",
+            "2024-01-05",
+        ]
+    )
+
+    monkeypatch.setattr(
+        main_module.UniverseBuilder,
+        "screen_candidates",
+        lambda self, candidate_path, *, as_of_date, lookback_days, refresh_cache, enforce_max_symbols=True: [
+            SimpleNamespace(symbol="AAPL")
+        ],
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+
+    class FakeProvider:
+        def fetch_daily_bars(
+            self,
+            symbol: str,
+            start_date: date,
+            end_date: date,
+            *,
+            refresh_cache: bool = False,
+        ) -> pd.DataFrame:
+            if symbol == config.strategy.signals.benchmark_symbol:
+                raise DataProviderError("polygon request timed out: simulated timeout")
+            return pd.DataFrame(
+                {
+                    "date": pd.to_datetime(["2024-01-05"]),
+                    "open": [100.0],
+                    "high": [101.0],
+                    "low": [99.0],
+                    "close": [100.5],
+                    "volume": [1_000_000.0],
+                    "symbol": [symbol],
+                }
+            )
+
+    observed: dict[str, object] = {}
+
+    def fake_generate_breakout_signal(
+        bars: pd.DataFrame,
+        *,
+        settings,
+        benchmark_frame,
+        has_open_position: bool,
+        symbol: str,
+    ) -> StrategySignal:
+        observed["enable_regime_filter"] = settings.enable_regime_filter
+        observed["benchmark_frame"] = benchmark_frame
+        return StrategySignal(
+            strategy_name="breakout_momentum",
+            symbol=symbol,
+            date=date(2024, 1, 5),
+            side="BUY",
+            entry_reason="close_above_prior_20_day_high",
+            entry_price_hint=101.0,
+            stop_hint=96.0,
+            metadata={"prior_high": 100.0, "relative_volume": 1.8},
+        )
+
+    monkeypatch.setattr(
+        main_module,
+        "generate_breakout_signal",
+        fake_generate_breakout_signal,
+    )
+
+    with caplog.at_level("WARNING"):
+        workflow = main_module._run_daily_summary_workflow(
+            args,
+            config=config,
+            provider=FakeProvider(),
+            current_positions=[],
+        )
+
+    payload = workflow["summary"].to_dict()
+
+    assert payload["approved_count"] == 1
+    assert payload["rejected_count"] == 0
+    assert observed["enable_regime_filter"] is False
+    assert observed["benchmark_frame"] is None
+    assert (
+        "Benchmark context unavailable for daily-summary because regime symbol "
+        in caplog.text
+    )
+    assert "proceeding without regime filter" in caplog.text
+
+
 def test_run_daily_summary_workflow_ignores_corrupt_candidate_score_journal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3669,8 +3962,26 @@ def test_run_daily_summary_workflow_ignores_corrupt_candidate_score_journal(
             SimpleNamespace(symbol="AAPL")
         ],
     )
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
 
     class FakeProvider:
         def fetch_daily_bars(
@@ -3854,8 +4165,26 @@ def test_handle_generate_orders_blocks_candidate_on_weak_market_breadth(
 
     monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
     monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
     monkeypatch.setattr(
         main_module,
         "compute_market_breadth_from_frames",
@@ -3940,18 +4269,41 @@ def test_handle_generate_orders_blocks_candidate_on_stressed_volatility_regime(
 
     monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
     monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
     monkeypatch.setattr(
         main_module,
-        "_load_volatility_context",
-        lambda **kwargs: {
-            "vix_close": 33.4,
-            "vix_sma_short": 31.0,
-            "vix_sma_long": 26.2,
-            "volatility_regime_state": "stressed",
-            "volatility_regime_risk_off": True,
-        },
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context_result",
+        lambda **kwargs: _research_result(
+            role_name="historical_bars",
+            operation="load_volatility_context",
+            provider_name="alpaca",
+            value={
+                "vix_close": 33.4,
+                "vix_sma_short": 31.0,
+                "vix_sma_long": 26.2,
+                "volatility_regime_state": "stressed",
+                "volatility_regime_risk_off": True,
+            },
+        ),
     )
     monkeypatch.setattr(
         main_module,
@@ -4031,15 +4383,20 @@ def test_handle_generate_orders_blocks_candidate_near_earnings(
     monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
     monkeypatch.setattr(
         main_module,
-        "_load_earnings_contexts",
-        lambda **kwargs: {
-            "AAPL": EarningsRiskContext(
-                symbol="AAPL",
-                earnings_date=date(2024, 1, 9),
-                earnings_days_away=2,
-                is_earnings_risk=True,
-            )
-        },
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={
+                "AAPL": EarningsRiskContext(
+                    symbol="AAPL",
+                    earnings_date=date(2024, 1, 9),
+                    earnings_days_away=2,
+                    is_earnings_risk=True,
+                )
+            },
+        ),
     )
     monkeypatch.setattr(
         main_module,
@@ -4122,58 +4479,77 @@ def test_handle_generate_orders_rolls_forward_approved_sector_exposure_between_c
 
     monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
     monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: current_positions)
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
     monkeypatch.setattr(
         main_module,
-        "_load_sector_contexts",
-        lambda **kwargs: {
-            "AAPL": SectorFeatureContext(
-                symbol="AAPL",
-                sector_name="Technology",
-                industry_name="Software",
-                sector_etf_symbol="XLK",
-                sector_regime_passed=True,
-                sector_return=0.03,
-                symbol_return=0.05,
-                relative_strength_vs_sector=0.02,
-                relative_strength_window=20,
-                sector_trend_state="supportive",
-                mapping_source="test",
-            ),
-            "SNOW": SectorFeatureContext(
-                symbol="SNOW",
-                sector_name="Technology",
-                industry_name="Semiconductors",
-                sector_etf_symbol="XLK",
-                sector_regime_passed=True,
-                sector_return=0.03,
-                symbol_return=0.05,
-                relative_strength_vs_sector=0.02,
-                relative_strength_window=20,
-                sector_trend_state="supportive",
-                mapping_source="test",
-            ),
-        },
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
     )
     monkeypatch.setattr(
         main_module,
-        "_load_position_sector_classifications",
-        lambda *args, **kwargs: {
-            "MSFT": SymbolSectorClassification(
-                symbol="MSFT",
-                sector="Technology",
-                industry="Software",
-                sector_etf_symbol="XLK",
-                mapping_source="test",
-            ),
-            "NVDA": SymbolSectorClassification(
-                symbol="NVDA",
-                sector="Technology",
-                industry="Semiconductors",
-                sector_etf_symbol="XLK",
-                mapping_source="test",
-            ),
-        },
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={
+                "AAPL": SectorFeatureContext(
+                    symbol="AAPL",
+                    sector_name="Technology",
+                    industry_name="Software",
+                    sector_etf_symbol="XLK",
+                    sector_regime_passed=True,
+                    sector_return=0.03,
+                    symbol_return=0.05,
+                    relative_strength_vs_sector=0.02,
+                    relative_strength_window=20,
+                    sector_trend_state="supportive",
+                    mapping_source="test",
+                ),
+                "SNOW": SectorFeatureContext(
+                    symbol="SNOW",
+                    sector_name="Technology",
+                    industry_name="Semiconductors",
+                    sector_etf_symbol="XLK",
+                    sector_regime_passed=True,
+                    sector_return=0.03,
+                    symbol_return=0.05,
+                    relative_strength_vs_sector=0.02,
+                    relative_strength_window=20,
+                    sector_trend_state="supportive",
+                    mapping_source="test",
+                ),
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_position_sector_classifications_result",
+        lambda *args, **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_position_sector_classifications",
+            provider_name="polygon",
+            value={
+                "MSFT": SymbolSectorClassification(
+                    symbol="MSFT",
+                    sector="Technology",
+                    industry="Software",
+                    sector_etf_symbol="XLK",
+                    mapping_source="test",
+                ),
+                "NVDA": SymbolSectorClassification(
+                    symbol="NVDA",
+                    sector="Technology",
+                    industry="Semiconductors",
+                    sector_etf_symbol="XLK",
+                    mapping_source="test",
+                ),
+            },
+        ),
     )
     monkeypatch.setattr(
         main_module,
@@ -4186,14 +4562,19 @@ def test_handle_generate_orders_rolls_forward_approved_sector_exposure_between_c
     )
     monkeypatch.setattr(
         main_module,
-        "_load_volatility_context",
-        lambda **kwargs: {
-            "vix_close": 20.0,
-            "vix_sma_short": 19.5,
-            "vix_sma_long": 18.8,
-            "volatility_regime_state": "calm",
-            "volatility_regime_risk_off": False,
-        },
+        "_load_volatility_context_result",
+        lambda **kwargs: _research_result(
+            role_name="historical_bars",
+            operation="load_volatility_context",
+            provider_name="alpaca",
+            value={
+                "vix_close": 20.0,
+                "vix_sma_short": 19.5,
+                "vix_sma_long": 18.8,
+                "volatility_regime_state": "calm",
+                "volatility_regime_risk_off": False,
+            },
+        ),
     )
     monkeypatch.setattr(
         main_module,
@@ -4294,8 +4675,26 @@ def test_handle_generate_orders_accounts_for_pending_order_capacity(
     monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
     monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: current_positions)
     monkeypatch.setattr(main_module, "_load_pending_order_state", lambda project_root: pending_order_state)
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
     monkeypatch.setattr(
         main_module,
         "compute_market_breadth_from_frames",
@@ -4307,14 +4706,19 @@ def test_handle_generate_orders_accounts_for_pending_order_capacity(
     )
     monkeypatch.setattr(
         main_module,
-        "_load_volatility_context",
-        lambda **kwargs: {
-            "vix_close": 18.0,
-            "vix_sma_short": 17.8,
-            "vix_sma_long": 18.2,
-            "volatility_regime_state": "calm",
-            "volatility_regime_risk_off": False,
-        },
+        "_load_volatility_context_result",
+        lambda **kwargs: _research_result(
+            role_name="historical_bars",
+            operation="load_volatility_context",
+            provider_name="alpaca",
+            value={
+                "vix_close": 18.0,
+                "vix_sma_short": 17.8,
+                "vix_sma_long": 18.2,
+                "volatility_regime_state": "calm",
+                "volatility_regime_risk_off": False,
+            },
+        ),
     )
     monkeypatch.setattr(
         main_module,
@@ -4416,8 +4820,26 @@ def test_handle_generate_orders_can_stage_pending_orders_for_later_capacity_chec
         "_load_current_positions",
         lambda portfolio_file: current_positions,
     )
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
     monkeypatch.setattr(
         main_module,
         "compute_market_breadth_from_frames",
@@ -4429,14 +4851,19 @@ def test_handle_generate_orders_can_stage_pending_orders_for_later_capacity_chec
     )
     monkeypatch.setattr(
         main_module,
-        "_load_volatility_context",
-        lambda **kwargs: {
-            "vix_close": 18.0,
-            "vix_sma_short": 17.8,
-            "vix_sma_long": 18.2,
-            "volatility_regime_state": "calm",
-            "volatility_regime_risk_off": False,
-        },
+        "_load_volatility_context_result",
+        lambda **kwargs: _research_result(
+            role_name="historical_bars",
+            operation="load_volatility_context",
+            provider_name="alpaca",
+            value={
+                "vix_close": 18.0,
+                "vix_sma_short": 17.8,
+                "vix_sma_long": 18.2,
+                "volatility_regime_state": "calm",
+                "volatility_regime_risk_off": False,
+            },
+        ),
     )
     monkeypatch.setattr(main_module, "generate_breakout_signal", fake_breakout_signal)
 
@@ -4631,6 +5058,36 @@ def test_handle_daily_summary_uses_workflow_universe_count(
         benchmark_symbol="SPY",
         preset_selection_source="named_presets",
         current_positions=[],
+        metadata={
+            "research_input_statuses": {
+                "benchmark": {"status": "ok"},
+                "volatility_context": {
+                    "status": "unavailable",
+                    "issue_code": "unsupported_capability",
+                },
+            },
+            "workflow_input_summary": {
+                "total_count": 2,
+                "ok_count": 1,
+                "degraded_count": 0,
+                "unavailable_count": 1,
+                "failed_count": 0,
+                "issue_count": 1,
+                "healthy": False,
+                "problematic_inputs": ["volatility_context"],
+                "issue_codes": ["unsupported_capability"],
+                "issues": [
+                    {
+                        "input_name": "volatility_context",
+                        "status": "unavailable",
+                        "role_name": None,
+                        "provider": None,
+                        "issue_code": "unsupported_capability",
+                        "message": None,
+                    }
+                ],
+            },
+        },
     )
 
     monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: SimpleNamespace(project_root=tmp_path, data_sources=SimpleNamespace(provider="polygon")))
@@ -4657,6 +5114,8 @@ def test_handle_daily_summary_uses_workflow_universe_count(
             "current_equity": 100_000.0,
             "execution_batch": ManualExecutor().build_execution_batch([], as_of_date=date(2024, 1, 5)),
             "ranked_evaluations": [],
+            "research_input_statuses": summary.metadata["research_input_statuses"],
+            "workflow_input_summary": summary.metadata["workflow_input_summary"],
         }
 
     monkeypatch.setattr(
@@ -4692,8 +5151,13 @@ def test_handle_daily_summary_uses_workflow_universe_count(
     assert payload["universe_count"] == 105
     assert payload["current_position_count"] == 1
     assert payload["current_position_symbols"] == ["AAPL"]
+    assert payload["workflow_input_summary"]["unavailable_count"] == 1
     assert Path(payload["outputs"]["daily_summary_json"]).exists()
     assert Path(payload["outputs"]["daily_summary_brief"]).exists()
+    daily_summary_payload = json.loads(
+        Path(payload["outputs"]["daily_summary_json"]).read_text(encoding="utf-8")
+    )
+    assert daily_summary_payload["metadata"]["workflow_input_summary"]["issue_count"] == 1
 
 
 def test_handle_daily_summary_writes_trade_decision_log(
@@ -4767,12 +5231,49 @@ def test_handle_daily_summary_writes_trade_decision_log(
     log_path = Path(payload["outputs"]["trade_decision_log"])
     events = load_trade_feedback_events(log_path)
 
+    assert payload["provider"] == "alpaca"
+    assert payload["historical_provider"] == "alpaca"
+    assert payload["reference_provider"] == "polygon"
+    assert payload["earnings_provider"] == "polygon"
+    assert payload["stream_provider"] == "alpaca"
+    assert payload["execution_broker"] == "alpaca"
+    assert payload["broker_update_stream_provider"] is None
     assert log_path == default_trade_feedback_log_path(tmp_path)
     assert len(events) == 1
     assert events[0].workflow == "daily-summary"
     assert events[0].symbol == "AAPL"
     assert events[0].approved is True
     assert events[0].decision_id is not None
+
+
+def test_load_volatility_context_warns_cleanly_when_historical_provider_lacks_vix_support(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class AlpacaHistoricalProvider:
+        provider_name = "alpaca"
+        capabilities = SimpleNamespace(supports_vix_symbols=False)
+
+        def fetch_daily_bars(self, *args, **kwargs):  # pragma: no cover - should not be called
+            raise AssertionError("volatility fetch should be skipped for Alpaca historical bars")
+
+    with caplog.at_level(logging.WARNING):
+        context = main_module._load_volatility_context(
+            provider=AlpacaHistoricalProvider(),
+            as_of_date=date(2024, 1, 5),
+            vix_caution_threshold=25.0,
+            vix_entry_block_threshold=30.0,
+            refresh_cache=False,
+            log_label="daily-summary",
+        )
+
+    assert context == {
+        "vix_close": None,
+        "vix_sma_short": None,
+        "vix_sma_long": None,
+        "volatility_regime_state": None,
+        "volatility_regime_risk_off": None,
+    }
+    assert "does not support VIX/index-style symbols" in caplog.text
 
 
 def test_handle_review_portfolio_writes_trade_decision_and_outcome_log(
@@ -5290,8 +5791,26 @@ def test_handle_generate_orders_writes_trade_decision_log(
     monkeypatch.setattr(main_module, "load_app_config", lambda config_dir: config)
     monkeypatch.setattr(main_module, "create_daily_bar_provider", lambda config, env_file: FakeProvider())
     monkeypatch.setattr(main_module, "_load_current_positions", lambda portfolio_file: [])
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
+    monkeypatch.setattr(
+        main_module,
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
     monkeypatch.setattr(
         main_module,
         "compute_market_breadth_from_frames",
@@ -5303,14 +5822,19 @@ def test_handle_generate_orders_writes_trade_decision_log(
     )
     monkeypatch.setattr(
         main_module,
-        "_load_volatility_context",
-        lambda **kwargs: {
-            "vix_close": None,
-            "vix_sma_short": None,
-            "vix_sma_long": None,
-            "volatility_regime_state": None,
-            "volatility_regime_risk_off": None,
-        },
+        "_load_volatility_context_result",
+        lambda **kwargs: _research_result(
+            role_name="historical_bars",
+            operation="load_volatility_context",
+            provider_name="alpaca",
+            value={
+                "vix_close": None,
+                "vix_sma_short": None,
+                "vix_sma_long": None,
+                "volatility_regime_state": None,
+                "volatility_regime_risk_off": None,
+            },
+        ),
     )
     monkeypatch.setattr(
         main_module,
@@ -6099,18 +6623,41 @@ def test_run_daily_summary_workflow_includes_elevated_volatility_in_rationale(
             SimpleNamespace(symbol="AAPL")
         ],
     )
-    monkeypatch.setattr(main_module, "_load_earnings_contexts", lambda **kwargs: {})
-    monkeypatch.setattr(main_module, "_load_sector_contexts", lambda **kwargs: {})
     monkeypatch.setattr(
         main_module,
-        "_load_volatility_context",
-        lambda **kwargs: {
-            "vix_close": 26.4,
-            "vix_sma_short": 25.1,
-            "vix_sma_long": 21.7,
-            "volatility_regime_state": "elevated",
-            "volatility_regime_risk_off": False,
-        },
+        "_load_earnings_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="earnings_calendar",
+            operation="load_earnings_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_sector_contexts_result",
+        lambda **kwargs: _research_result(
+            role_name="reference_data",
+            operation="load_sector_contexts",
+            provider_name="polygon",
+            value={},
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_load_volatility_context_result",
+        lambda **kwargs: _research_result(
+            role_name="historical_bars",
+            operation="load_volatility_context",
+            provider_name="alpaca",
+            value={
+                "vix_close": 26.4,
+                "vix_sma_short": 25.1,
+                "vix_sma_long": 21.7,
+                "volatility_regime_state": "elevated",
+                "volatility_regime_risk_off": False,
+            },
+        ),
     )
 
     class FakeProvider:

@@ -217,6 +217,11 @@ def test_dashboard_app_asset_references_internal_api_endpoints() -> None:
     assert "setPanelUnavailable" in javascript
     assert "snapshot.top_rejected_reasons_summary" in javascript
     assert "data.top_rejected_reasons_summary" not in javascript
+    assert "function workflowOverviewStatusLabel(status)" in javascript
+    assert "function renderWorkflowInputOverviewBlock(" in javascript
+    assert "recommendationState.workflow_input_overview" in javascript
+    assert "data.workflow_input_overview" in javascript
+    assert "Recommendation input health" in javascript
 
 
 def test_dashboard_app_asset_wires_control_client_and_refresh_after_actions() -> None:
@@ -300,6 +305,151 @@ def test_dashboard_app_asset_renders_replace_editor_form_and_force_sync_control(
     assert "Require live confirm" in javascript
     assert 'action: "submit-replace-order"' in javascript
     assert "Only changed fields will be sent to the backend replacement request." in javascript
+
+
+def test_dashboard_runtime_renders_workflow_input_overview_blocks(
+    tmp_path: Path,
+) -> None:
+    _run_dashboard_app_runtime_test(
+        tmp_path,
+        test_body="""
+        state.currentResults = {
+          health: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          marketState: {
+            ok: true,
+            payload: {
+              available: true,
+              warnings: [],
+              data: {
+                snapshot: {
+                  as_of_timestamp: "2024-01-05T15:00:00+00:00",
+                  source_workflows: ["monitor-market", "review-portfolio"],
+                },
+                current_alertable_states: [],
+                recent_transitions: [],
+                recommendation_state: {
+                  workflow_input_overview: {
+                    workflow_count: 2,
+                    healthy_workflow_count: 1,
+                    degraded_workflow_count: 0,
+                    unavailable_workflow_count: 1,
+                    failed_workflow_count: 0,
+                    problematic_workflow_count: 1,
+                    highest_severity: "unavailable",
+                    problematic_workflows: [
+                      {
+                        workflow_name: "daily_summary",
+                        status: "unavailable",
+                        issue_count: 1,
+                        issue_codes: ["unsupported_capability"],
+                        problematic_inputs: ["volatility_context"],
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+          marketTransitions: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          portfolio: {
+            ok: true,
+            payload: {
+              available: true,
+              warnings: [],
+              data: {
+                portfolio_review_summary: {
+                  position_count: 3,
+                  hold_count: 1,
+                  watch_closely_count: 1,
+                  exit_candidate_count: 1,
+                  raise_stop_count: 0,
+                },
+                intraday_review_summary: {
+                  watch_closely_count: 1,
+                },
+                current_action_states: [
+                  { symbol: "AAPL", action: "HOLD" },
+                  { symbol: "MSFT", action: "WATCH CLOSELY" },
+                ],
+                watch_closely: ["MSFT"],
+                exit_candidates: ["NVDA"],
+                raise_stop: [],
+                workflow_input_overview: {
+                  workflow_count: 2,
+                  healthy_workflow_count: 0,
+                  degraded_workflow_count: 2,
+                  unavailable_workflow_count: 0,
+                  failed_workflow_count: 0,
+                  problematic_workflow_count: 2,
+                  highest_severity: "degraded",
+                  problematic_workflows: [
+                    {
+                      workflow_name: "portfolio_review",
+                      status: "degraded",
+                      issue_count: 1,
+                      issue_codes: ["partial_symbol_frames"],
+                      problematic_inputs: ["position_daily_symbol_frames"],
+                    },
+                    {
+                      workflow_name: "intraday_review",
+                      status: "degraded",
+                      issue_count: 1,
+                      issue_codes: ["partial_symbol_frames"],
+                      problematic_inputs: ["position_daily_symbol_frames"],
+                    },
+                  ],
+                },
+              },
+            },
+          },
+          analytics: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          controlSafety: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          pendingOrders: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+        };
+
+        renderCurrentDashboard();
+
+        if (!els.marketStateBody.innerHTML.includes("Workflow input health")) {
+          throw new Error(`Expected workflow input health block in market-state panel: ${els.marketStateBody.innerHTML}`);
+        }
+        if (!els.marketStateBody.innerHTML.includes("daily_summary | Unavailable")) {
+          throw new Error(`Expected daily_summary details in market-state panel: ${els.marketStateBody.innerHTML}`);
+        }
+        if (!els.marketStateBody.innerHTML.includes("Unavailable highest severity")) {
+          throw new Error(`Expected unavailable severity wording in market-state panel: ${els.marketStateBody.innerHTML}`);
+        }
+        if (!els.portfolioStateBody.innerHTML.includes("Review input health")) {
+          throw new Error(`Expected review input health block in portfolio panel: ${els.portfolioStateBody.innerHTML}`);
+        }
+        if (!els.portfolioStateBody.innerHTML.includes("portfolio_review | Degraded")) {
+          throw new Error(`Expected portfolio_review details in portfolio panel: ${els.portfolioStateBody.innerHTML}`);
+        }
+        if (!els.portfolioStateBody.innerHTML.includes("intraday_review | Degraded")) {
+          throw new Error(`Expected intraday_review details in portfolio panel: ${els.portfolioStateBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Recommendation input health")) {
+          throw new Error(`Expected recommendation input health block in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("daily_summary | Unavailable")) {
+          throw new Error(`Expected daily_summary details in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        """,
+    )
 
 
 def test_dashboard_asset_for_path_serves_stylesheet() -> None:

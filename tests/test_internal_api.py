@@ -60,8 +60,36 @@ def test_internal_api_market_state_reports_fresh_recommendation_state_when_queue
     query_service = InternalApiQueryService(project_root=tmp_path)
     _write_market_state_snapshots(tmp_path)
     write_json_file(
-        tmp_path / "data" / "processed" / "monitor_market" / "2024-01-05" / "market_monitor.json",
+        tmp_path / "data" / "processed" / "live_market" / "2024-01-05" / "market_monitor.json",
         {"as_of_date": "2024-01-05"},
+    )
+    write_json_file(
+        tmp_path / "data" / "processed" / "live_market" / "2024-01-05" / "daily_summary.json",
+        {
+            "metadata": {
+                "workflow_input_summary": {
+                    "total_count": 2,
+                    "ok_count": 1,
+                    "degraded_count": 0,
+                    "unavailable_count": 1,
+                    "failed_count": 0,
+                    "issue_count": 1,
+                    "healthy": False,
+                    "problematic_inputs": ["volatility_context"],
+                    "issue_codes": ["unsupported_capability"],
+                    "issues": [
+                        {
+                            "input_name": "volatility_context",
+                            "status": "unavailable",
+                            "role_name": "historical_bars",
+                            "provider": "alpaca",
+                            "issue_code": "unsupported_capability",
+                            "message": "VIX symbols are not supported.",
+                        }
+                    ],
+                }
+            }
+        },
     )
 
     payload = query_service.market_state()
@@ -72,6 +100,14 @@ def test_internal_api_market_state_reports_fresh_recommendation_state_when_queue
     assert recommendation_state["empty_reasons"] == []
     assert recommendation_state["latest_successful_monitor_market_as_of_date"] == "2024-01-05"
     assert recommendation_state["monitor_market_fresh_for_snapshot_date"] is True
+    assert recommendation_state["workflow_input_overview"]["workflow_count"] == 1
+    assert recommendation_state["workflow_input_overview"]["highest_severity"] == "unavailable"
+    assert (
+        recommendation_state["workflow_input_summaries"]["daily_summary"][
+            "unavailable_count"
+        ]
+        == 1
+    )
 
 
 def test_internal_api_market_state_surfaces_empty_queue_reasons_and_stale_monitor_market_output(
@@ -138,6 +174,48 @@ def test_internal_api_market_state_surfaces_empty_queue_reasons_and_stale_monito
     )
 
 
+def test_internal_api_market_state_falls_back_to_raw_statuses_for_workflow_input_summary(
+    tmp_path: Path,
+) -> None:
+    query_service = InternalApiQueryService(project_root=tmp_path)
+    _write_market_state_snapshots(tmp_path)
+    write_json_file(
+        tmp_path / "data" / "processed" / "monitor_market" / "2024-01-05" / "market_monitor.json",
+        {"as_of_date": "2024-01-05"},
+    )
+    write_json_file(
+        tmp_path / "data" / "processed" / "monitor_market" / "2024-01-05" / "daily_summary.json",
+        {
+            "metadata": {
+                "research_input_statuses": {
+                    "benchmark": {"status": "ok"},
+                    "earnings_contexts": {
+                        "status": "degraded",
+                        "issue_code": "entitlement_limited",
+                    },
+                }
+            }
+        },
+    )
+
+    payload = query_service.market_state()
+    recommendation_state = payload["data"]["recommendation_state"]
+
+    assert (
+        recommendation_state["workflow_input_summaries"]["daily_summary"][
+            "degraded_count"
+        ]
+        == 1
+    )
+    assert (
+        recommendation_state["workflow_input_summaries"]["daily_summary"][
+            "issue_codes"
+        ]
+        == ["entitlement_limited"]
+    )
+    assert recommendation_state["workflow_input_overview"]["problematic_workflow_count"] == 1
+
+
 def test_internal_api_market_state_degrades_cleanly_when_missing_or_malformed(
     tmp_path: Path,
 ) -> None:
@@ -171,6 +249,35 @@ def test_internal_api_health_reports_defaults_and_persisted_status(
             service_state="connected",
             connected=True,
             cycle_count=3,
+            raw_message_count=12,
+            accepted_message_count=9,
+            last_raw_message_at_utc="2024-01-05T15:05:30+00:00",
+            last_accepted_message_at_utc="2024-01-05T15:05:00+00:00",
+            last_raw_message_type="b",
+            last_accepted_message_type="quote_bar_batch_refresh",
+            stream_provider="alpaca",
+            historical_provider="polygon",
+            reference_provider="polygon",
+            earnings_provider="polygon",
+            execution_broker="alpaca",
+            broker_update_stream_provider=None,
+            provider_roles={
+                "stream_market_data": {
+                    "provider": "alpaca",
+                    "configured": True,
+                    "available": True,
+                },
+                "historical_bars": {
+                    "provider": "polygon",
+                    "configured": True,
+                    "available": True,
+                    "degraded": True,
+                },
+            },
+            degraded_provider_roles=("historical_bars",),
+            unavailable_provider_roles=(),
+            subscription_status="acknowledged",
+            last_subscription_message="alpaca websocket subscription acknowledged: bars=3",
             last_successful_flush_at_utc="2024-01-05T15:05:00+00:00",
         ),
         updated_at_utc="2024-01-05T15:06:00+00:00",
@@ -181,6 +288,30 @@ def test_internal_api_health_reports_defaults_and_persisted_status(
     assert persisted_payload["data"]["updated_at_utc"] == "2024-01-05T15:06:00+00:00"
     assert persisted_payload["data"]["status"]["connected"] is True
     assert persisted_payload["data"]["status"]["cycle_count"] == 3
+    assert persisted_payload["data"]["status"]["raw_message_count"] == 12
+    assert persisted_payload["data"]["status"]["accepted_message_count"] == 9
+    assert persisted_payload["data"]["status"]["last_raw_message_type"] == "b"
+    assert (
+        persisted_payload["data"]["status"]["last_accepted_message_type"]
+        == "quote_bar_batch_refresh"
+    )
+    assert persisted_payload["data"]["status"]["stream_provider"] == "alpaca"
+    assert persisted_payload["data"]["status"]["historical_provider"] == "polygon"
+    assert persisted_payload["data"]["status"]["reference_provider"] == "polygon"
+    assert persisted_payload["data"]["status"]["earnings_provider"] == "polygon"
+    assert persisted_payload["data"]["status"]["execution_broker"] == "alpaca"
+    assert persisted_payload["data"]["status"]["broker_update_stream_provider"] is None
+    assert (
+        persisted_payload["data"]["status"]["provider_roles"]["stream_market_data"][
+            "provider"
+        ]
+        == "alpaca"
+    )
+    assert persisted_payload["data"]["status"]["degraded_provider_roles"] == [
+        "historical_bars"
+    ]
+    assert persisted_payload["data"]["status"]["unavailable_provider_roles"] == []
+    assert persisted_payload["data"]["status"]["subscription_status"] == "acknowledged"
 
 
 def test_internal_api_pending_orders_returns_current_summary(
@@ -484,6 +615,53 @@ def test_internal_api_portfolio_returns_current_review_state(
     tmp_path: Path,
 ) -> None:
     _write_market_state_snapshots(tmp_path)
+    write_json_file(
+        tmp_path / "data" / "processed" / "portfolio_review" / "2024-01-05" / "portfolio_review.json",
+        {
+            "metadata": {
+                "review_input_statuses": {
+                    "benchmark": {"status": "ok"},
+                    "position_daily_symbol_frames": {
+                        "status": "degraded",
+                        "issue_code": "partial_symbol_frames",
+                    },
+                }
+            }
+        },
+    )
+    write_json_file(
+        tmp_path
+        / "data"
+        / "processed"
+        / "portfolio_review_intraday"
+        / "2024-01-05"
+        / "portfolio_review_intraday.json",
+        {
+            "metadata": {
+                "workflow_input_summary": {
+                    "total_count": 2,
+                    "ok_count": 1,
+                    "degraded_count": 1,
+                    "unavailable_count": 0,
+                    "failed_count": 0,
+                    "issue_count": 1,
+                    "healthy": False,
+                    "problematic_inputs": ["position_daily_symbol_frames"],
+                    "issue_codes": ["partial_symbol_frames"],
+                    "issues": [
+                        {
+                            "input_name": "position_daily_symbol_frames",
+                            "status": "degraded",
+                            "role_name": "historical_bars",
+                            "provider": "alpaca",
+                            "issue_code": "partial_symbol_frames",
+                            "message": "One or more held symbols could not be loaded.",
+                        }
+                    ],
+                }
+            }
+        },
+    )
     query_service = InternalApiQueryService(project_root=tmp_path)
 
     payload = query_service.portfolio()
@@ -491,6 +669,14 @@ def test_internal_api_portfolio_returns_current_review_state(
     assert payload["available"] is True
     assert payload["data"]["watch_closely"] == ["AAPL"]
     assert payload["data"]["exit_candidates"] == []
+    assert payload["data"]["workflow_input_overview"]["workflow_count"] == 2
+    assert payload["data"]["workflow_input_overview"]["problematic_workflow_count"] == 2
+    assert payload["data"]["workflow_input_summaries"]["portfolio_review"][
+        "degraded_count"
+    ] == 1
+    assert payload["data"]["workflow_input_summaries"]["intraday_review"][
+        "issue_codes"
+    ] == ["partial_symbol_frames"]
 
 
 def test_internal_api_portfolio_degrades_cleanly_when_market_state_missing(

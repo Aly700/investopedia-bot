@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
 from typing import Any, Mapping
@@ -397,10 +397,58 @@ class ProviderConfig:
     """Credential metadata for a market data provider."""
 
     api_key_env: str
+    api_secret_env: str | None = None
+    default_feed: str | None = None
+    default_adjustment: str | None = None
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "ProviderConfig":
-        return cls(api_key_env=_as_str(data, "api_key_env"))
+        return cls(
+            api_key_env=_as_str(data, "api_key_env"),
+            api_secret_env=_as_optional_str(data, "api_secret_env"),
+            default_feed=_as_optional_lower_str(data, "default_feed"),
+            default_adjustment=_as_optional_lower_str(data, "default_adjustment"),
+        )
+
+    def required_environment_variables(self) -> tuple[str, ...]:
+        required_names = [self.api_key_env]
+        if self.api_secret_env is not None:
+            required_names.append(self.api_secret_env)
+        return tuple(required_names)
+
+
+@dataclass(frozen=True)
+class ProviderRolesConfig:
+    """Explicit provider-role assignments for mixed-provider runtimes."""
+
+    stream_market_data: str | None = None
+    historical_bars: str | None = None
+    reference_data: str | None = None
+    earnings_calendar: str | None = None
+    execution_broker: str | None = None
+    broker_update_stream: str | None = None
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> "ProviderRolesConfig":
+        return cls(
+            stream_market_data=_as_optional_lower_str(data, "stream_market_data"),
+            historical_bars=_as_optional_lower_str(data, "historical_bars"),
+            reference_data=_as_optional_lower_str(data, "reference_data"),
+            earnings_calendar=_as_optional_lower_str(data, "earnings_calendar"),
+            execution_broker=_as_optional_lower_str(data, "execution_broker"),
+            broker_update_stream=_as_optional_lower_str(data, "broker_update_stream"),
+        )
+
+    def resolved(self, *, legacy_provider: str) -> "ProviderRolesConfig":
+        normalized_legacy_provider = legacy_provider.strip().lower()
+        return ProviderRolesConfig(
+            stream_market_data=self.stream_market_data,
+            historical_bars=self.historical_bars or normalized_legacy_provider,
+            reference_data=self.reference_data or normalized_legacy_provider,
+            earnings_calendar=self.earnings_calendar or normalized_legacy_provider,
+            execution_broker=self.execution_broker,
+            broker_update_stream=self.broker_update_stream,
+        )
 
 
 @dataclass(frozen=True)
@@ -411,6 +459,8 @@ class DataSourcesConfig:
     alphavantage: ProviderConfig
     tiingo: ProviderConfig
     polygon: ProviderConfig
+    alpaca: ProviderConfig
+    roles: ProviderRolesConfig = field(default_factory=ProviderRolesConfig)
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "DataSourcesConfig":
@@ -419,24 +469,48 @@ class DataSourcesConfig:
             alphavantage=ProviderConfig.from_mapping(_as_mapping(data, "alphavantage")),
             tiingo=ProviderConfig.from_mapping(_as_mapping(data, "tiingo")),
             polygon=ProviderConfig.from_mapping(_as_mapping(data, "polygon")),
+            alpaca=ProviderConfig.from_mapping(_as_mapping(data, "alpaca")),
+            roles=ProviderRolesConfig.from_mapping(_as_optional_mapping(data, "roles")),
         )
 
-    def active_provider(self) -> ProviderConfig:
-        """Return the credential config for the selected provider."""
+    def provider_config(self, provider_name: str) -> ProviderConfig:
+        """Return the credential config for one named provider."""
 
-        provider_name = self.provider.lower()
+        normalized_provider_name = provider_name.strip().lower()
         providers = {
             "alphavantage": self.alphavantage,
             "tiingo": self.tiingo,
             "polygon": self.polygon,
+            "alpaca": self.alpaca,
         }
         try:
-            return providers[provider_name]
+            return providers[normalized_provider_name]
         except KeyError as exc:
             valid_providers = ", ".join(sorted(providers))
             raise ConfigError(
-                f"Unsupported provider '{self.provider}'. Expected one of: {valid_providers}."
+                f"Unsupported provider '{provider_name}'. Expected one of: {valid_providers}."
             ) from exc
+
+    def resolved_roles(self) -> ProviderRolesConfig:
+        """Return provider roles with legacy fallbacks applied."""
+
+        return self.roles.resolved(legacy_provider=self.provider)
+
+    def provider_name_for_role(self, role_name: str) -> str | None:
+        """Return the configured provider name for a role."""
+
+        resolved_roles = self.resolved_roles()
+        try:
+            provider_name = getattr(resolved_roles, role_name)
+        except AttributeError as exc:
+            raise ConfigError(f"Unsupported provider role '{role_name}'.") from exc
+        return provider_name.strip().lower() if isinstance(provider_name, str) else None
+
+    def active_provider(self) -> ProviderConfig:
+        """Return the credential config for the active historical-bars provider."""
+
+        provider_name = self.provider_name_for_role("historical_bars") or self.provider
+        return self.provider_config(provider_name)
 
 
 @dataclass(frozen=True)
@@ -525,10 +599,32 @@ class AppConfig:
     game_rules: GameRulesConfig
 
     def required_environment_variables(self) -> tuple[str, ...]:
-        """Return the environment variables required by the active provider."""
+        """Return deduplicated environment variables required by configured data roles."""
 
-        api_key_env = self.data_sources.active_provider().api_key_env
-        return (api_key_env,) if api_key_env else ()
+        required_names: list[str] = []
+        for names in self.required_environment_variables_by_role().values():
+            for name in names:
+                if name not in required_names:
+                    required_names.append(name)
+        return tuple(required_names)
+
+    def required_environment_variables_by_role(self) -> dict[str, tuple[str, ...]]:
+        """Return required environment variables for configured data-provider roles."""
+
+        required_by_role: dict[str, tuple[str, ...]] = {}
+        for role_name in (
+            "stream_market_data",
+            "historical_bars",
+            "reference_data",
+            "earnings_calendar",
+        ):
+            provider_name = self.data_sources.provider_name_for_role(role_name)
+            if provider_name is None:
+                continue
+            required_by_role[role_name] = self.data_sources.provider_config(
+                provider_name
+            ).required_environment_variables()
+        return required_by_role
 
     def to_dict(self) -> dict[str, Any]:
         """Return a serialization-friendly copy of the config."""
@@ -541,9 +637,10 @@ class AppConfig:
 
 @dataclass(frozen=True)
 class EnvironmentValidationResult:
-    """Result of checking environment variables required by the active provider."""
+    """Result of checking environment variables required by configured data roles."""
 
     provider: str
+    role_assignments: dict[str, str]
     required: tuple[str, ...]
     present: tuple[str, ...]
     missing: tuple[str, ...]
@@ -616,14 +713,22 @@ def validate_environment(
     env_file: Path | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> EnvironmentValidationResult:
-    """Validate environment variables required by the active data provider."""
+    """Validate environment variables required by configured data-provider roles."""
 
     merged_environment = _merge_environment(env_file=env_file, environ=environ)
+    required_by_role = config.required_environment_variables_by_role()
     required = config.required_environment_variables()
     present = tuple(name for name in required if merged_environment.get(name))
     missing = tuple(name for name in required if name not in present)
     return EnvironmentValidationResult(
-        provider=config.data_sources.provider,
+        provider=(
+            config.data_sources.provider_name_for_role("historical_bars")
+            or config.data_sources.provider
+        ),
+        role_assignments={
+            role_name: config.data_sources.provider_name_for_role(role_name) or ""
+            for role_name in required_by_role
+        },
         required=required,
         present=present,
         missing=missing,
@@ -731,6 +836,15 @@ def _as_mapping(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     return value
 
 
+def _as_optional_mapping(data: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = data.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"Expected '{key}' to be a mapping.")
+    return value
+
+
 def _as_str(data: Mapping[str, Any], key: str, *, default: str | None = None) -> str:
     value = data.get(key, default)
     if not isinstance(value, str):
@@ -740,6 +854,21 @@ def _as_str(data: Mapping[str, Any], key: str, *, default: str | None = None) ->
     if not value.strip():
         raise ConfigError(f"Expected '{key}' to be a non-empty string.")
     return value.strip()
+
+
+def _as_optional_str(data: Mapping[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"Expected '{key}' to be a string.")
+    cleaned = value.strip()
+    return cleaned if cleaned else None
+
+
+def _as_optional_lower_str(data: Mapping[str, Any], key: str) -> str | None:
+    value = _as_optional_str(data, key)
+    return value.lower() if value is not None else None
 
 
 def _as_int(data: Mapping[str, Any], key: str) -> int:

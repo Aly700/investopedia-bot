@@ -1036,6 +1036,83 @@ function renderNotes(messages, tone = "neutral") {
     .join("");
 }
 
+function workflowOverviewStatusLabel(status) {
+  const value = String(status || "").toLowerCase();
+  if (value === "failed") return "Failed";
+  if (value === "unavailable") return "Unavailable";
+  if (value === "degraded") return "Degraded";
+  return "Healthy";
+}
+
+function toneForWorkflowOverviewStatus(status) {
+  const label = workflowOverviewStatusLabel(status);
+  if (label === "Failed") return "bad";
+  if (label === "Unavailable" || label === "Degraded") return "warn";
+  return "neutral";
+}
+
+function renderWorkflowInputOverviewBlock(
+  overview,
+  {
+    title = "Workflow input health",
+    emptyText = "Workflow input overview is not available.",
+  } = {}
+) {
+  const data = asObject(overview);
+  const workflowCount = typeof data.workflow_count === "number" ? data.workflow_count : 0;
+  if (!workflowCount) {
+    return `
+      <div class="detail-stack">
+        <div class="detail-line"><strong>${escapeHtml(title)}</strong></div>
+        <div class="empty-row">${escapeHtml(emptyText)}</div>
+      </div>
+    `;
+  }
+
+  const highestSeverity = workflowOverviewStatusLabel(data.highest_severity);
+  const problematicWorkflows = asArray(data.problematic_workflows);
+  const summaryNote = problematicWorkflows.length
+    ? `${problematicWorkflows.length} of ${workflowCount} tracked workflows have input issues (${highestSeverity} highest severity).`
+    : `${workflowCount} tracked workflows are Healthy.`;
+
+  return `
+    <div class="detail-stack">
+      <div class="detail-line"><strong>${escapeHtml(title)}</strong></div>
+      ${renderMetricGrid([
+        ["Tracked workflows", formatNumber(workflowCount)],
+        ["Healthy", formatNumber(data.healthy_workflow_count)],
+        ["Problematic", formatNumber(data.problematic_workflow_count)],
+        ["Highest severity", highestSeverity],
+      ])}
+      ${renderNotes(
+        [summaryNote],
+        toneForWorkflowOverviewStatus(data.highest_severity)
+      )}
+      ${renderList(
+        problematicWorkflows.map((item) => {
+          const issueCodes = asArray(item.issue_codes).join(", ");
+          const inputs = asArray(item.problematic_inputs).join(", ");
+          const bodyParts = [];
+          if (typeof item.issue_count === "number") {
+            bodyParts.push(`issues=${item.issue_count}`);
+          }
+          if (inputs) {
+            bodyParts.push(`inputs=${inputs}`);
+          }
+          if (issueCodes) {
+            bodyParts.push(`issue_codes=${issueCodes}`);
+          }
+          return {
+            title: `${item.workflow_name || "workflow"} | ${workflowOverviewStatusLabel(item.status)}`,
+            body: bodyParts.join(" | ") || "No additional workflow issue details.",
+          };
+        }),
+        "No workflow input problems are currently reported."
+      )}
+    </div>
+  `;
+}
+
 function controlSafetySnapshot(result) {
   const fallback = {
     available: false,
@@ -1353,6 +1430,14 @@ function renderHealth(result, controlResult) {
     !control.available ||
     !control.readable ||
     control.liveConfirmationRequired === false;
+  const providerRoleItems = [
+    ["Stream market data", status.stream_provider || "n/a"],
+    ["Historical bars", status.historical_provider || "n/a"],
+    ["Reference data", status.reference_provider || "n/a"],
+    ["Earnings calendar", status.earnings_provider || "n/a"],
+    ["Execution broker", status.execution_broker || "n/a"],
+    ["Broker update stream", status.broker_update_stream_provider || "n/a"],
+  ].map(([title, body]) => ({ title, body }));
 
   element.innerHTML = `
     ${renderMetricGrid([
@@ -1371,6 +1456,10 @@ function renderHealth(result, controlResult) {
     ])}
     ${renderNotes(errorNotes, "bad")}
     ${renderNotes(warningNotes, warningNotes.length ? "warn" : "neutral")}
+    <div class="detail-stack">
+      <div class="detail-line"><strong>Provider roles</strong></div>
+      ${renderList(providerRoleItems, "Provider roles are not available.")}
+    </div>
     <div class="detail-stack">
       <div class="detail-line"><strong>Execution controls</strong></div>
       <div class="control-toolbar">
@@ -1459,6 +1548,7 @@ function renderMarketState(marketResult, transitionsResult) {
     transitionsPayload.available ? transitionsData.transitions : data.recent_transitions
   );
   const alertableStates = asArray(data.current_alertable_states);
+  const recommendationState = asObject(data.recommendation_state);
 
   element.innerHTML = `
     ${renderMetricGrid([
@@ -1489,6 +1579,13 @@ function renderMarketState(marketResult, transitionsResult) {
         "No meaningful transitions detected."
       )}
     </div>
+    ${renderWorkflowInputOverviewBlock(
+      asObject(recommendationState.workflow_input_overview),
+      {
+        title: "Workflow input health",
+        emptyText: "Workflow input overview is not available for current market-state artifacts.",
+      }
+    )}
   `;
 }
 
@@ -1518,6 +1615,7 @@ function renderPortfolio(result) {
   const watchNames = asArray(data.watch_closely);
   const exitNames = asArray(data.exit_candidates);
   const raiseStopNames = asArray(data.raise_stop);
+  const workflowInputOverview = asObject(data.workflow_input_overview);
 
   element.innerHTML = `
     ${renderMetricGrid([
@@ -1535,6 +1633,10 @@ function renderPortfolio(result) {
       ${renderChipRow(exitNames.map((label) => ({ label, tone: "bad" })), "bad")}
       ${renderChipRow(raiseStopNames.map((label) => ({ label, tone: "good" })), "good")}
     </div>
+    ${renderWorkflowInputOverviewBlock(workflowInputOverview, {
+      title: "Review input health",
+      emptyText: "Workflow input overview is not available for review artifacts.",
+    })}
   `;
 }
 
@@ -1751,6 +1853,7 @@ function renderCandidateQueue(result) {
 
   const data = asObject(payload.data);
   const snapshot = asObject(data.snapshot);
+  const recommendationState = asObject(data.recommendation_state);
   const topPriority = asArray(data.top_priority_candidates);
   const approvedQueue = asArray(snapshot.approved_candidate_queue);
   const constrained = approvedQueue.filter((item) => item.priority_bucket === "capacity_constrained");
@@ -1783,6 +1886,13 @@ function renderCandidateQueue(result) {
         "No rejected-reason summary is available."
       )}
     </div>
+    ${renderWorkflowInputOverviewBlock(
+      asObject(recommendationState.workflow_input_overview),
+      {
+        title: "Recommendation input health",
+        emptyText: "Workflow input overview is not available for recommendation artifacts.",
+      }
+    )}
   `;
 }
 

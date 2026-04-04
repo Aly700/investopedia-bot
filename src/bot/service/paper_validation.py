@@ -37,6 +37,12 @@ from bot.service.local_staging_runtime import (
     RuntimeSupervisor,
     create_local_staging_runtime,
 )
+from bot.workflow_status import (
+    build_workflow_input_overview,
+    render_workflow_input_summary_lines,
+    summarize_named_workflow_input_statuses,
+    summarize_workflow_input_statuses,
+)
 
 
 LOGGER = get_logger(__name__)
@@ -689,6 +695,14 @@ class LocalPaperValidationSummary:
                 f"last successful cycle: {self.health_checkpoint['last_successful_flush_at_utc'] or 'n/a'} | "
                 f"reconnect attempts: {self.health_checkpoint['reconnect_attempt_count']}"
             ),
+            (
+                f"- Providers: stream={self.health_checkpoint['stream_provider'] or 'n/a'} | "
+                f"historical={self.health_checkpoint['historical_provider'] or 'n/a'} | "
+                f"reference={self.health_checkpoint['reference_provider'] or 'n/a'} | "
+                f"earnings={self.health_checkpoint['earnings_provider'] or 'n/a'} | "
+                f"execution={self.health_checkpoint['execution_broker'] or 'n/a'} | "
+                f"broker updates={self.health_checkpoint['broker_update_stream_provider'] or 'n/a'}"
+            ),
             "",
             "Safety",
             (
@@ -775,6 +789,14 @@ class LocalPaperValidationSummary:
                 f"- Last warning: {self.health_checkpoint['last_warning'] or 'n/a'} | "
                 f"status updated: {self.health_checkpoint['status_updated_at_utc'] or 'n/a'}"
             ),
+            (
+                f"- Providers: stream={self.health_checkpoint['stream_provider'] or 'n/a'} | "
+                f"historical={self.health_checkpoint['historical_provider'] or 'n/a'} | "
+                f"reference={self.health_checkpoint['reference_provider'] or 'n/a'} | "
+                f"earnings={self.health_checkpoint['earnings_provider'] or 'n/a'} | "
+                f"execution={self.health_checkpoint['execution_broker'] or 'n/a'} | "
+                f"broker updates={self.health_checkpoint['broker_update_stream_provider'] or 'n/a'}"
+            ),
             "",
             "Connectivity",
             (
@@ -826,6 +848,20 @@ class LocalPaperValidationSummary:
             "",
             "Attention",
         ]
+        workflow_input_summaries = self.daily_review.get("workflow_input_summaries", {})
+        if not isinstance(workflow_input_summaries, Mapping) or not workflow_input_summaries:
+            review_inputs = self.daily_review.get("review_inputs", {})
+            if isinstance(review_inputs, Mapping) and review_inputs:
+                workflow_input_summaries = summarize_named_workflow_input_statuses(
+                    review_inputs
+                )
+        workflow_input_lines = render_workflow_input_summary_lines(
+            workflow_input_summaries
+            if isinstance(workflow_input_summaries, Mapping)
+            else None
+        )
+        if workflow_input_lines:
+            lines[-2:-2] = [""] + workflow_input_lines
         if self.anomaly_flags:
             lines.extend(
                 f"- [{flag['severity'].upper()}] {flag['message']}"
@@ -1017,6 +1053,8 @@ def build_local_paper_validation_smoke_result(
     profile: LocalPaperValidationProfile,
     *,
     as_of_date: date,
+    websocket_url: str | None,
+    stream_provider: str | None,
     max_iterations: int | None,
     summary: LocalPaperValidationSummary | None,
     review_paths: Mapping[str, Path],
@@ -1061,6 +1099,7 @@ def build_local_paper_validation_smoke_result(
     broker_trading_enabled = safety_summary.get("broker_trading_enabled")
     paper_only_intact = bool(paper_integrity.get("paper_only_intact"))
     blocking_issues: list[str] = []
+    smoke_warnings: list[str] = []
     if runtime_failure_message:
         blocking_issues.append(runtime_failure_message)
     if not startup_succeeded:
@@ -1082,9 +1121,20 @@ def build_local_paper_validation_smoke_result(
             "Required paper-validation review artifacts were not written."
         )
     if successful_cycle_count < 1 or not last_successful_cycle_at_utc:
-        blocking_issues.append(
-            "No successful market cycle completed during the smoke run."
-        )
+        if _alpaca_test_stream_smoke_cycle_gap_is_non_blocking(
+            websocket_url=websocket_url,
+            stream_provider=stream_provider,
+            health_checkpoint=health_checkpoint,
+        ):
+            smoke_warnings.append(
+                "No successful market cycle completed during the bounded Alpaca test-stream "
+                "smoke run. Websocket transport health was proven, but the historical/"
+                "recommendation path remains unvalidated."
+            )
+        else:
+            blocking_issues.append(
+                "No successful market cycle completed during the smoke run."
+            )
     if execution_mode_current != "paper":
         blocking_issues.append(
             f"Execution mode drifted out of paper mode: current_execution_mode={execution_mode_current!r}."
@@ -1113,6 +1163,7 @@ def build_local_paper_validation_smoke_result(
         blocking_issues.append("Smoke runtime did not stop cleanly.")
 
     warning_messages = list(summary.warnings) if summary is not None else []
+    warning_messages.extend(smoke_warnings)
     if summary is not None:
         warning_messages.extend(
             str(flag.get("message"))
@@ -1323,6 +1374,14 @@ def build_local_paper_validation_summary(
         recent_transitions=recent_transitions,
     )
     pending_orders_summary = _build_pending_orders_summary(pending_orders_payload)
+    review_input_statuses = _load_review_input_statuses(
+        profile,
+        as_of_date=resolved_as_of_date,
+    )
+    workflow_input_summaries = _load_workflow_input_summaries(
+        profile,
+        as_of_date=resolved_as_of_date,
+    )
     paper_integrity = _build_paper_integrity_summary(
         current_safety_state=safety_state,
         safety_payload=safety_payload,
@@ -1391,6 +1450,8 @@ def build_local_paper_validation_summary(
         log_summary=log_summary,
         paper_integrity=paper_integrity,
         anomaly_flags=anomaly_flags,
+        review_input_statuses=review_input_statuses,
+        workflow_input_summaries=workflow_input_summaries,
     )
     operator_checklist = _build_operator_checklist(
         health_checkpoint=health_checkpoint,
@@ -1571,6 +1632,17 @@ def _build_health_checkpoint_payload(
             "last_cycle_warning_count": 0,
             "last_warning": None,
             "last_error": None,
+            "stream_provider": None,
+            "historical_provider": None,
+            "reference_provider": None,
+            "earnings_provider": None,
+            "execution_broker": None,
+            "broker_update_stream_provider": None,
+            "provider_roles": {},
+            "degraded_provider_roles": [],
+            "unavailable_provider_roles": [],
+            "subscription_status": None,
+            "last_subscription_message": None,
         }
     data = health_payload.get("data")
     status = data.get("status", {}) if isinstance(data, Mapping) else {}
@@ -1594,7 +1666,53 @@ def _build_health_checkpoint_payload(
         "last_cycle_warning_count": _coerce_int(status.get("last_cycle_warning_count")),
         "last_warning": status.get("last_warning"),
         "last_error": status.get("last_error"),
+        "stream_provider": status.get("stream_provider"),
+        "historical_provider": status.get("historical_provider"),
+        "reference_provider": status.get("reference_provider"),
+        "earnings_provider": status.get("earnings_provider"),
+        "execution_broker": status.get("execution_broker"),
+        "broker_update_stream_provider": status.get("broker_update_stream_provider"),
+        "provider_roles": (
+            dict(status.get("provider_roles"))
+            if isinstance(status.get("provider_roles"), Mapping)
+            else {}
+        ),
+        "degraded_provider_roles": [
+            str(role)
+            for role in status.get("degraded_provider_roles", ())
+            if isinstance(role, str) and role.strip()
+        ],
+        "unavailable_provider_roles": [
+            str(role)
+            for role in status.get("unavailable_provider_roles", ())
+            if isinstance(role, str) and role.strip()
+        ],
+        "subscription_status": status.get("subscription_status"),
+        "last_subscription_message": status.get("last_subscription_message"),
     }
+
+
+def _alpaca_test_stream_smoke_cycle_gap_is_non_blocking(
+    *,
+    websocket_url: str | None,
+    stream_provider: str | None,
+    health_checkpoint: Mapping[str, Any],
+) -> bool:
+    resolved_stream_provider = _clean_text(stream_provider)
+    resolved_url = _clean_text(websocket_url)
+    if resolved_stream_provider != "alpaca":
+        return False
+    if resolved_url is None or "/v2/test" not in resolved_url.lower():
+        return False
+    if not bool(health_checkpoint.get("available")):
+        return False
+    if not bool(health_checkpoint.get("connected")):
+        return False
+    if _clean_text(health_checkpoint.get("subscription_status")) != "acknowledged":
+        return False
+    if not _clean_text(health_checkpoint.get("last_message_at_utc")):
+        return False
+    return _clean_text(health_checkpoint.get("last_error")) is None
 
 
 def _service_feed_continuity_healthy(
@@ -1699,6 +1817,78 @@ def _build_market_state_summary(
         else None,
         "recent_transitions": list(recent_transitions),
     }
+
+
+def _load_review_input_statuses(
+    profile: LocalPaperValidationProfile,
+    *,
+    as_of_date: date,
+) -> dict[str, dict[str, Any]]:
+    review_root = profile.default_live_output_dir(as_of_date=as_of_date)
+    review_files = {
+        "portfolio_review": review_root / "portfolio_review.json",
+        "intraday_review": review_root / "portfolio_review_intraday.json",
+    }
+    results: dict[str, dict[str, Any]] = {}
+    for workflow_name, path in review_files.items():
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        raw_statuses = metadata.get("review_input_statuses")
+        if not isinstance(raw_statuses, Mapping):
+            continue
+        results[workflow_name] = {
+            str(key): dict(value)
+            for key, value in raw_statuses.items()
+            if isinstance(key, str) and isinstance(value, Mapping)
+        }
+    return results
+
+
+def _load_workflow_input_summaries(
+    profile: LocalPaperValidationProfile,
+    *,
+    as_of_date: date,
+) -> dict[str, dict[str, Any]]:
+    review_root = profile.default_live_output_dir(as_of_date=as_of_date)
+    artifact_specs = {
+        "daily_summary": ("daily_summary.json", "research_input_statuses"),
+        "portfolio_review": ("portfolio_review.json", "review_input_statuses"),
+        "intraday_review": ("portfolio_review_intraday.json", "review_input_statuses"),
+    }
+    results: dict[str, dict[str, Any]] = {}
+    for workflow_name, (filename, raw_status_key) in artifact_specs.items():
+        path = review_root / filename
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, Mapping):
+            continue
+        stored_summary = metadata.get("workflow_input_summary")
+        if isinstance(stored_summary, Mapping):
+            results[workflow_name] = dict(stored_summary)
+            continue
+        raw_statuses = metadata.get(raw_status_key)
+        if not isinstance(raw_statuses, Mapping):
+            continue
+        results[workflow_name] = summarize_workflow_input_statuses(
+            raw_statuses
+        ).to_dict()
+    return results
 
 
 def _build_pending_orders_summary(
@@ -2079,9 +2269,16 @@ def _build_daily_review(
     log_summary: Mapping[str, Any],
     paper_integrity: Mapping[str, Any],
     anomaly_flags: Sequence[Mapping[str, Any]],
+    review_input_statuses: Mapping[str, Any] | None = None,
+    workflow_input_summaries: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     feed_continuity_healthy = _service_feed_continuity_healthy(health_checkpoint)
     connectivity_degraded = _service_connectivity_degraded(health_checkpoint)
+    resolved_workflow_input_summaries = (
+        dict(workflow_input_summaries)
+        if isinstance(workflow_input_summaries, Mapping)
+        else {}
+    )
     return {
         "as_of_date": as_of_date.isoformat(),
         "service": {
@@ -2169,6 +2366,15 @@ def _build_daily_review(
                 "control_state_degradation_window_count"
             ),
         },
+        "review_inputs": (
+            dict(review_input_statuses)
+            if isinstance(review_input_statuses, Mapping)
+            else {}
+        ),
+        "workflow_input_summaries": resolved_workflow_input_summaries,
+        "workflow_input_overview": build_workflow_input_overview(
+            resolved_workflow_input_summaries
+        ).to_dict(),
         "anomaly_flag_count": len(anomaly_flags),
     }
 
