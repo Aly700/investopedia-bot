@@ -3472,6 +3472,10 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
     summary_payload = summary.to_dict()
     candidate_score_journal_path = summary_result.get("candidate_score_journal_path")
     category_counts = report_payload["category_counts"]
+    recommendation_summary = cast(
+        Mapping[str, Any],
+        report_payload.get("recommendation_summary", {}),
+    )
     flat_category_counts = {
         market_monitor_flat_count_key(category): count
         for category, count in category_counts.items()
@@ -3527,9 +3531,24 @@ def _handle_monitor_market(args: argparse.Namespace) -> int:
         "universe_count": summary_payload["universe_count"],
         "approved_count": summary_payload["approved_count"],
         "rejected_count": summary_payload["rejected_count"],
+        "actionable_buy_candidate_count": recommendation_summary.get(
+            "actionable_candidate_count"
+        ),
+        "capacity_blocked_candidate_count": recommendation_summary.get(
+            "capacity_blocked_candidate_count"
+        ),
+        "sector_gated_candidate_count": recommendation_summary.get(
+            "sector_gated_candidate_count"
+        ),
+        "degraded_context_candidate_count": recommendation_summary.get(
+            "degraded_context_candidate_count"
+        ),
         "alert_count": report_payload["alert_count"],
         "state_change_count": cycle.state_change_count,
         "market_state_baseline_established": state_artifacts.baseline_established,
+        "workflow_input_summary": report_payload.get("workflow_input_summaries", {}).get(
+            "daily_summary"
+        ),
         **flat_category_counts,
         "outputs": outputs,
     }
@@ -5867,6 +5886,15 @@ def _attach_evaluation_decision_ids(
 
 def _candidate_feature_snapshot(candidate: RiskAssessedCandidate) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
+    if candidate.outcome is not None:
+        snapshot["candidate_disposition"] = candidate.outcome.disposition.value
+        degraded_contexts = candidate.outcome.context_availability.degraded_or_missing_contexts
+        if degraded_contexts:
+            snapshot["degraded_or_missing_contexts"] = list(degraded_contexts)
+        if candidate.outcome.blockers:
+            snapshot["blocker_categories"] = [
+                blocker.category.value for blocker in candidate.outcome.blockers
+            ]
     if candidate.execution_priority is not None:
         snapshot["opportunity_score"] = candidate.execution_priority.opportunity_score
     if candidate.features is not None:
@@ -7501,7 +7529,7 @@ def _candidate_journal_observations(
         if existing_observation is None:
             observations[symbol] = CandidateJournalObservation(
                 symbol=symbol,
-                approved_today=candidate.approved,
+                approved_today=candidate.operator_approved,
                 breakout_strength=breakout_strength,
                 relative_volume=relative_volume,
                 sector_etf_symbol=sector_etf_symbol,
@@ -7512,7 +7540,9 @@ def _candidate_journal_observations(
 
         observations[symbol] = CandidateJournalObservation(
             symbol=symbol,
-            approved_today=(existing_observation.approved_today or candidate.approved),
+            approved_today=(
+                existing_observation.approved_today or candidate.operator_approved
+            ),
             breakout_strength=_peak_optional_float(
                 existing_observation.breakout_strength,
                 breakout_strength,

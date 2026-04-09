@@ -24,6 +24,16 @@ from bot.features import (
     build_intraday_position_features,
     build_position_features,
 )
+from bot.risk.candidate_outcome import (
+    BlockerCategory,
+    BlockerSeverity,
+    CandidateBlocker,
+    CandidateOutcome,
+    ContextAvailability,
+    ContextStatus,
+    build_context_availability,
+    legacy_candidate_outcome,
+)
 from bot.risk.position_sizing import PositionSizingResult, size_position
 from bot.strategy.signal_models import StrategySignal
 
@@ -52,6 +62,7 @@ PORTFOLIO_REVIEW_ACTIONS = (
 )
 DEFAULT_POSITION_PERSISTENT_WEAKNESS_DAY_THRESHOLD = 3
 DEFAULT_POSITION_REPEATED_WATCH_EXIT_THRESHOLD = 2
+MAX_CONCURRENT_POSITIONS_REJECTION_REASON = "Max concurrent positions reached."
 
 
 @dataclass(frozen=True)
@@ -170,6 +181,8 @@ class PortfolioRuleResult:
 
     approved: bool
     reasons: tuple[str, ...] = ()
+    capacity_blocked: bool = False
+    blockers: tuple[CandidateBlocker, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -181,12 +194,32 @@ class RiskAssessedCandidate:
     stop_price: float
     adjusted_risk_per_trade: float
     sizing: PositionSizingResult
-    approved: bool
+    approved: bool | None = None
     rejection_reasons: tuple[str, ...] = ()
+    outcome: CandidateOutcome | None = None
     existing_position: ExistingPosition | None = None
     features: CandidateFeatures | None = None
     portfolio_heat_projection: PortfolioHeatProjection | None = None
     execution_priority: ExecutionPriority | None = None
+
+    def __post_init__(self) -> None:
+        resolved_outcome = self.outcome
+        if resolved_outcome is None:
+            resolved_outcome = legacy_candidate_outcome(
+                approved=bool(self.approved),
+                rejection_reasons=self.rejection_reasons,
+                context_availability=_candidate_context_availability(
+                    self.signal,
+                    self.features,
+                ),
+            )
+        object.__setattr__(self, "outcome", resolved_outcome)
+        object.__setattr__(self, "approved", resolved_outcome.legacy_approved)
+        object.__setattr__(self, "rejection_reasons", resolved_outcome.rejection_reasons)
+
+    @property
+    def operator_approved(self) -> bool:
+        return self.outcome.operator_approved if self.outcome is not None else bool(self.approved)
 
 
 @dataclass(frozen=True)
@@ -1217,32 +1250,70 @@ def evaluate_portfolio_rules(
     *,
     current_positions: Sequence[ExistingPosition],
     constraints: PortfolioConstraints,
+    preserve_capacity_blocked_candidates: bool = False,
 ) -> PortfolioRuleResult:
     """Evaluate deterministic portfolio rules for a candidate position.
 
     Checks covered here: concurrent-position cap, no-averaging-down, and
-    duplicate-entry blocking.  The notional/position-size cap is enforced
+    duplicate-entry blocking. The notional/position-size cap is enforced
     upstream by ``size_position`` before this function is ever called, so it
     is not re-checked here.
-    """
 
-    reasons: list[str] = []
+    ``preserve_capacity_blocked_candidates`` is retained only for backward
+    compatibility. Capacity is now represented as a structured soft blocker via
+    ``CandidateOutcome`` regardless of caller.
+    """
+    _ = preserve_capacity_blocked_candidates
+
+    blockers: list[CandidateBlocker] = []
     existing_position = _find_existing_position(current_positions, signal.symbol)
 
     is_new_symbol = existing_position is None
-    if is_new_symbol and len(current_positions) >= constraints.max_concurrent_positions:
-        reasons.append("Max concurrent positions reached.")
+    capacity_blocked = (
+        is_new_symbol and len(current_positions) >= constraints.max_concurrent_positions
+    )
+    if capacity_blocked:
+        blockers.append(
+            CandidateBlocker(
+                category=BlockerCategory.CAPACITY,
+                severity=BlockerSeverity.SOFT,
+                reason=MAX_CONCURRENT_POSITIONS_REJECTION_REASON,
+                context_key="max_concurrent_positions",
+            )
+        )
 
     if existing_position is not None and signal.side == "BUY":
         if (
             constraints.no_averaging_down
             and signal.entry_price_hint < existing_position.average_entry_price
         ):
-            reasons.append("No averaging down is allowed for existing long positions.")
+            blockers.append(
+                CandidateBlocker(
+                    category=BlockerCategory.DUPLICATE_POSITION,
+                    severity=BlockerSeverity.HARD,
+                    reason="No averaging down is allowed for existing long positions.",
+                    context_key="existing_position",
+                )
+            )
         else:
-            reasons.append("Existing long position already open for symbol; duplicate entries are not allowed.")
+            blockers.append(
+                CandidateBlocker(
+                    category=BlockerCategory.DUPLICATE_POSITION,
+                    severity=BlockerSeverity.HARD,
+                    reason=(
+                        "Existing long position already open for symbol; duplicate entries are not allowed."
+                    ),
+                    context_key="existing_position",
+                )
+            )
 
-    return PortfolioRuleResult(approved=not reasons, reasons=tuple(reasons))
+    outcome = CandidateOutcome.from_blockers(blockers)
+    return PortfolioRuleResult(
+        approved=outcome.legacy_approved,
+        reasons=outcome.rejection_reasons,
+        capacity_blocked=capacity_blocked,
+        blockers=tuple(blockers),
+    )
 
 
 def assess_signal_candidate(
@@ -1270,8 +1341,10 @@ def assess_signal_candidate(
     vix_entry_block_threshold: float | None = None,
     require_sector_regime_for_entries: bool = False,
     sector_relative_strength_entry_reject_threshold: float | None = None,
+    preserve_capacity_blocked_candidates: bool = False,
 ) -> RiskAssessedCandidate:
     """Combine sizing and portfolio rules into one risk-assessed entry candidate."""
+    _ = preserve_capacity_blocked_candidates
 
     if candidate_features is not None and market_context is not None:
         raise ValueError(
@@ -1329,8 +1402,20 @@ def assess_signal_candidate(
             stop_price=signal.entry_price_hint,
             adjusted_risk_per_trade=adjusted_risk_per_trade,
             sizing=sizing,
-            approved=False,
-            rejection_reasons=(sizing.rejection_reason,),
+            outcome=CandidateOutcome.from_blockers(
+                (
+                    CandidateBlocker(
+                        category=BlockerCategory.SIZING,
+                        severity=BlockerSeverity.HARD,
+                        reason=sizing.rejection_reason,
+                        context_key="stop_price",
+                    ),
+                ),
+                context_availability=_candidate_context_availability(
+                    signal,
+                    features,
+                ),
+            ),
             existing_position=existing_position,
             features=features,
         )
@@ -1411,9 +1496,16 @@ def _assess_signal_candidate_from_features(
         ),
     )
 
-    rejection_reasons: list[str] = []
+    blockers: list[CandidateBlocker] = []
     if not sizing.is_valid and sizing.rejection_reason is not None:
-        rejection_reasons.append(sizing.rejection_reason)
+        blockers.append(
+            CandidateBlocker(
+                category=BlockerCategory.SIZING,
+                severity=BlockerSeverity.HARD,
+                reason=sizing.rejection_reason,
+                context_key="position_sizing",
+            )
+        )
 
     if sizing.is_valid:
         rule_result = evaluate_portfolio_rules(
@@ -1421,18 +1513,23 @@ def _assess_signal_candidate_from_features(
             current_positions=current_positions,
             constraints=constraints,
         )
-        rejection_reasons.extend(rule_result.reasons)
+        blockers.extend(rule_result.blockers)
 
     if (
         features.earnings_days_away is not None
         and earnings_entry_block_days is not None
         and features.earnings_days_away <= earnings_entry_block_days
     ):
-        rejection_reasons.append(
-            _earnings_entry_block_reason(
-                earnings_date=features.earnings_date,
-                earnings_days_away=features.earnings_days_away,
-                earnings_entry_block_days=earnings_entry_block_days,
+        blockers.append(
+            CandidateBlocker(
+                category=BlockerCategory.EARNINGS,
+                severity=BlockerSeverity.HARD,
+                reason=_earnings_entry_block_reason(
+                    earnings_date=features.earnings_date,
+                    earnings_days_away=features.earnings_days_away,
+                    earnings_entry_block_days=earnings_entry_block_days,
+                ),
+                context_key="earnings_context",
             )
         )
 
@@ -1446,10 +1543,15 @@ def _assess_signal_candidate_from_features(
         and market_breadth_pct_above_200ma is not None
         and market_breadth_pct_above_200ma < market_breadth_entry_floor_200ma
     ):
-        rejection_reasons.append(
-            _market_breadth_entry_reject_reason(
-                market_breadth_pct_above_200ma=market_breadth_pct_above_200ma,
-                market_breadth_entry_floor_200ma=market_breadth_entry_floor_200ma,
+        blockers.append(
+            CandidateBlocker(
+                category=BlockerCategory.MARKET_BREADTH,
+                severity=BlockerSeverity.HARD,
+                reason=_market_breadth_entry_reject_reason(
+                    market_breadth_pct_above_200ma=market_breadth_pct_above_200ma,
+                    market_breadth_entry_floor_200ma=market_breadth_entry_floor_200ma,
+                ),
+                context_key="market_breadth_context",
             )
         )
 
@@ -1472,19 +1574,29 @@ def _assess_signal_candidate_from_features(
         volatility_regime_risk_off is True
         or (vix_close is not None and vix_close >= vix_entry_block_threshold)
     ):
-        rejection_reasons.append(
-            _volatility_entry_reject_reason(
-                vix_close=vix_close,
-                vix_entry_block_threshold=vix_entry_block_threshold,
-                volatility_regime_state=volatility_regime_state,
+        blockers.append(
+            CandidateBlocker(
+                category=BlockerCategory.VOLATILITY,
+                severity=BlockerSeverity.HARD,
+                reason=_volatility_entry_reject_reason(
+                    vix_close=vix_close,
+                    vix_entry_block_threshold=vix_entry_block_threshold,
+                    volatility_regime_state=volatility_regime_state,
+                ),
+                context_key="volatility_context",
             )
         )
 
     if require_sector_regime_for_entries and features.sector_regime_passed is False:
-        rejection_reasons.append(
-            _sector_entry_regime_reject_reason(
-                features.sector_etf_symbol,
-                features.sector_name,
+        blockers.append(
+            CandidateBlocker(
+                category=BlockerCategory.SECTOR_REGIME,
+                severity=BlockerSeverity.SOFT,
+                reason=_sector_entry_regime_reject_reason(
+                    features.sector_etf_symbol,
+                    features.sector_name,
+                ),
+                context_key="sector_context",
             )
         )
 
@@ -1493,56 +1605,81 @@ def _assess_signal_candidate_from_features(
         and sector_relative_strength_entry_reject_threshold is not None
         and features.relative_strength_vs_sector <= sector_relative_strength_entry_reject_threshold
     ):
-        rejection_reasons.append(
-            _sector_entry_lag_reject_reason(
-                features.sector_etf_symbol,
-                sector_name=features.sector_name,
-                relative_strength_vs_sector=features.relative_strength_vs_sector,
-                window=features.sector_relative_strength_window,
+        blockers.append(
+            CandidateBlocker(
+                category=BlockerCategory.SECTOR_RELATIVE_STRENGTH,
+                severity=BlockerSeverity.SOFT,
+                reason=_sector_entry_lag_reject_reason(
+                    features.sector_etf_symbol,
+                    sector_name=features.sector_name,
+                    relative_strength_vs_sector=features.relative_strength_vs_sector,
+                    window=features.sector_relative_strength_window,
+                ),
+                context_key="sector_context",
             )
         )
 
     if features.portfolio_heat_context is not None:
         heat_context = features.portfolio_heat_context
         if heat_context.sector_concentration_risk:
-            rejection_reasons.append(
-                _sector_exposure_entry_reject_reason(
-                    candidate_sector=heat_context.candidate_sector,
-                    same_sector_position_count=heat_context.same_sector_position_count,
-                    max_positions_per_sector=heat_context.max_positions_per_sector,
+            blockers.append(
+                CandidateBlocker(
+                    category=BlockerCategory.SECTOR_EXPOSURE,
+                    severity=BlockerSeverity.HARD,
+                    reason=_sector_exposure_entry_reject_reason(
+                        candidate_sector=heat_context.candidate_sector,
+                        same_sector_position_count=heat_context.same_sector_position_count,
+                        max_positions_per_sector=heat_context.max_positions_per_sector,
+                    ),
+                    context_key="portfolio_heat",
                 )
             )
         if sizing.is_valid and portfolio_heat_projection.sector_notional_concentration_risk:
-            rejection_reasons.append(
-                _sector_notional_exposure_entry_reject_reason(
-                    candidate_sector=heat_context.candidate_sector,
-                    current_sector_notional_pct=heat_context.sector_notional_pct_by_sector.get(
-                        heat_context.candidate_sector or "",
+            blockers.append(
+                CandidateBlocker(
+                    category=BlockerCategory.SECTOR_NOTIONAL_EXPOSURE,
+                    severity=BlockerSeverity.HARD,
+                    reason=_sector_notional_exposure_entry_reject_reason(
+                        candidate_sector=heat_context.candidate_sector,
+                        current_sector_notional_pct=heat_context.sector_notional_pct_by_sector.get(
+                            heat_context.candidate_sector or "",
+                        ),
+                        projected_sector_notional_pct=(
+                            portfolio_heat_projection.projected_sector_notional_pct
+                        ),
+                        max_sector_notional_pct=heat_context.max_sector_notional_pct,
                     ),
-                    projected_sector_notional_pct=(
-                        portfolio_heat_projection.projected_sector_notional_pct
-                    ),
-                    max_sector_notional_pct=heat_context.max_sector_notional_pct,
+                    context_key="portfolio_heat",
                 )
             )
         if heat_context.correlated_exposure_risk:
-            rejection_reasons.append(
-                _industry_exposure_entry_reject_reason(
-                    candidate_industry=heat_context.candidate_industry,
-                    same_industry_position_count=heat_context.same_industry_position_count,
-                    max_same_industry_positions=heat_context.max_same_industry_positions,
+            blockers.append(
+                CandidateBlocker(
+                    category=BlockerCategory.INDUSTRY_EXPOSURE,
+                    severity=BlockerSeverity.HARD,
+                    reason=_industry_exposure_entry_reject_reason(
+                        candidate_industry=heat_context.candidate_industry,
+                        same_industry_position_count=heat_context.same_industry_position_count,
+                        max_same_industry_positions=heat_context.max_same_industry_positions,
+                    ),
+                    context_key="portfolio_heat",
                 )
             )
 
-    approved = sizing.is_valid and not rejection_reasons
+    outcome = CandidateOutcome.from_blockers(
+        blockers,
+        context_availability=_candidate_context_availability(
+            signal,
+            features,
+        ),
+    )
     return RiskAssessedCandidate(
         signal=signal,
         entry_price=signal.entry_price_hint,
         stop_price=stop_price,
         adjusted_risk_per_trade=adjusted_risk_per_trade,
         sizing=sizing,
-        approved=approved,
-        rejection_reasons=tuple(rejection_reasons),
+        outcome=outcome,
         existing_position=existing_position,
         features=features,
         portfolio_heat_projection=portfolio_heat_projection,
@@ -1558,6 +1695,99 @@ def _find_existing_position(
         if position.symbol.strip().upper() == normalized_symbol:
             return position
     return None
+
+
+def _candidate_context_availability(
+    signal: StrategySignal,
+    features: CandidateFeatures | None,
+) -> ContextAvailability:
+    market_context = features.market_context if features is not None else None
+    metadata = signal.metadata
+    return build_context_availability(
+        sector_context=_sector_context_status(metadata, features),
+        volatility_context=_volatility_context_status(metadata, market_context),
+        earnings_context=_earnings_context_status(metadata, features),
+        market_breadth_context=_market_breadth_context_status(metadata, market_context),
+    )
+
+
+def _sector_context_status(
+    metadata: Mapping[str, Any],
+    features: CandidateFeatures | None,
+) -> ContextStatus:
+    explicit = metadata.get("sector_context_available")
+    if isinstance(explicit, bool):
+        return ContextStatus.AVAILABLE if explicit else ContextStatus.UNAVAILABLE
+    if features is not None and (
+        features.sector_etf_symbol is not None
+        or features.sector_regime_passed is not None
+        or features.relative_strength_vs_sector is not None
+    ):
+        return ContextStatus.AVAILABLE
+    if features is not None and (
+        features.sector_name is not None or features.industry_name is not None
+    ):
+        return ContextStatus.DEGRADED
+    return ContextStatus.UNKNOWN
+
+
+def _volatility_context_status(
+    metadata: Mapping[str, Any],
+    market_context: MarketContext | None,
+) -> ContextStatus:
+    if market_context is not None and (
+        market_context.vix_close is not None
+        or market_context.vix_sma_short is not None
+        or market_context.vix_sma_long is not None
+        or market_context.volatility_regime_state is not None
+        or market_context.volatility_regime_risk_off is not None
+    ):
+        return ContextStatus.AVAILABLE
+    if market_context is not None or metadata.get("vix_entry_block_threshold") is not None:
+        return ContextStatus.UNAVAILABLE
+    return ContextStatus.UNKNOWN
+
+
+def _earnings_context_status(
+    metadata: Mapping[str, Any],
+    features: CandidateFeatures | None,
+) -> ContextStatus:
+    if features is not None and (
+        features.earnings_date is not None
+        or features.earnings_days_away is not None
+        or features.is_earnings_risk
+    ):
+        return ContextStatus.AVAILABLE
+    if any(
+        key in metadata
+        for key in (
+            "earnings_date",
+            "earnings_days_away",
+            "is_earnings_risk",
+            "earnings_event_status",
+            "earnings_source",
+        )
+    ):
+        return ContextStatus.UNKNOWN
+    return ContextStatus.UNKNOWN
+
+
+def _market_breadth_context_status(
+    metadata: Mapping[str, Any],
+    market_context: MarketContext | None,
+) -> ContextStatus:
+    if market_context is not None and (
+        market_context.market_breadth_pct_above_200ma is not None
+        or market_context.market_breadth_pct_above_50ma is not None
+        or market_context.market_breadth_state is not None
+    ):
+        return ContextStatus.AVAILABLE
+    if (
+        market_context is not None
+        or metadata.get("market_breadth_entry_floor_200ma") is not None
+    ):
+        return ContextStatus.UNAVAILABLE
+    return ContextStatus.UNKNOWN
 
 
 def _earnings_risk_note(earnings_date: date | None, earnings_days_away: int | None) -> str:

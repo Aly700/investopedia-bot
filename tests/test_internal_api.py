@@ -50,6 +50,7 @@ def test_internal_api_market_state_returns_snapshot_and_recent_transitions(
     assert payload["available"] is True
     assert payload["data"]["snapshot"]["as_of_date"] == "2024-01-05"
     assert payload["data"]["top_priority_candidates"][0]["symbol"] == "NVDA"
+    assert payload["data"]["top_priority_candidates"][0]["candidate_disposition"] == "actionable"
     assert payload["data"]["current_alertable_states"][0]["symbol"] == "AAPL"
     assert payload["data"]["recent_transitions"][0]["transition_type"] == "HOLD_TO_WATCH_CLOSELY"
 
@@ -59,9 +60,26 @@ def test_internal_api_market_state_reports_fresh_recommendation_state_when_queue
 ) -> None:
     query_service = InternalApiQueryService(project_root=tmp_path)
     _write_market_state_snapshots(tmp_path)
-    write_json_file(
+    monitor_output_path = write_json_file(
         tmp_path / "data" / "processed" / "live_market" / "2024-01-05" / "market_monitor.json",
-        {"as_of_date": "2024-01-05"},
+        {
+            "as_of_date": "2024-01-05",
+            "recommendation_sections": {
+                "actionable_buy_candidates": [
+                    {
+                        "symbol": "NVDA",
+                        "candidate_disposition": "actionable",
+                        "blocker_categories": [],
+                        "blocker_severities": [],
+                        "degraded_or_missing_contexts": [],
+                    }
+                ],
+                "capacity_blocked_candidates": [],
+                "sector_gated_candidates": [],
+                "degraded_context_candidates": [],
+                "fundamental_rejected_candidates": [],
+            },
+        },
     )
     write_json_file(
         tmp_path / "data" / "processed" / "live_market" / "2024-01-05" / "daily_summary.json",
@@ -96,9 +114,19 @@ def test_internal_api_market_state_reports_fresh_recommendation_state_when_queue
     recommendation_state = payload["data"]["recommendation_state"]
 
     assert recommendation_state["queue_empty"] is False
+    assert recommendation_state["actionable_queue_empty"] is False
     assert recommendation_state["top_priority_empty"] is False
     assert recommendation_state["empty_reasons"] == []
+    assert recommendation_state["actionable_candidate_count"] == 1
+    assert recommendation_state["capacity_blocked_candidate_count"] == 0
+    assert recommendation_state["candidate_disposition_counts"] == {"actionable": 1}
+    assert recommendation_state["sector_gated_candidate_count"] == 0
+    assert recommendation_state["degraded_context_candidate_count"] == 0
     assert recommendation_state["latest_successful_monitor_market_as_of_date"] == "2024-01-05"
+    assert (
+        recommendation_state["latest_successful_monitor_market_output_path"]
+        == str(monitor_output_path.resolve())
+    )
     assert recommendation_state["monitor_market_fresh_for_snapshot_date"] is True
     assert recommendation_state["workflow_input_overview"]["workflow_count"] == 1
     assert recommendation_state["workflow_input_overview"]["highest_severity"] == "unavailable"
@@ -107,6 +135,173 @@ def test_internal_api_market_state_reports_fresh_recommendation_state_when_queue
             "unavailable_count"
         ]
         == 1
+    )
+
+
+def test_internal_api_market_state_reports_capacity_blocked_candidates_when_no_top_priority_is_actionable(
+    tmp_path: Path,
+) -> None:
+    query_service = InternalApiQueryService(project_root=tmp_path)
+    current_snapshot = MarketStateSnapshot(
+        schema_version=MARKET_STATE_SNAPSHOT_SCHEMA_VERSION,
+        as_of_timestamp="2024-01-05T15:00:00+00:00",
+        as_of_date=date(2024, 1, 5),
+        source_workflows=("monitor-market",),
+        approved_candidate_queue=(
+            MarketStateCandidateState(
+                symbol="NVDA",
+                rank=1,
+                preset_name="standard_breakout",
+                actionable_now=False,
+                priority_bucket="capacity_constrained",
+                candidate_disposition="approved_capacity_blocked",
+            ),
+        ),
+    )
+    write_json_file(
+        default_current_market_state_path(tmp_path),
+        current_snapshot.to_dict(),
+    )
+    write_json_file(
+        tmp_path / "data" / "processed" / "live_market" / "2024-01-05" / "market_monitor.json",
+        {"as_of_date": "2024-01-05"},
+    )
+
+    payload = query_service.market_state()
+    recommendation_state = payload["data"]["recommendation_state"]
+
+    assert recommendation_state["approved_candidate_count"] == 1
+    assert recommendation_state["actionable_candidate_count"] == 0
+    assert recommendation_state["capacity_blocked_candidate_count"] == 1
+    assert recommendation_state["queue_empty"] is False
+    assert recommendation_state["actionable_queue_empty"] is True
+    assert recommendation_state["top_priority_empty"] is True
+    assert recommendation_state["top_capacity_blocked_candidates"][0]["symbol"] == "NVDA"
+    assert recommendation_state["candidate_disposition_counts"] == {
+        "approved_capacity_blocked": 1
+    }
+    assert recommendation_state["empty_reasons"] == [
+        "No approved candidates are actionable right now; 1 approved candidate is blocked by current portfolio capacity."
+    ]
+
+
+def test_internal_api_market_state_surfaces_structured_recommendation_sections_from_monitor_market_artifact(
+    tmp_path: Path,
+) -> None:
+    query_service = InternalApiQueryService(project_root=tmp_path)
+    _write_market_state_snapshots(tmp_path)
+    write_json_file(
+        tmp_path / "data" / "processed" / "live_market" / "2024-01-05" / "market_monitor.json",
+        {
+            "as_of_date": "2024-01-05",
+            "recommendation_sections": {
+                "actionable_buy_candidates": [
+                    {
+                        "symbol": "NVDA",
+                        "candidate_disposition": "actionable",
+                        "blocker_categories": [],
+                        "blocker_severities": [],
+                        "degraded_or_missing_contexts": [],
+                    }
+                ],
+                "capacity_blocked_candidates": [],
+                "sector_gated_candidates": [
+                    {
+                        "symbol": "AMD",
+                        "candidate_disposition": "soft_gated",
+                        "blocker_categories": ["sector_regime"],
+                        "blocker_severities": ["soft"],
+                        "degraded_or_missing_contexts": [],
+                    }
+                ],
+                "degraded_context_candidates": [
+                    {
+                        "symbol": "SHOP",
+                        "candidate_disposition": "hard_rejected",
+                        "blocker_categories": ["sizing"],
+                        "blocker_severities": ["hard"],
+                        "degraded_or_missing_contexts": ["sector_context"],
+                    }
+                ],
+                "fundamental_rejected_candidates": [
+                    {
+                        "symbol": "AAPL",
+                        "candidate_disposition": "hard_rejected",
+                        "blocker_categories": ["duplicate_position"],
+                        "blocker_severities": ["hard"],
+                        "degraded_or_missing_contexts": [],
+                    }
+                ],
+            },
+        },
+    )
+
+    payload = query_service.market_state()
+    recommendation_state = payload["data"]["recommendation_state"]
+
+    assert recommendation_state["sector_gated_candidate_count"] == 1
+    assert recommendation_state["degraded_context_candidate_count"] == 1
+    assert recommendation_state["fundamental_rejected_candidate_count"] == 1
+    assert recommendation_state["top_sector_gated_candidates"][0]["symbol"] == "AMD"
+    assert recommendation_state["top_sector_gated_candidates"][0]["blocker_categories"] == [
+        "sector_regime"
+    ]
+    assert recommendation_state["top_degraded_context_candidates"][0]["symbol"] == "SHOP"
+    assert recommendation_state["top_degraded_context_candidates"][0][
+        "degraded_or_missing_contexts"
+    ] == ["sector_context"]
+    assert recommendation_state["top_fundamental_rejected_candidates"][0]["symbol"] == "AAPL"
+    assert recommendation_state["candidate_disposition_counts"] == {
+        "actionable": 1,
+        "soft_gated": 1,
+        "hard_rejected": 2,
+    }
+
+
+def test_internal_api_market_state_treats_archived_live_market_output_as_successful_with_zero_approved_candidates(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "runtime-root"
+    query_service = InternalApiQueryService(project_root=project_root)
+    current_snapshot = MarketStateSnapshot(
+        schema_version=MARKET_STATE_SNAPSHOT_SCHEMA_VERSION,
+        as_of_timestamp="2024-01-05T15:00:00+00:00",
+        as_of_date=date(2024, 1, 5),
+        source_workflows=("monitor-market",),
+        top_rejected_reasons_summary=(
+            MarketStateRejectedReasonSummary(
+                reason="Max concurrent positions reached.",
+                count=5,
+            ),
+        ),
+    )
+    write_json_file(
+        default_current_market_state_path(project_root),
+        current_snapshot.to_dict(),
+    )
+    monitor_output_path = write_json_file(
+        tmp_path / "archive" / "live_market" / "2024-01-05" / "market_monitor.json",
+        {"as_of_date": "2024-01-05"},
+    )
+
+    payload = query_service.market_state()
+    recommendation_state = payload["data"]["recommendation_state"]
+
+    assert recommendation_state["approved_candidate_count"] == 0
+    assert recommendation_state["queue_empty"] is True
+    assert recommendation_state["latest_successful_monitor_market_as_of_date"] == "2024-01-05"
+    assert (
+        recommendation_state["latest_successful_monitor_market_output_path"]
+        == str(monitor_output_path.resolve())
+    )
+    assert recommendation_state["monitor_market_fresh_for_snapshot_date"] is True
+    assert (
+        "No successful monitor-market output artifact has been written yet."
+        not in recommendation_state["context_notes"]
+    )
+    assert (
+        "No successful monitor-market output artifact was written for 2024-01-05; latest successful monitor-market output is 2024-01-04."
+        not in recommendation_state["context_notes"]
     )
 
 
@@ -214,6 +409,79 @@ def test_internal_api_market_state_falls_back_to_raw_statuses_for_workflow_input
         == ["entitlement_limited"]
     )
     assert recommendation_state["workflow_input_overview"]["problematic_workflow_count"] == 1
+
+
+def test_internal_api_market_state_loads_workflow_summaries_from_archived_live_market_runtime(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "runtime-root"
+    query_service = InternalApiQueryService(project_root=project_root)
+    _write_market_state_snapshots(project_root)
+    write_json_file(
+        tmp_path / "archive" / "live_market" / "2024-01-05" / "market_monitor.json",
+        {"as_of_date": "2024-01-05"},
+    )
+    write_json_file(
+        tmp_path / "archive" / "live_market" / "2024-01-05" / "portfolio_review.json",
+        {
+            "metadata": {
+                "workflow_input_summary": {
+                    "total_count": 4,
+                    "ok_count": 3,
+                    "degraded_count": 1,
+                    "unavailable_count": 0,
+                    "failed_count": 0,
+                    "issue_count": 1,
+                    "healthy": False,
+                    "problematic_inputs": ["earnings_contexts"],
+                    "issue_codes": ["entitlement_limited"],
+                    "issues": [
+                        {
+                            "input_name": "earnings_contexts",
+                            "status": "degraded",
+                            "role_name": "earnings_calendar",
+                            "provider": "polygon",
+                            "issue_code": "entitlement_limited",
+                            "message": "Earnings context degraded.",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+    write_json_file(
+        tmp_path / "archive" / "live_market" / "2024-01-05" / "portfolio_review_intraday.json",
+        {
+            "metadata": {
+                "review_input_statuses": {
+                    "benchmark_intraday_metrics": {"status": "ok"},
+                    "earnings_contexts": {
+                        "status": "degraded",
+                        "issue_code": "entitlement_limited",
+                    },
+                }
+            }
+        },
+    )
+
+    payload = query_service.market_state()
+    recommendation_state = payload["data"]["recommendation_state"]
+
+    assert recommendation_state["workflow_input_overview"]["workflow_count"] == 2
+    assert recommendation_state["workflow_input_overview"]["problematic_workflow_count"] == 2
+    assert recommendation_state["workflow_input_overview"]["highest_severity"] == "degraded"
+    assert (
+        recommendation_state["workflow_input_summaries"]["portfolio_review"][
+            "problematic_inputs"
+        ]
+        == ["earnings_contexts"]
+    )
+    assert (
+        recommendation_state["workflow_input_summaries"]["intraday_review"][
+            "issue_codes"
+        ]
+        == ["entitlement_limited"]
+    )
 
 
 def test_internal_api_market_state_degrades_cleanly_when_missing_or_malformed(
@@ -708,6 +976,7 @@ def _write_market_state_snapshots(
                 preset_name="standard_breakout",
                 actionable_now=True,
                 priority_bucket="top_priority",
+                candidate_disposition="actionable",
             ),
         ),
         portfolio_review_summary=MarketStatePortfolioSummary(
@@ -738,6 +1007,7 @@ def _write_market_state_snapshots(
                 preset_name="standard_breakout",
                 actionable_now=True,
                 priority_bucket="top_priority",
+                candidate_disposition="actionable",
             ),
         ),
         portfolio_review_summary=MarketStatePortfolioSummary(

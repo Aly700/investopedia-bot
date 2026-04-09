@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 import json
 from pathlib import Path
@@ -19,6 +20,11 @@ from bot.features import (
     build_intraday_position_features,
     build_market_context,
     build_position_features,
+)
+from bot.risk.candidate_outcome import (
+    BlockerCategory,
+    CandidateDisposition,
+    ContextStatus,
 )
 from bot.risk.portfolio_rules import (
     ExistingPosition,
@@ -155,6 +161,36 @@ def test_portfolio_rules_enforce_max_positions() -> None:
 
     assert result.approved is False
     assert result.reasons == ("Max concurrent positions reached.",)
+    assert result.capacity_blocked is True
+    assert result.blockers[0].category == BlockerCategory.CAPACITY
+
+
+def test_assess_signal_candidate_represents_capacity_block_as_explicit_outcome() -> None:
+    signal = _signal(symbol="CCC", entry_price=100.0, stop_price=95.0)
+    positions = [
+        ExistingPosition(symbol="AAA", shares=100, average_entry_price=50.0),
+        ExistingPosition(symbol="BBB", shares=100, average_entry_price=60.0),
+    ]
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=2,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+        current_positions=positions,
+    )
+
+    assert candidate.approved is False
+    assert candidate.operator_approved is True
+    assert candidate.sizing.is_valid is True
+    assert candidate.outcome is not None
+    assert candidate.outcome.disposition == CandidateDisposition.APPROVED_CAPACITY_BLOCKED
+    assert candidate.rejection_reasons == ("Max concurrent positions reached.",)
 
 
 def test_portfolio_rules_block_averaging_down() -> None:
@@ -244,6 +280,9 @@ def test_assess_signal_candidate_rejects_weak_sector_regime() -> None:
     assert candidate.rejection_reasons == (
         "Sector ETF XLK is below its trend filter; new entries require sector support.",
     )
+    assert candidate.outcome is not None
+    assert candidate.outcome.disposition == CandidateDisposition.SOFT_GATED
+    assert candidate.outcome.blockers[0].category == BlockerCategory.SECTOR_REGIME
 
 
 def test_assess_signal_candidate_rejects_symbol_lagging_sector() -> None:
@@ -270,6 +309,9 @@ def test_assess_signal_candidate_rejects_symbol_lagging_sector() -> None:
     assert candidate.rejection_reasons == (
         "Stock is lagging XLK by 6.2% over 20 trading days; new entries require sector-relative strength.",
     )
+    assert candidate.outcome is not None
+    assert candidate.outcome.disposition == CandidateDisposition.SOFT_GATED
+    assert candidate.outcome.blockers[0].category == BlockerCategory.SECTOR_RELATIVE_STRENGTH
 
 
 def test_assess_signal_candidate_does_not_block_unknown_sector_regime() -> None:
@@ -293,6 +335,35 @@ def test_assess_signal_candidate_does_not_block_unknown_sector_regime() -> None:
 
     assert candidate.approved is True
     assert candidate.rejection_reasons == ()
+    assert candidate.outcome is not None
+    assert candidate.outcome.disposition == CandidateDisposition.ACTIONABLE
+    assert candidate.outcome.context_availability.sector_context == ContextStatus.AVAILABLE
+
+
+def test_assess_signal_candidate_marks_missing_optional_context_as_degraded_approved() -> None:
+    signal = replace(
+        _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0),
+        metadata={"sector_context_available": False},
+    )
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+    )
+
+    assert candidate.approved is True
+    assert candidate.operator_approved is True
+    assert candidate.rejection_reasons == ()
+    assert candidate.outcome is not None
+    assert candidate.outcome.disposition == CandidateDisposition.DEGRADED_APPROVED
+    assert candidate.outcome.context_availability.sector_context == ContextStatus.UNAVAILABLE
 
 
 def test_assess_signal_candidate_blocks_sector_exposure_when_sector_bucket_is_crowded() -> None:

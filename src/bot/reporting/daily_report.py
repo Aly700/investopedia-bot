@@ -17,12 +17,17 @@ from bot.execution.prioritization import (
     score_risk_candidate_opportunity as _score_risk_candidate_opportunity,
 )
 from bot.features import MarketContext
+from bot.risk.candidate_outcome import BlockerCategory, CandidateDisposition
 from bot.risk.portfolio_rules import (
     PORTFOLIO_REVIEW_ACTIONS,
     ExistingPosition,
     RiskAssessedCandidate,
 )
 from bot.strategy.breakout_momentum import BreakoutStrategyPreset, build_breakout_rationale
+from bot.workflow_status import (
+    build_workflow_input_overview,
+    render_workflow_input_summary_lines,
+)
 
 
 DAILY_REPORT_COLUMNS = (
@@ -125,6 +130,26 @@ MARKET_MONITOR_CATEGORY_PRIORITY = {
 }
 MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT = 5
 MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT = 5
+_MARKET_MONITOR_RECOMMENDATION_SECTION_ORDER = (
+    "actionable_buy_candidates",
+    "capacity_blocked_candidates",
+    "sector_gated_candidates",
+    "degraded_context_candidates",
+    "fundamental_rejected_candidates",
+)
+_OPERATOR_APPROVED_DISPOSITIONS = {
+    CandidateDisposition.ACTIONABLE.value,
+    CandidateDisposition.APPROVED_CAPACITY_BLOCKED.value,
+    CandidateDisposition.DEGRADED_APPROVED.value,
+}
+_ACTIONABLE_DISPOSITIONS = {
+    CandidateDisposition.ACTIONABLE.value,
+    CandidateDisposition.DEGRADED_APPROVED.value,
+}
+_SECTOR_GATED_BLOCKER_CATEGORIES = {
+    BlockerCategory.SECTOR_REGIME.value,
+    BlockerCategory.SECTOR_RELATIVE_STRENGTH.value,
+}
 
 
 def market_monitor_flat_count_key(category: str) -> str:
@@ -195,6 +220,12 @@ class DailyResearchOpportunityRow:
     per_share_risk: float
     notional_value: float
     rejection_reasons: tuple[str, ...] = ()
+    candidate_disposition: str | None = None
+    blocker_categories: tuple[str, ...] = ()
+    blocker_severities: tuple[str, ...] = ()
+    degraded_or_missing_contexts: tuple[str, ...] = ()
+    actionable_now: bool | None = None
+    priority_bucket: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -224,6 +255,12 @@ class DailyResearchOpportunityRow:
             "per_share_risk": self.per_share_risk,
             "notional_value": self.notional_value,
             "rejection_reasons": list(self.rejection_reasons),
+            "candidate_disposition": self.candidate_disposition,
+            "blocker_categories": list(self.blocker_categories),
+            "blocker_severities": list(self.blocker_severities),
+            "degraded_or_missing_contexts": list(self.degraded_or_missing_contexts),
+            "actionable_now": self.actionable_now,
+            "priority_bucket": self.priority_bucket,
             "metadata": dict(self.metadata),
         }
 
@@ -855,6 +892,7 @@ class MarketMonitorReport:
     ranked_opportunity_rows: tuple[DailyResearchOpportunityRow, ...] = ()
     portfolio_review_rows: tuple[PortfolioReviewRow, ...] = ()
     market_context: MarketContext | None = None
+    workflow_input_summaries: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def category_counts(self) -> dict[str, int]:
@@ -869,6 +907,9 @@ class MarketMonitorReport:
         """Return a JSON-friendly market-monitor payload."""
 
         category_counts = self.category_counts
+        recommendation_sections = _market_monitor_recommendation_sections(
+            self.ranked_opportunity_rows
+        )
         flat_count_fields = {
             market_monitor_flat_count_key(category): category_counts[category]
             for category in MARKET_MONITOR_CATEGORIES
@@ -888,6 +929,20 @@ class MarketMonitorReport:
             "category_counts": dict(category_counts),
             **flat_count_fields,
             "alerts": [alert.to_dict() for alert in self.alerts],
+            "ranked_opportunities": [
+                row.to_dict() for row in self.ranked_opportunity_rows
+            ],
+            "recommendation_summary": _market_monitor_recommendation_summary(
+                recommendation_sections
+            ),
+            "recommendation_sections": {
+                section_name: [row.to_dict() for row in rows]
+                for section_name, rows in recommendation_sections.items()
+            },
+            "workflow_input_overview": build_workflow_input_overview(
+                self.workflow_input_summaries
+            ).to_dict(),
+            "workflow_input_summaries": dict(self.workflow_input_summaries),
         }
 
     def to_text(self) -> str:
@@ -923,22 +978,20 @@ class MarketMonitorReport:
         """Return a human-readable trader brief for the monitor run."""
 
         counts = self.category_counts
-        approved_buy_rows = [
-            row
-            for row in self.ranked_opportunity_rows
-            if row.status == "approved" and _row_actionable_now(row)
+        recommendation_sections = _market_monitor_recommendation_sections(
+            self.ranked_opportunity_rows
+        )
+        actionable_buy_rows = list(recommendation_sections["actionable_buy_candidates"])
+        top_buy_rows = actionable_buy_rows[:MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT]
+        additional_actionable_rows = actionable_buy_rows[
+            MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT:
         ]
-        deferred_buy_rows = [
-            row
-            for row in self.ranked_opportunity_rows
-            if row.status == "approved" and not _row_actionable_now(row)
-        ]
-        lower_priority_buy_rows = deferred_buy_rows + list(
-            approved_buy_rows[MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT:]
-        ) + [
-            row for row in self.ranked_opportunity_rows if row.status != "approved"
-        ]
-        top_buy_rows = approved_buy_rows[:MARKET_MONITOR_BRIEF_TOP_BUY_LIMIT]
+        capacity_blocked_rows = list(recommendation_sections["capacity_blocked_candidates"])
+        sector_gated_rows = list(recommendation_sections["sector_gated_candidates"])
+        degraded_context_rows = list(recommendation_sections["degraded_context_candidates"])
+        fundamental_rejected_rows = list(
+            recommendation_sections["fundamental_rejected_candidates"]
+        )
         holding_rows = sorted(
             self.portfolio_review_rows,
             key=lambda row: (
@@ -955,8 +1008,10 @@ class MarketMonitorReport:
 
         lines = [f"Market monitor brief for {self.as_of_date.isoformat()}", "", "Headline"]
         lines.append(
-            f"Actionable now: {len(top_buy_rows) + len(urgent_holding_rows)} | "
+            f"Actionable now: {len(actionable_buy_rows) + len(urgent_holding_rows)} | "
             f"Top buys shown: {len(top_buy_rows)} | "
+            f"Blocked by capacity: {len(capacity_blocked_rows)} | "
+            f"Sector-gated: {len(sector_gated_rows)} | "
             f"Raise stop: {counts['RAISE STOP']} | "
             f"Exit: {counts['EXIT CANDIDATE']} | "
             f"Watch: {counts['WATCH CLOSELY']}"
@@ -974,10 +1029,25 @@ class MarketMonitorReport:
         )
         if volatility_line is not None:
             lines.append(volatility_line)
+        workflow_input_lines = render_workflow_input_summary_lines(
+            self.workflow_input_summaries
+        )
+        if workflow_input_lines:
+            lines.extend(workflow_input_lines)
 
         lines.extend(("", "Best actions now"))
         if not urgent_holding_rows and not top_buy_rows:
             lines.append("No immediate action is required.")
+            if capacity_blocked_rows:
+                lines.append(
+                    "- Replacement candidates if a slot opens: "
+                    + ", ".join(
+                        row.symbol
+                        for row in capacity_blocked_rows[
+                            :MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT
+                        ]
+                    )
+                )
         else:
             if urgent_holding_rows:
                 lines.append(
@@ -992,6 +1062,16 @@ class MarketMonitorReport:
                     "- Best buys: "
                     + ", ".join(row.symbol for row in top_buy_rows)
                 )
+            if capacity_blocked_rows:
+                lines.append(
+                    "- Replacement candidates if a slot opens: "
+                    + ", ".join(
+                        row.symbol
+                        for row in capacity_blocked_rows[
+                            :MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT
+                        ]
+                    )
+                )
 
         lines.extend(("", "Current holdings"))
         if holding_rows:
@@ -1004,19 +1084,44 @@ class MarketMonitorReport:
         if top_buy_rows:
             for row in top_buy_rows:
                 lines.append(_daily_research_monitor_brief_line(row))
-        elif deferred_buy_rows:
+        elif capacity_blocked_rows:
             lines.append("No approved buy candidates are currently actionable under portfolio capacity.")
         else:
             lines.append("No approved buy candidates.")
 
         lines.extend(("", "Lower-priority names"))
-        if lower_priority_buy_rows:
-            for row in lower_priority_buy_rows[:MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT]:
-                lines.append(_daily_research_monitor_brief_line(row))
-            remaining_count = len(lower_priority_buy_rows) - MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT
-            if remaining_count > 0:
-                lines.append(f"- {remaining_count} more lower-priority buy candidates not shown.")
-        else:
+        rendered_lower_priority = False
+        rendered_lower_priority = _append_monitor_recommendation_bucket(
+            lines,
+            title="Additional approved names",
+            rows=additional_actionable_rows,
+            limit=MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT,
+        ) or rendered_lower_priority
+        rendered_lower_priority = _append_monitor_recommendation_bucket(
+            lines,
+            title="Blocked by capacity",
+            rows=capacity_blocked_rows,
+            limit=MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT,
+        ) or rendered_lower_priority
+        rendered_lower_priority = _append_monitor_recommendation_bucket(
+            lines,
+            title="Sector-gated candidates",
+            rows=sector_gated_rows,
+            limit=MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT,
+        ) or rendered_lower_priority
+        rendered_lower_priority = _append_monitor_recommendation_bucket(
+            lines,
+            title="Degraded-context candidates",
+            rows=degraded_context_rows,
+            limit=MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT,
+        ) or rendered_lower_priority
+        rendered_lower_priority = _append_monitor_recommendation_bucket(
+            lines,
+            title="Other rejected names",
+            rows=fundamental_rejected_rows,
+            limit=MARKET_MONITOR_BRIEF_LOWER_PRIORITY_LIMIT,
+        ) or rendered_lower_priority
+        if not rendered_lower_priority:
             lines.append("No lower-priority buy candidates.")
 
         return "\n".join(lines).rstrip() + "\n"
@@ -1179,6 +1284,10 @@ def build_market_monitor_report(
             if daily_summary is not None
             else None
         ),
+        workflow_input_summaries=_market_monitor_workflow_input_summaries(
+            daily_summary=daily_summary,
+            portfolio_review=portfolio_review,
+        ),
     )
 
 
@@ -1315,6 +1424,12 @@ class DailySignalReportRow:
     strategy_name: str | None
     rationale: str
     rejection_reasons: tuple[str, ...] = ()
+    candidate_disposition: str | None = None
+    blocker_categories: tuple[str, ...] = ()
+    blocker_severities: tuple[str, ...] = ()
+    degraded_or_missing_contexts: tuple[str, ...] = ()
+    actionable_now: bool | None = None
+    priority_bucket: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1333,6 +1448,12 @@ class DailySignalReportRow:
             "strategy_name": self.strategy_name,
             "rationale": self.rationale,
             "rejection_reasons": list(self.rejection_reasons),
+            "candidate_disposition": self.candidate_disposition,
+            "blocker_categories": list(self.blocker_categories),
+            "blocker_severities": list(self.blocker_severities),
+            "degraded_or_missing_contexts": list(self.degraded_or_missing_contexts),
+            "actionable_now": self.actionable_now,
+            "priority_bucket": self.priority_bucket,
             "metadata": dict(self.metadata),
         }
 
@@ -1655,7 +1776,8 @@ def _row_from_candidate(
     as_of_date: date,
     order: ExecutionOrder | None,
 ) -> DailySignalReportRow:
-    status = "approved" if candidate.approved else "rejected"
+    status = _candidate_report_status(candidate)
+    outcome_fields = _candidate_outcome_row_fields(candidate)
     metadata = {
         "adjusted_risk_per_trade": candidate.adjusted_risk_per_trade,
         "risk_budget": candidate.sizing.risk_budget,
@@ -1663,6 +1785,8 @@ def _row_from_candidate(
         "notional_value": candidate.sizing.notional_value,
         "signal_metadata": dict(candidate.signal.metadata),
     }
+    if candidate.outcome is not None:
+        metadata["candidate_outcome"] = candidate.outcome.to_dict()
     if candidate.features is not None and candidate.features.market_context is not None:
         metadata["market_context"] = candidate.features.market_context.to_dict()
     if candidate.features is not None and candidate.features.portfolio_heat_context is not None:
@@ -1692,6 +1816,12 @@ def _row_from_candidate(
         strategy_name=candidate.signal.strategy_name,
         rationale=rationale,
         rejection_reasons=candidate.rejection_reasons,
+        candidate_disposition=outcome_fields["candidate_disposition"],
+        blocker_categories=outcome_fields["blocker_categories"],
+        blocker_severities=outcome_fields["blocker_severities"],
+        degraded_or_missing_contexts=outcome_fields["degraded_or_missing_contexts"],
+        actionable_now=outcome_fields["actionable_now"],
+        priority_bucket=outcome_fields["priority_bucket"],
         metadata=metadata,
     )
 
@@ -1709,6 +1839,7 @@ def _daily_research_row_from_evaluation(
         candidate,
         current_equity=current_equity,
     )
+    outcome_fields = _candidate_outcome_row_fields(candidate)
     metadata = {
         "score_components": dict(score_components),
         "adjusted_risk_per_trade": candidate.adjusted_risk_per_trade,
@@ -1717,6 +1848,8 @@ def _daily_research_row_from_evaluation(
         "notional_value": candidate.sizing.notional_value,
         "signal_metadata": dict(candidate.signal.metadata),
     }
+    if candidate.outcome is not None:
+        metadata["candidate_outcome"] = candidate.outcome.to_dict()
     if candidate.features is not None and candidate.features.market_context is not None:
         metadata["market_context"] = candidate.features.market_context.to_dict()
     if candidate.features is not None and candidate.features.portfolio_heat_context is not None:
@@ -1740,7 +1873,7 @@ def _daily_research_row_from_evaluation(
         preset_name=evaluation.preset_name,
         parameter_id=evaluation.parameter_id,
         symbol=candidate.signal.symbol,
-        status="approved" if candidate.approved else "rejected",
+        status=_candidate_report_status(candidate),
         action=candidate.signal.side,
         quantity=order.quantity if order is not None else 0,
         intended_order_type=order.intended_order_type if order is not None else None,
@@ -1757,6 +1890,12 @@ def _daily_research_row_from_evaluation(
         per_share_risk=candidate.sizing.per_share_risk,
         notional_value=candidate.sizing.notional_value,
         rejection_reasons=candidate.rejection_reasons,
+        candidate_disposition=outcome_fields["candidate_disposition"],
+        blocker_categories=outcome_fields["blocker_categories"],
+        blocker_severities=outcome_fields["blocker_severities"],
+        degraded_or_missing_contexts=outcome_fields["degraded_or_missing_contexts"],
+        actionable_now=outcome_fields["actionable_now"],
+        priority_bucket=outcome_fields["priority_bucket"],
         metadata=metadata,
     )
 
@@ -1770,6 +1909,46 @@ def _candidate_rationale(candidate: RiskAssessedCandidate) -> str:
     if priority_note is None:
         return rationale
     return f"{rationale} | {priority_note}"
+
+
+def _candidate_report_status(candidate: RiskAssessedCandidate) -> str:
+    return "approved" if candidate.operator_approved else "rejected"
+
+
+def _candidate_outcome_row_fields(candidate: RiskAssessedCandidate) -> dict[str, Any]:
+    outcome = candidate.outcome
+    execution_priority = candidate.execution_priority
+    actionable_now: bool | None
+    if execution_priority is not None:
+        actionable_now = execution_priority.actionable_now
+    elif outcome is not None:
+        actionable_now = outcome.disposition.value in _ACTIONABLE_DISPOSITIONS
+    else:
+        actionable_now = candidate.approved
+    return {
+        "candidate_disposition": (
+            outcome.disposition.value if outcome is not None else None
+        ),
+        "blocker_categories": tuple(
+            blocker.category.value for blocker in outcome.blockers
+        )
+        if outcome is not None
+        else (),
+        "blocker_severities": tuple(
+            blocker.severity.value for blocker in outcome.blockers
+        )
+        if outcome is not None
+        else (),
+        "degraded_or_missing_contexts": (
+            outcome.context_availability.degraded_or_missing_contexts
+            if outcome is not None
+            else ()
+        ),
+        "actionable_now": actionable_now,
+        "priority_bucket": (
+            execution_priority.priority_bucket if execution_priority is not None else None
+        ),
+    }
 
 
 def _market_breadth_brief_line(
@@ -1909,29 +2088,236 @@ def _daily_research_brief_card(row: DailyResearchOpportunityRow) -> list[str]:
     ]
 
 
+def _market_monitor_workflow_input_summaries(
+    *,
+    daily_summary: DailyResearchSummary | None,
+    portfolio_review: PortfolioReviewReport | None,
+) -> dict[str, dict[str, Any]]:
+    summaries: dict[str, dict[str, Any]] = {}
+    if daily_summary is not None:
+        daily_summary_input = _optional_mapping(
+            daily_summary.metadata.get("workflow_input_summary")
+        )
+        if daily_summary_input is not None:
+            summaries["daily_summary"] = dict(daily_summary_input)
+    if portfolio_review is not None:
+        portfolio_review_input = _optional_mapping(
+            portfolio_review.metadata.get("workflow_input_summary")
+        )
+        if portfolio_review_input is not None:
+            summaries["portfolio_review"] = dict(portfolio_review_input)
+    return summaries
+
+
+def _market_monitor_recommendation_sections(
+    rows: Sequence[DailyResearchOpportunityRow],
+) -> dict[str, tuple[DailyResearchOpportunityRow, ...]]:
+    sections: dict[str, list[DailyResearchOpportunityRow]] = {
+        section_name: []
+        for section_name in _MARKET_MONITOR_RECOMMENDATION_SECTION_ORDER
+    }
+    for row in rows:
+        section_name = _market_monitor_recommendation_section_name(row)
+        if section_name == "sector_gated_candidates":
+            sections["sector_gated_candidates"].append(row)
+        elif section_name == "degraded_context_candidates":
+            sections["degraded_context_candidates"].append(row)
+        elif section_name == "capacity_blocked_candidates":
+            sections["capacity_blocked_candidates"].append(row)
+        elif section_name == "actionable_buy_candidates":
+            sections["actionable_buy_candidates"].append(row)
+        else:
+            sections["fundamental_rejected_candidates"].append(row)
+    return {
+        section_name: tuple(section_rows)
+        for section_name, section_rows in sections.items()
+    }
+
+
+def _market_monitor_recommendation_summary(
+    recommendation_sections: Mapping[str, Sequence[DailyResearchOpportunityRow]],
+) -> dict[str, Any]:
+    candidate_disposition_counts: dict[str, int] = {}
+    for section_rows in recommendation_sections.values():
+        for row in section_rows:
+            disposition = _row_candidate_disposition(row)
+            if disposition is None:
+                continue
+            candidate_disposition_counts[disposition] = (
+                candidate_disposition_counts.get(disposition, 0) + 1
+            )
+    return {
+        "actionable_candidate_count": len(
+            recommendation_sections.get("actionable_buy_candidates", ())
+        ),
+        "capacity_blocked_candidate_count": len(
+            recommendation_sections.get("capacity_blocked_candidates", ())
+        ),
+        "sector_gated_candidate_count": len(
+            recommendation_sections.get("sector_gated_candidates", ())
+        ),
+        "degraded_context_candidate_count": len(
+            recommendation_sections.get("degraded_context_candidates", ())
+        ),
+        "fundamental_rejected_candidate_count": len(
+            recommendation_sections.get("fundamental_rejected_candidates", ())
+        ),
+        "approved_candidate_count": len(
+            recommendation_sections.get("actionable_buy_candidates", ())
+        )
+        + len(recommendation_sections.get("capacity_blocked_candidates", ())),
+        "ranked_candidate_count": sum(
+            len(section_rows) for section_rows in recommendation_sections.values()
+        ),
+        "candidate_disposition_counts": candidate_disposition_counts,
+    }
+
+
+def _append_monitor_recommendation_bucket(
+    lines: list[str],
+    *,
+    title: str,
+    rows: Sequence[DailyResearchOpportunityRow],
+    limit: int,
+) -> bool:
+    if not rows:
+        return False
+    lines.append(title)
+    for row in rows[:limit]:
+        lines.append(_daily_research_monitor_brief_line(row))
+    remaining_count = len(rows) - limit
+    if remaining_count > 0:
+        lines.append(f"- {remaining_count} more {title.lower()} not shown.")
+    return True
+
+
 def _daily_research_monitor_brief_line(row: DailyResearchOpportunityRow) -> str:
-    if row.status == "approved":
+    context_suffix = ""
+    degraded_contexts = _row_degraded_or_missing_contexts(row)
+    if degraded_contexts:
+        context_suffix = " | context=" + ", ".join(
+            _brief_context_label(context_key) for context_key in degraded_contexts
+        )
+    if _row_is_operator_approved(row):
         return (
             f"- {row.rank}. {row.symbol} | preset={row.preset_name} | "
             f"qty={row.quantity} | entry={_brief_value(row.entry_price_hint)} | "
             f"stop={_brief_value(row.stop_level)} | note={_single_line(row.rationale)}"
+            f"{context_suffix}"
         )
 
     reason = row.rejection_reasons[0] if row.rejection_reasons else row.rationale
+    disposition = _row_candidate_disposition(row) or row.status
+    blocker_categories = _row_blocker_categories(row)
+    blocker_suffix = ""
+    if blocker_categories:
+        blocker_suffix = " | blockers=" + ",".join(blocker_categories)
     return (
         f"- {row.rank}. {row.symbol} | preset={row.preset_name} | "
-        f"status={row.status} | reason={_single_line(reason)}"
+        f"status={disposition} | reason={_single_line(reason)}"
+        f"{blocker_suffix}{context_suffix}"
     )
 
 
 def _row_actionable_now(row: DailyResearchOpportunityRow) -> bool:
+    if isinstance(row.actionable_now, bool):
+        return row.actionable_now
     execution_priority = row.metadata.get("execution_priority")
     if not isinstance(execution_priority, Mapping):
+        disposition = _row_candidate_disposition(row)
+        if disposition is not None:
+            return disposition in _ACTIONABLE_DISPOSITIONS
         return row.status == "approved"
     actionable_now = execution_priority.get("actionable_now")
     if isinstance(actionable_now, bool):
         return actionable_now
+    disposition = _row_candidate_disposition(row)
+    if disposition is not None:
+        return disposition in _ACTIONABLE_DISPOSITIONS
     return row.status == "approved"
+
+
+def _row_is_sector_gated(row: DailyResearchOpportunityRow) -> bool:
+    return bool(_SECTOR_GATED_BLOCKER_CATEGORIES.intersection(_row_blocker_categories(row)))
+
+
+def _row_has_missing_optional_context(row: DailyResearchOpportunityRow) -> bool:
+    return bool(_row_degraded_or_missing_contexts(row))
+
+
+def _market_monitor_recommendation_section_name(row: DailyResearchOpportunityRow) -> str:
+    if _row_is_operator_approved(row):
+        if _row_actionable_now(row):
+            return "actionable_buy_candidates"
+        return "capacity_blocked_candidates"
+    if _row_is_sector_gated(row):
+        return "sector_gated_candidates"
+    if _row_has_missing_optional_context(row):
+        return "degraded_context_candidates"
+    return "fundamental_rejected_candidates"
+
+
+def _row_is_operator_approved(row: DailyResearchOpportunityRow) -> bool:
+    disposition = _row_candidate_disposition(row)
+    if disposition is not None:
+        return disposition in _OPERATOR_APPROVED_DISPOSITIONS
+    return row.status == "approved"
+
+
+def _row_candidate_disposition(row: DailyResearchOpportunityRow) -> str | None:
+    if isinstance(row.candidate_disposition, str) and row.candidate_disposition.strip():
+        return row.candidate_disposition
+    candidate_outcome = _optional_mapping(row.metadata.get("candidate_outcome"))
+    if candidate_outcome is None:
+        return None
+    disposition = candidate_outcome.get("disposition")
+    if isinstance(disposition, str) and disposition.strip():
+        return disposition.strip()
+    return None
+
+
+def _row_blocker_categories(row: DailyResearchOpportunityRow) -> tuple[str, ...]:
+    if row.blocker_categories:
+        return row.blocker_categories
+    candidate_outcome = _optional_mapping(row.metadata.get("candidate_outcome"))
+    if candidate_outcome is None:
+        return ()
+    blockers = candidate_outcome.get("blockers")
+    if not isinstance(blockers, Sequence) or isinstance(blockers, (str, bytes)):
+        return ()
+    categories: list[str] = []
+    for blocker in blockers:
+        if not isinstance(blocker, Mapping):
+            continue
+        category = blocker.get("category")
+        if isinstance(category, str) and category.strip():
+            categories.append(category.strip())
+    return tuple(categories)
+
+
+def _row_degraded_or_missing_contexts(row: DailyResearchOpportunityRow) -> tuple[str, ...]:
+    if row.degraded_or_missing_contexts:
+        return row.degraded_or_missing_contexts
+    candidate_outcome = _optional_mapping(row.metadata.get("candidate_outcome"))
+    if candidate_outcome is None:
+        return ()
+    context_availability = _optional_mapping(candidate_outcome.get("context_availability"))
+    if context_availability is None:
+        return ()
+    degraded_contexts: list[str] = []
+    for context_key, status in context_availability.items():
+        if isinstance(status, str) and status in {"degraded", "unavailable"}:
+            degraded_contexts.append(str(context_key))
+    return tuple(degraded_contexts)
+
+
+def _brief_context_label(context_key: str) -> str:
+    return {
+        "sector_context": "sector unavailable",
+        "volatility_context": "volatility unavailable",
+        "earnings_context": "earnings unavailable",
+        "market_breadth_context": "breadth unavailable",
+    }.get(context_key, context_key.replace("_", " "))
 
 
 def _market_monitor_brief_line(alert: MarketMonitorAlertRow) -> str:
@@ -2001,6 +2387,12 @@ def _optional_float(value: Any) -> float | None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
+    return None
+
+
+def _optional_mapping(value: Any) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        return value
     return None
 
 

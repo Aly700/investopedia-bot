@@ -73,6 +73,13 @@ from bot.reporting.daily_report import (
     write_daily_research_summary,
     write_market_monitor_brief,
 )
+from bot.risk.candidate_outcome import (
+    BlockerCategory,
+    BlockerSeverity,
+    CandidateBlocker,
+    CandidateOutcome,
+    build_context_availability,
+)
 from bot.risk.portfolio_rules import (
     PORTFOLIO_REVIEW_ACTIONS,
     ExistingPosition,
@@ -1527,6 +1534,241 @@ def test_market_monitor_brief_limits_top_buy_section_and_moves_remainder_lower(
     assert "5. EEE" in buy_section
     assert "6. FFF" not in buy_section
     assert "6. FFF" in lower_priority_section
+
+
+def test_market_monitor_report_surfaces_capacity_blocked_sector_gated_and_degraded_candidates() -> None:
+    preset = _selected_presets("standard_breakout")[0]
+
+    def with_signal_metadata(
+        evaluation: PresetCandidateEvaluation,
+        **metadata: object,
+    ) -> PresetCandidateEvaluation:
+        return replace(
+            evaluation,
+            candidate=replace(
+                evaluation.candidate,
+                signal=replace(
+                    evaluation.candidate.signal,
+                    metadata={
+                        **dict(evaluation.candidate.signal.metadata),
+                        **metadata,
+                    },
+                ),
+            ),
+        )
+
+    stronger = _evaluation(
+        preset,
+        symbol="AAA",
+        approved=True,
+        shares=30,
+        prior_high=99.0,
+        entry_price=101.0,
+        relative_volume=2.6,
+    )
+    blocked = _evaluation(
+        preset,
+        symbol="BBB",
+        approved=True,
+        shares=30,
+        prior_high=99.5,
+        entry_price=100.5,
+        relative_volume=1.8,
+    )
+    prioritized_candidates = annotate_execution_priority(
+        [stronger.candidate, blocked.candidate],
+        current_equity=100_000.0,
+        current_positions=[
+            ExistingPosition(symbol="MSFT", shares=10, average_entry_price=100.0),
+            ExistingPosition(symbol="NVDA", shares=10, average_entry_price=100.0),
+            ExistingPosition(symbol="JPM", shares=10, average_entry_price=100.0),
+        ],
+        constraints=PortfolioConstraints(
+            max_concurrent_positions=4,
+            max_position_pct_equity=0.25,
+            no_averaging_down=True,
+        ),
+    )
+    stronger = replace(stronger, candidate=prioritized_candidates[0])
+    blocked = replace(blocked, candidate=prioritized_candidates[1])
+
+    sector_gated = with_signal_metadata(
+        _evaluation(
+            preset,
+            symbol="CCC",
+            approved=False,
+            shares=0,
+            rejection_reasons=(
+                "Sector ETF XLK is below its trend filter; new entries require sector support.",
+            ),
+            outcome=CandidateOutcome.from_blockers(
+                (
+                    CandidateBlocker(
+                        category=BlockerCategory.SECTOR_REGIME,
+                        severity=BlockerSeverity.SOFT,
+                        reason=(
+                            "Sector ETF XLK is below its trend filter; new entries require sector support."
+                        ),
+                        context_key="sector_context",
+                    ),
+                ),
+                context_availability=build_context_availability(sector_context=True),
+            ),
+        ),
+        sector_context_available=True,
+        sector_etf_symbol="XLK",
+    )
+    degraded = with_signal_metadata(
+        _evaluation(
+            preset,
+            symbol="DDD",
+            approved=False,
+            shares=0,
+            rejection_reasons=(
+                "Calculated share size is zero after risk and notional constraints.",
+            ),
+            outcome=CandidateOutcome.from_blockers(
+                (
+                    CandidateBlocker(
+                        category=BlockerCategory.SIZING,
+                        severity=BlockerSeverity.HARD,
+                        reason="Calculated share size is zero after risk and notional constraints.",
+                        context_key="position_sizing",
+                    ),
+                ),
+                context_availability=build_context_availability(sector_context=False),
+            ),
+        ),
+        sector_context_available=False,
+    )
+    fundamental = with_signal_metadata(
+        _evaluation(
+            preset,
+            symbol="EEE",
+            approved=False,
+            shares=0,
+            rejection_reasons=(
+                "No averaging down is allowed for existing long positions.",
+            ),
+            outcome=CandidateOutcome.from_blockers(
+                (
+                    CandidateBlocker(
+                        category=BlockerCategory.DUPLICATE_POSITION,
+                        severity=BlockerSeverity.HARD,
+                        reason="No averaging down is allowed for existing long positions.",
+                        context_key="existing_position",
+                    ),
+                ),
+                context_availability=build_context_availability(sector_context=True),
+            ),
+        ),
+        sector_context_available=True,
+    )
+    summary = build_daily_research_summary(
+        as_of_date=date(2024, 1, 5),
+        execution_batch=ManualExecutor().build_execution_batch(
+            [
+                stronger.candidate,
+                blocked.candidate,
+                sector_gated.candidate,
+                degraded.candidate,
+                fundamental.candidate,
+            ],
+            as_of_date=date(2024, 1, 5),
+        ),
+        evaluations=[stronger, blocked, sector_gated, degraded, fundamental],
+        selected_presets=[preset],
+        universe_symbols=["AAA", "BBB", "CCC", "DDD", "EEE"],
+        current_equity=100_000.0,
+        no_signal_symbols_by_preset={"standard_breakout": ()},
+        benchmark_symbol="SPY",
+        preset_selection_source="named_presets",
+        metadata={
+            "workflow_input_summary": {
+                "total_count": 2,
+                "ok_count": 0,
+                "degraded_count": 1,
+                "unavailable_count": 1,
+                "failed_count": 0,
+                "issue_count": 2,
+                "healthy": False,
+                "problematic_inputs": [
+                    "earnings_calendar",
+                    "volatility_context",
+                ],
+                "issue_codes": [
+                    "entitlement_limited",
+                    "unsupported_capability",
+                ],
+                "issues": [
+                    {
+                        "input_name": "earnings_calendar",
+                        "status": "degraded",
+                        "role_name": "earnings_calendar",
+                        "provider": "polygon",
+                        "issue_code": "entitlement_limited",
+                        "message": "Earnings entitlement is unavailable.",
+                    },
+                    {
+                        "input_name": "volatility_context",
+                        "status": "unavailable",
+                        "role_name": "historical_bars",
+                        "provider": "alpaca",
+                        "issue_code": "unsupported_capability",
+                        "message": "VIX symbols are not supported.",
+                    },
+                ],
+            }
+        },
+    )
+
+    report = build_market_monitor_report(as_of_date=date(2024, 1, 5), daily_summary=summary)
+    payload = report.to_dict()
+    text = report.to_brief()
+
+    assert report.category_counts["BUY CANDIDATE"] == 1
+    assert payload["recommendation_summary"]["actionable_candidate_count"] == 1
+    assert payload["recommendation_summary"]["capacity_blocked_candidate_count"] == 1
+    assert payload["recommendation_summary"]["sector_gated_candidate_count"] == 1
+    assert payload["recommendation_summary"]["degraded_context_candidate_count"] == 1
+    assert payload["recommendation_summary"]["fundamental_rejected_candidate_count"] == 1
+    assert payload["recommendation_summary"]["approved_candidate_count"] == 2
+    assert payload["recommendation_summary"]["candidate_disposition_counts"] == {
+        "actionable": 2,
+        "soft_gated": 1,
+        "hard_rejected": 2,
+    }
+    assert [row["symbol"] for row in payload["recommendation_sections"]["capacity_blocked_candidates"]] == [
+        "BBB"
+    ]
+    assert [row["symbol"] for row in payload["recommendation_sections"]["sector_gated_candidates"]] == [
+        "CCC"
+    ]
+    assert [row["symbol"] for row in payload["recommendation_sections"]["degraded_context_candidates"]] == [
+        "DDD"
+    ]
+    assert payload["recommendation_sections"]["capacity_blocked_candidates"][0][
+        "candidate_disposition"
+    ] == "actionable"
+    assert payload["recommendation_sections"]["sector_gated_candidates"][0][
+        "candidate_disposition"
+    ] == "soft_gated"
+    assert payload["recommendation_sections"]["sector_gated_candidates"][0][
+        "blocker_categories"
+    ] == ["sector_regime"]
+    assert payload["recommendation_sections"]["degraded_context_candidates"][0][
+        "degraded_or_missing_contexts"
+    ] == ["sector_context"]
+    assert payload["workflow_input_summaries"]["daily_summary"]["issue_count"] == 2
+    assert "Workflow inputs" in text
+    assert "Blocked by capacity" in text
+    assert "Sector-gated candidates" in text
+    assert "Degraded-context candidates" in text
+    assert "Other rejected names" in text
+    assert "BBB" in text
+    assert "CCC" in text
+    assert "DDD" in text
+    assert "context=sector unavailable" in text
 
 
 def test_market_monitor_report_orders_multiple_alert_categories_by_priority() -> None:
@@ -6926,6 +7168,7 @@ def _evaluation(
     relative_volume_required: bool | None = None,
     rejection_reasons: tuple[str, ...] = (),
     existing_position: ExistingPosition | None = None,
+    outcome: CandidateOutcome | None = None,
 ) -> PresetCandidateEvaluation:
     relative_volume_threshold = preset.relative_volume_threshold
     required = (
@@ -6983,6 +7226,7 @@ def _evaluation(
             sizing=sizing,
             approved=approved,
             rejection_reasons=rejection_reasons,
+            outcome=outcome,
             existing_position=existing_position,
         ),
     )

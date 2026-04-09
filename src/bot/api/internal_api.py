@@ -18,6 +18,7 @@ from bot.data.pending_orders import (
     pending_order_reserves_unmatched_slot,
 )
 from bot.logging_utils import get_logger
+from bot.risk.candidate_outcome import CandidateDisposition
 from bot.risk.portfolio_rules import (
     ExistingPosition,
     PortfolioInputError,
@@ -36,6 +37,12 @@ from bot.workflow_status import (
 
 
 LOGGER = get_logger(__name__)
+_OPERATOR_APPROVED_DISPOSITIONS = {
+    CandidateDisposition.ACTIONABLE.value,
+    CandidateDisposition.APPROVED_CAPACITY_BLOCKED.value,
+    CandidateDisposition.DEGRADED_APPROVED.value,
+}
+_CAPACITY_BLOCKED_DISPOSITION = CandidateDisposition.APPROVED_CAPACITY_BLOCKED.value
 
 INTERNAL_API_VERSION = 1
 INTERNAL_API_ENDPOINTS = (
@@ -481,6 +488,15 @@ def _endpoint_response(
     }
 
 
+def _optional_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return cleaned
+
+
 def _load_current_positions(
     portfolio_path: str | None,
 ) -> tuple[list[ExistingPosition], tuple[str, ...], bool]:
@@ -514,12 +530,43 @@ def _market_state_recommendation_state(
     latest_monitor_market_output_path, latest_monitor_market_output_date = (
         _latest_monitor_market_output(project_root)
     )
+    monitor_market_recommendation_sections = _load_monitor_market_recommendation_sections_for_date(
+        project_root,
+        as_of_date=current_snapshot.as_of_date,
+    )
     workflow_input_summaries = _load_workflow_input_summaries_for_date(
         project_root,
         as_of_date=current_snapshot.as_of_date,
     )
+    approved_candidate_queue = tuple(
+        candidate
+        for candidate in current_snapshot.approved_candidate_queue
+        if _market_state_candidate_is_operator_approved(candidate)
+    )
+    actionable_candidates = [
+        candidate.to_dict()
+        for candidate in approved_candidate_queue
+        if candidate.actionable_now
+    ]
+    capacity_blocked_candidates = [
+        candidate.to_dict()
+        for candidate in approved_candidate_queue
+        if _market_state_candidate_is_capacity_blocked(candidate)
+    ]
+    sector_gated_candidates = _recommendation_section_preview(
+        monitor_market_recommendation_sections,
+        section_name="sector_gated_candidates",
+    )
+    degraded_context_candidates = _recommendation_section_preview(
+        monitor_market_recommendation_sections,
+        section_name="degraded_context_candidates",
+    )
+    fundamental_rejected_candidates = _recommendation_section_preview(
+        monitor_market_recommendation_sections,
+        section_name="fundamental_rejected_candidates",
+    )
     empty_reasons: list[str] = []
-    if not current_snapshot.approved_candidate_queue:
+    if not approved_candidate_queue:
         if current_snapshot.top_rejected_reasons_summary:
             rejection_summary = "; ".join(
                 f"{reason.reason} ({reason.count})"
@@ -532,16 +579,40 @@ def _market_state_recommendation_state(
             empty_reasons.append(
                 "No approved candidates are present in the current market-state snapshot."
             )
-    if not top_priority_candidates and current_snapshot.approved_candidate_queue:
+    elif not actionable_candidates and capacity_blocked_candidates:
+        blocked_count = len(capacity_blocked_candidates)
+        empty_reasons.append(
+            "No approved candidates are actionable right now; "
+            f"{blocked_count} approved candidate"
+            + ("" if blocked_count == 1 else "s")
+            + " "
+            + ("is" if blocked_count == 1 else "are")
+            + " blocked by current portfolio capacity."
+        )
+    elif not top_priority_candidates and approved_candidate_queue:
         empty_reasons.append(
             "Approved candidates are present, but none are currently marked top priority."
         )
     return {
-        "approved_candidate_count": len(current_snapshot.approved_candidate_queue),
+        "approved_candidate_count": len(approved_candidate_queue),
+        "actionable_candidate_count": len(actionable_candidates),
+        "capacity_blocked_candidate_count": len(capacity_blocked_candidates),
+        "sector_gated_candidate_count": len(sector_gated_candidates),
+        "degraded_context_candidate_count": len(degraded_context_candidates),
+        "fundamental_rejected_candidate_count": len(fundamental_rejected_candidates),
         "top_priority_candidate_count": len(top_priority_candidates),
-        "queue_empty": not current_snapshot.approved_candidate_queue,
+        "queue_empty": not approved_candidate_queue,
+        "actionable_queue_empty": not actionable_candidates,
         "top_priority_empty": not top_priority_candidates,
         "empty_reasons": empty_reasons,
+        "top_capacity_blocked_candidates": capacity_blocked_candidates[:5],
+        "top_sector_gated_candidates": sector_gated_candidates[:5],
+        "top_degraded_context_candidates": degraded_context_candidates[:5],
+        "top_fundamental_rejected_candidates": fundamental_rejected_candidates[:5],
+        "candidate_disposition_counts": _recommendation_candidate_disposition_counts(
+            approved_candidate_queue=approved_candidate_queue,
+            recommendation_sections=monitor_market_recommendation_sections,
+        ),
         "workflow_input_overview": build_workflow_input_overview(
             workflow_input_summaries
         ).to_dict(),
@@ -597,20 +668,106 @@ def _market_state_recommendation_context_notes(
     return notes
 
 
+def _market_state_candidate_is_operator_approved(candidate: Any) -> bool:
+    disposition = _optional_text(getattr(candidate, "candidate_disposition", None))
+    if disposition is not None:
+        return disposition in _OPERATOR_APPROVED_DISPOSITIONS
+    return bool(getattr(candidate, "status", None) == "approved")
+
+
+def _market_state_candidate_is_capacity_blocked(candidate: Any) -> bool:
+    disposition = _optional_text(getattr(candidate, "candidate_disposition", None))
+    if disposition == _CAPACITY_BLOCKED_DISPOSITION:
+        return True
+    return _market_state_candidate_is_operator_approved(candidate) and not bool(
+        getattr(candidate, "actionable_now", False)
+    )
+
+
+def _load_monitor_market_recommendation_sections_for_date(
+    project_root: Path,
+    *,
+    as_of_date: date,
+) -> dict[str, tuple[dict[str, Any], ...]]:
+    payload = _load_latest_workflow_artifact_payload_for_date(
+        project_root,
+        as_of_date=as_of_date,
+        filename="market_monitor.json",
+        processed_roots=("live_market", "monitor_market"),
+    )
+    if payload is None:
+        return {}
+    raw_sections = payload.get("recommendation_sections")
+    if not isinstance(raw_sections, Mapping):
+        return {}
+    sections: dict[str, tuple[dict[str, Any], ...]] = {}
+    for section_name, section_rows in raw_sections.items():
+        if not isinstance(section_name, str) or not section_name.strip():
+            continue
+        if isinstance(section_rows, (str, bytes)) or not isinstance(section_rows, Sequence):
+            continue
+        rows: list[dict[str, Any]] = []
+        for row in section_rows:
+            if isinstance(row, Mapping):
+                rows.append(dict(row))
+        sections[section_name] = tuple(rows)
+    return sections
+
+
+def _recommendation_section_preview(
+    recommendation_sections: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    section_name: str,
+) -> list[dict[str, Any]]:
+    return [dict(row) for row in recommendation_sections.get(section_name, ())[:5]]
+
+
+def _recommendation_candidate_disposition_counts(
+    *,
+    approved_candidate_queue: Sequence[Any],
+    recommendation_sections: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if recommendation_sections:
+        for section_rows in recommendation_sections.values():
+            for row in section_rows:
+                disposition = _optional_text(row.get("candidate_disposition"))
+                if disposition is None:
+                    candidate_outcome = row.get("metadata")
+                    if isinstance(candidate_outcome, Mapping):
+                        outcome_payload = candidate_outcome.get("candidate_outcome")
+                        if isinstance(outcome_payload, Mapping):
+                            disposition = _optional_text(outcome_payload.get("disposition"))
+                if disposition is None:
+                    continue
+                counts[disposition] = counts.get(disposition, 0) + 1
+        if counts:
+            return counts
+    for candidate in approved_candidate_queue:
+        disposition = _optional_text(getattr(candidate, "candidate_disposition", None))
+        if disposition is None:
+            continue
+        counts[disposition] = counts.get(disposition, 0) + 1
+    return counts
+
+
 def _latest_monitor_market_output(project_root: Path) -> tuple[Path | None, date | None]:
     candidate_paths: list[Path] = []
     for root_name in ("monitor_market", "live_market"):
-        monitor_market_root = project_root / "data" / "processed" / root_name
-        if not monitor_market_root.exists():
-            continue
-        try:
-            candidate_paths.extend(monitor_market_root.rglob("market_monitor.json"))
-        except OSError as exc:
-            LOGGER.warning(
-                "Ignoring monitor-market artifact lookup under %s because the directory could not be scanned: %s",
-                monitor_market_root,
-                exc,
-            )
+        for monitor_market_root in _workflow_artifact_roots(
+            project_root,
+            root_name=root_name,
+        ):
+            if not monitor_market_root.exists():
+                continue
+            try:
+                candidate_paths.extend(monitor_market_root.rglob("market_monitor.json"))
+            except OSError as exc:
+                LOGGER.warning(
+                    "Ignoring monitor-market artifact lookup under %s because the directory could not be scanned: %s",
+                    monitor_market_root,
+                    exc,
+                )
     latest_candidate: tuple[date, int, Path] | None = None
     for path in candidate_paths:
         try:
@@ -674,35 +831,79 @@ def _load_latest_workflow_artifact_payload_for_date(
     filename: str,
     processed_roots: Sequence[str],
 ) -> Mapping[str, Any] | None:
-    best_candidate: tuple[int, Mapping[str, Any]] | None = None
+    best_candidate: tuple[int, int, Mapping[str, Any]] | None = None
     for priority, root_name in enumerate(processed_roots):
-        path = (
-            project_root
-            / "data"
-            / "processed"
-            / root_name
-            / as_of_date.isoformat()
-            / filename
-        )
-        if not path.exists():
-            continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            LOGGER.warning(
-                "Ignoring workflow artifact %s because it could not be loaded: %s",
-                path,
-                exc,
-            )
-            continue
-        if not isinstance(payload, Mapping):
-            continue
-        candidate = (priority, dict(payload))
-        if best_candidate is None or candidate[0] < best_candidate[0]:
-            best_candidate = candidate
+        for path in _workflow_artifact_paths_for_date(
+            project_root,
+            root_name=root_name,
+            as_of_date=as_of_date,
+            filename=filename,
+        ):
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                LOGGER.warning(
+                    "Ignoring workflow artifact %s because it could not be loaded: %s",
+                    path,
+                    exc,
+                )
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            try:
+                mtime_ns = path.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = -1
+            candidate = (priority, mtime_ns, dict(payload))
+            if (
+                best_candidate is None
+                or candidate[0] < best_candidate[0]
+                or (candidate[0] == best_candidate[0] and candidate[1] > best_candidate[1])
+            ):
+                best_candidate = candidate
     if best_candidate is None:
         return None
-    return best_candidate[1]
+    return best_candidate[2]
+
+
+def _workflow_artifact_roots(project_root: Path, *, root_name: str) -> tuple[Path, ...]:
+    candidates = [
+        project_root / "data" / "processed" / root_name,
+    ]
+    if root_name == "live_market":
+        candidates.extend(
+            (
+                project_root / "archive" / "live_market",
+                project_root.parent / "archive" / "live_market",
+            )
+        )
+    deduplicated: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(candidate)
+    return tuple(deduplicated)
+
+
+def _workflow_artifact_paths_for_date(
+    project_root: Path,
+    *,
+    root_name: str,
+    as_of_date: date,
+    filename: str,
+) -> tuple[Path, ...]:
+    return tuple(
+        artifact_root / as_of_date.isoformat() / filename
+        for artifact_root in _workflow_artifact_roots(
+            project_root,
+            root_name=root_name,
+        )
+    )
 
 
 def _workflow_input_summary_from_artifact_payload(

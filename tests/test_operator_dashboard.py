@@ -220,6 +220,10 @@ def test_dashboard_app_asset_references_internal_api_endpoints() -> None:
     assert "function workflowOverviewStatusLabel(status)" in javascript
     assert "function renderWorkflowInputOverviewBlock(" in javascript
     assert "recommendationState.workflow_input_overview" in javascript
+    assert "recommendationState.top_sector_gated_candidates" in javascript
+    assert "recommendationState.top_degraded_context_candidates" in javascript
+    assert "recommendationState.top_fundamental_rejected_candidates" in javascript
+    assert "recommendationState.candidate_disposition_counts" in javascript
     assert "data.workflow_input_overview" in javascript
     assert "Recommendation input health" in javascript
 
@@ -447,6 +451,239 @@ def test_dashboard_runtime_renders_workflow_input_overview_blocks(
         }
         if (!els.candidateQueueBody.innerHTML.includes("daily_summary | Unavailable")) {
           throw new Error(`Expected daily_summary details in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        """,
+    )
+
+
+def test_dashboard_runtime_renders_structured_recommendation_state_in_queue_panel(
+    tmp_path: Path,
+) -> None:
+    _run_dashboard_app_runtime_test(
+        tmp_path,
+        test_body="""
+        state.currentResults = {
+          health: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          marketState: {
+            ok: true,
+            payload: {
+              available: true,
+              warnings: [],
+              data: {
+                snapshot: {
+                  as_of_timestamp: "2024-01-05T15:00:00+00:00",
+                  source_workflows: ["monitor-market"],
+                  approved_candidate_queue: [
+                    {
+                      symbol: "NVDA",
+                      rank: 1,
+                      preset_name: "standard_breakout",
+                      actionable_now: true,
+                      priority_bucket: "top_priority",
+                      candidate_disposition: "actionable",
+                      blocker_categories: [],
+                      degraded_or_missing_contexts: [],
+                      entry_price_hint: 450.5,
+                      stop_level: 430.0,
+                      sector_name: "Technology",
+                    },
+                    {
+                      symbol: "AMD",
+                      rank: 2,
+                      preset_name: "standard_breakout",
+                      actionable_now: false,
+                      priority_bucket: "capacity_constrained",
+                      candidate_disposition: "approved_capacity_blocked",
+                      blocker_categories: ["capacity"],
+                      degraded_or_missing_contexts: [],
+                      entry_price_hint: 170.0,
+                      stop_level: 160.0,
+                      sector_name: "Technology",
+                    },
+                  ],
+                  top_rejected_reasons_summary: [
+                    { reason: "Max concurrent positions reached.", count: 5 },
+                  ],
+                },
+                current_alertable_states: [],
+                recent_transitions: [],
+                top_priority_candidates: [
+                  {
+                    symbol: "NVDA",
+                    rank: 1,
+                    preset_name: "standard_breakout",
+                    actionable_now: true,
+                    priority_bucket: "top_priority",
+                    candidate_disposition: "actionable",
+                  },
+                ],
+                recommendation_state: {
+                  top_priority_candidate_count: 1,
+                  actionable_candidate_count: 1,
+                  approved_candidate_count: 2,
+                  capacity_blocked_candidate_count: 1,
+                  sector_gated_candidate_count: 1,
+                  degraded_context_candidate_count: 1,
+                  fundamental_rejected_candidate_count: 1,
+                  candidate_disposition_counts: {
+                    actionable: 1,
+                    approved_capacity_blocked: 1,
+                    soft_gated: 1,
+                    hard_rejected: 2,
+                  },
+                  empty_reasons: [
+                    "Actionable buys are limited by current portfolio capacity.",
+                  ],
+                  context_notes: [
+                    "Volatility context is unavailable in the current market-state snapshot.",
+                  ],
+                  top_capacity_blocked_candidates: [
+                    {
+                      symbol: "AMD",
+                      rank: 2,
+                      preset_name: "standard_breakout",
+                      actionable_now: false,
+                      priority_bucket: "capacity_constrained",
+                      candidate_disposition: "approved_capacity_blocked",
+                      blocker_categories: ["capacity"],
+                      degraded_or_missing_contexts: [],
+                      entry_price_hint: 170.0,
+                      stop_level: 160.0,
+                      sector_name: "Technology",
+                    },
+                  ],
+                  top_sector_gated_candidates: [
+                    {
+                      symbol: "CRM",
+                      rank: 3,
+                      preset_name: "standard_breakout",
+                      candidate_disposition: "soft_gated",
+                      blocker_categories: ["sector_regime"],
+                      degraded_or_missing_contexts: [],
+                      rationale: "Sector ETF XLK is below its trend filter; new entries require sector support.",
+                    },
+                  ],
+                  top_degraded_context_candidates: [
+                    {
+                      symbol: "SHOP",
+                      rank: 4,
+                      preset_name: "standard_breakout",
+                      candidate_disposition: "hard_rejected",
+                      blocker_categories: ["sizing"],
+                      degraded_or_missing_contexts: ["sector_context"],
+                      rationale: "Calculated share size is zero after risk and notional constraints.",
+                    },
+                  ],
+                  top_fundamental_rejected_candidates: [
+                    {
+                      symbol: "AAPL",
+                      rank: 5,
+                      preset_name: "standard_breakout",
+                      candidate_disposition: "hard_rejected",
+                      blocker_categories: ["duplicate_position"],
+                      degraded_or_missing_contexts: [],
+                      rationale: "No averaging down is allowed for existing long positions.",
+                    },
+                  ],
+                  workflow_input_overview: {
+                    workflow_count: 1,
+                    healthy_workflow_count: 0,
+                    degraded_workflow_count: 0,
+                    unavailable_workflow_count: 1,
+                    failed_workflow_count: 0,
+                    problematic_workflow_count: 1,
+                    highest_severity: "unavailable",
+                    problematic_workflows: [
+                      {
+                        workflow_name: "daily_summary",
+                        status: "unavailable",
+                        issue_count: 1,
+                        issue_codes: ["unsupported_capability"],
+                        problematic_inputs: ["volatility_context"],
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          },
+          marketTransitions: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          portfolio: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          analytics: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          controlSafety: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+          pendingOrders: {
+            ok: true,
+            payload: { available: false, warnings: [], data: {} },
+          },
+        };
+
+        renderCurrentDashboard();
+
+        if (!els.marketStateBody.innerHTML.includes("Recommendation state")) {
+          throw new Error(`Expected recommendation state block in market-state panel: ${els.marketStateBody.innerHTML}`);
+        }
+        if (!els.marketStateBody.innerHTML.includes("Capacity blocked")) {
+          throw new Error(`Expected structured recommendation counts in market-state panel: ${els.marketStateBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Actionable candidates")) {
+          throw new Error(`Expected actionable candidates block in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Blocked by capacity")) {
+          throw new Error(`Expected capacity-blocked block in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Sector-gated candidates")) {
+          throw new Error(`Expected sector-gated block in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Degraded-context candidates")) {
+          throw new Error(`Expected degraded-context block in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Fundamental rejects")) {
+          throw new Error(`Expected fundamental rejects block in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("NVDA")) {
+          throw new Error(`Expected actionable candidate in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("AMD")) {
+          throw new Error(`Expected capacity-blocked candidate in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("CRM")) {
+          throw new Error(`Expected sector-gated candidate in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("SHOP")) {
+          throw new Error(`Expected degraded-context candidate in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("AAPL")) {
+          throw new Error(`Expected fundamental rejected candidate in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Disposition mix")) {
+          throw new Error(`Expected disposition mix in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Actionable 1")) {
+          throw new Error(`Expected actionable disposition chip in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Capacity blocked 1")) {
+          throw new Error(`Expected capacity-blocked disposition chip in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("context=sector unavailable")) {
+          throw new Error(`Expected degraded context detail in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
+        }
+        if (!els.candidateQueueBody.innerHTML.includes("Actionable buys are limited by current portfolio capacity.")) {
+          throw new Error(`Expected recommendation note in candidate queue panel: ${els.candidateQueueBody.innerHTML}`);
         }
         """,
     )

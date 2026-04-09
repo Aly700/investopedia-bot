@@ -192,7 +192,7 @@ def annotate_execution_priority(
 
     approved_entries: list[tuple[int, RiskAssessedCandidate, ExecutionPriority]] = []
     for index, candidate in enumerate(candidates):
-        if not candidate.approved:
+        if not candidate.operator_approved:
             continue
 
         opportunity_score, score_components = score_risk_candidate_opportunity(
@@ -345,7 +345,7 @@ def risk_candidate_sort_key(
 ) -> tuple[int, int, float, int, str, str]:
     """Return the shared deterministic sort key used by execution workflows."""
 
-    approval_rank = 1 if candidate.approved else 0
+    approval_rank = 1 if candidate.operator_approved else 0
     priority = candidate.execution_priority
     actionable_rank = 1 if priority is not None and priority.actionable_now else 0
     if priority is not None:

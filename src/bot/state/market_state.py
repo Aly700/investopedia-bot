@@ -19,6 +19,7 @@ from bot.data.state_persistence import (
     write_text_file,
 )
 from bot.features import MarketContext
+from bot.risk.candidate_outcome import CandidateDisposition
 from bot.reporting.daily_report import (
     DailyResearchSummary,
     IntradayPortfolioReviewReport,
@@ -54,6 +55,15 @@ _PORTFOLIO_ACTION_SEVERITY = {
     "RAISE STOP": 1,
     "WATCH CLOSELY": 2,
     "EXIT CANDIDATE": 3,
+}
+_OPERATOR_APPROVED_DISPOSITIONS = {
+    CandidateDisposition.ACTIONABLE.value,
+    CandidateDisposition.APPROVED_CAPACITY_BLOCKED.value,
+    CandidateDisposition.DEGRADED_APPROVED.value,
+}
+_ACTIONABLE_DISPOSITIONS = {
+    CandidateDisposition.ACTIONABLE.value,
+    CandidateDisposition.DEGRADED_APPROVED.value,
 }
 _CURRENT_MARKET_STATE_PATH = StateArtifactPath(
     preferred_relative_path=(
@@ -253,6 +263,10 @@ class MarketStateCandidateState:
     score: float | None = None
     actionable_now: bool = False
     priority_bucket: str | None = None
+    candidate_disposition: str | None = None
+    blocker_categories: tuple[str, ...] = ()
+    blocker_severities: tuple[str, ...] = ()
+    degraded_or_missing_contexts: tuple[str, ...] = ()
     entry_price_hint: float | None = None
     stop_level: float | None = None
     sector_name: str | None = None
@@ -273,6 +287,10 @@ class MarketStateCandidateState:
             "score": self.score,
             "actionable_now": self.actionable_now,
             "priority_bucket": self.priority_bucket,
+            "candidate_disposition": self.candidate_disposition,
+            "blocker_categories": list(self.blocker_categories),
+            "blocker_severities": list(self.blocker_severities),
+            "degraded_or_missing_contexts": list(self.degraded_or_missing_contexts),
             "entry_price_hint": self.entry_price_hint,
             "stop_level": self.stop_level,
             "sector_name": self.sector_name,
@@ -289,6 +307,19 @@ class MarketStateCandidateState:
             score=_optional_float(payload.get("score")),
             actionable_now=_required_bool(payload.get("actionable_now"), "actionable_now"),
             priority_bucket=_optional_text(payload.get("priority_bucket")),
+            candidate_disposition=_optional_text(payload.get("candidate_disposition")),
+            blocker_categories=_string_tuple(
+                payload.get("blocker_categories"),
+                "blocker_categories",
+            ),
+            blocker_severities=_string_tuple(
+                payload.get("blocker_severities"),
+                "blocker_severities",
+            ),
+            degraded_or_missing_contexts=_string_tuple(
+                payload.get("degraded_or_missing_contexts"),
+                "degraded_or_missing_contexts",
+            ),
             entry_price_hint=_optional_float(payload.get("entry_price_hint")),
             stop_level=_optional_float(payload.get("stop_level")),
             sector_name=_optional_text(payload.get("sector_name")),
@@ -1103,9 +1134,8 @@ def _market_context_sections(
 def _approved_candidate_queue(summary: DailyResearchSummary) -> tuple[MarketStateCandidateState, ...]:
     queue: list[MarketStateCandidateState] = []
     for row in summary.rows:
-        if row.status != "approved":
+        if not _row_is_operator_approved(row):
             continue
-        execution_priority = _optional_mapping(row.metadata.get("execution_priority"))
         signal_metadata = _optional_mapping(row.metadata.get("signal_metadata")) or {}
         queue.append(
             MarketStateCandidateState(
@@ -1114,15 +1144,12 @@ def _approved_candidate_queue(summary: DailyResearchSummary) -> tuple[MarketStat
                 preset_name=row.preset_name,
                 status=row.status,
                 score=row.score,
-                actionable_now=_required_bool_with_default(
-                    execution_priority,
-                    key="actionable_now",
-                    default=row.status == "approved",
-                ),
-                priority_bucket=_optional_text_from_mapping(
-                    execution_priority,
-                    key="priority_bucket",
-                ),
+                actionable_now=_row_actionable_now(row),
+                priority_bucket=row.priority_bucket,
+                candidate_disposition=_row_candidate_disposition(row),
+                blocker_categories=_row_blocker_categories(row),
+                blocker_severities=_row_blocker_severities(row),
+                degraded_or_missing_contexts=_row_degraded_or_missing_contexts(row),
                 entry_price_hint=row.entry_price_hint,
                 stop_level=row.stop_level,
                 sector_name=_optional_text(signal_metadata.get("sector_name")),
@@ -1155,9 +1182,9 @@ def _sector_context_summary(
         )
         if entry["sector_etf_symbol"] is None:
             entry["sector_etf_symbol"] = _optional_text(signal_metadata.get("sector_etf_symbol"))
-        if row.status == "approved":
+        if _row_is_operator_approved(row):
             entry["approved_candidate_count"] += 1
-            if _candidate_actionable_now(row.metadata):
+            if _row_actionable_now(row):
                 entry["actionable_candidate_count"] += 1
         if _candidate_blocked_by_portfolio_heat(row.metadata):
             entry["blocked_candidate_count"] += 1
@@ -1633,9 +1660,92 @@ def _latest_timestamp_for_snapshot(
     return timestamps[-1]
 
 
-def _candidate_actionable_now(metadata: Mapping[str, Any]) -> bool:
+def _row_actionable_now(row: Any) -> bool:
+    actionable_now = getattr(row, "actionable_now", None)
+    if isinstance(actionable_now, bool):
+        return actionable_now
+    metadata = _mapping_or_empty(getattr(row, "metadata", None), "row.metadata")
     execution_priority = _optional_mapping(metadata.get("execution_priority"))
-    return _required_bool_with_default(execution_priority, key="actionable_now", default=False)
+    disposition = _row_candidate_disposition(row)
+    default = disposition in _ACTIONABLE_DISPOSITIONS if disposition is not None else False
+    return _required_bool_with_default(execution_priority, key="actionable_now", default=default)
+
+
+def _row_is_operator_approved(row: Any) -> bool:
+    disposition = _row_candidate_disposition(row)
+    if disposition is not None:
+        return disposition in _OPERATOR_APPROVED_DISPOSITIONS
+    status = _optional_text(getattr(row, "status", None))
+    return status == "approved"
+
+
+def _row_candidate_disposition(row: Any) -> str | None:
+    disposition = _optional_text(getattr(row, "candidate_disposition", None))
+    if disposition is not None:
+        return disposition
+    metadata = _optional_mapping(getattr(row, "metadata", None))
+    if metadata is None:
+        return None
+    candidate_outcome = _optional_mapping(metadata.get("candidate_outcome"))
+    return _optional_text_from_mapping(candidate_outcome, key="disposition")
+
+
+def _row_blocker_categories(row: Any) -> tuple[str, ...]:
+    categories = getattr(row, "blocker_categories", ())
+    if categories:
+        return tuple(_string_tuple(categories, "row.blocker_categories"))
+    metadata = _optional_mapping(getattr(row, "metadata", None))
+    if metadata is None:
+        return ()
+    candidate_outcome = _optional_mapping(metadata.get("candidate_outcome"))
+    blockers = _sequence_of_mappings(
+        candidate_outcome.get("blockers") if candidate_outcome is not None else None,
+        "candidate_outcome.blockers",
+    )
+    return tuple(
+        category
+        for blocker in blockers
+        if (category := _optional_text(blocker.get("category"))) is not None
+    )
+
+
+def _row_blocker_severities(row: Any) -> tuple[str, ...]:
+    severities = getattr(row, "blocker_severities", ())
+    if severities:
+        return tuple(_string_tuple(severities, "row.blocker_severities"))
+    metadata = _optional_mapping(getattr(row, "metadata", None))
+    if metadata is None:
+        return ()
+    candidate_outcome = _optional_mapping(metadata.get("candidate_outcome"))
+    blockers = _sequence_of_mappings(
+        candidate_outcome.get("blockers") if candidate_outcome is not None else None,
+        "candidate_outcome.blockers",
+    )
+    return tuple(
+        severity
+        for blocker in blockers
+        if (severity := _optional_text(blocker.get("severity"))) is not None
+    )
+
+
+def _row_degraded_or_missing_contexts(row: Any) -> tuple[str, ...]:
+    contexts = getattr(row, "degraded_or_missing_contexts", ())
+    if contexts:
+        return tuple(_string_tuple(contexts, "row.degraded_or_missing_contexts"))
+    metadata = _optional_mapping(getattr(row, "metadata", None))
+    if metadata is None:
+        return ()
+    candidate_outcome = _optional_mapping(metadata.get("candidate_outcome"))
+    context_availability = _optional_mapping(
+        candidate_outcome.get("context_availability") if candidate_outcome is not None else None
+    )
+    if context_availability is None:
+        return ()
+    degraded_contexts: list[str] = []
+    for key, status in context_availability.items():
+        if _optional_text(status) in {"degraded", "unavailable"}:
+            degraded_contexts.append(str(key))
+    return tuple(degraded_contexts)
 
 
 def _candidate_blocked_by_portfolio_heat(metadata: Mapping[str, Any]) -> bool:

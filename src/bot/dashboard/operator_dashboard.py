@@ -946,8 +946,49 @@ function formatOptionalCount(value) {
   return typeof value === "number" ? formatNumber(value) : "Unavailable";
 }
 
+function formatPrice(value) {
+  return typeof value === "number" ? value.toFixed(2) : "n/a";
+}
+
 function formatControlStatus(value) {
   return value ? String(value).replace(/_/g, " ") : "n/a";
+}
+
+function formatSnakeCaseLabel(value) {
+  const text = String(value || "").trim();
+  if (!text) return "n/a";
+  return text
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function formatCandidateDisposition(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (text === "actionable") return "Actionable";
+  if (text === "approved_capacity_blocked") return "Capacity blocked";
+  if (text === "degraded_approved") return "Degraded approved";
+  if (text === "soft_gated") return "Soft gated";
+  if (text === "hard_rejected") return "Hard rejected";
+  return formatSnakeCaseLabel(text);
+}
+
+function toneForCandidateDisposition(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (text === "actionable") return "good";
+  if (text === "approved_capacity_blocked" || text === "degraded_approved" || text === "soft_gated") {
+    return "warn";
+  }
+  if (text === "hard_rejected") return "bad";
+  return "neutral";
+}
+
+function formatCandidateContextLabel(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (text === "sector_context") return "sector unavailable";
+  if (text === "volatility_context") return "volatility unavailable";
+  if (text === "earnings_context") return "earnings unavailable";
+  if (text === "market_breadth_context") return "breadth unavailable";
+  return formatSnakeCaseLabel(text).toLowerCase();
 }
 
 function describeCandidateActionability(item) {
@@ -1109,6 +1150,146 @@ function renderWorkflowInputOverviewBlock(
         }),
         "No workflow input problems are currently reported."
       )}
+    </div>
+  `;
+}
+
+function renderRecommendationDispositionChips(recommendationState) {
+  const counts = asObject(recommendationState.candidate_disposition_counts);
+  const orderedDispositions = [
+    "actionable",
+    "approved_capacity_blocked",
+    "degraded_approved",
+    "soft_gated",
+    "hard_rejected",
+  ];
+  const chips = orderedDispositions
+    .map((disposition) => {
+      const count = counts[disposition];
+      if (typeof count !== "number" || count <= 0) {
+        return null;
+      }
+      return {
+        label: `${formatCandidateDisposition(disposition)} ${formatNumber(count)}`,
+        tone: toneForCandidateDisposition(disposition),
+      };
+    })
+    .filter(Boolean);
+  if (!chips.length) {
+    return "";
+  }
+  return `
+    <div class="detail-line"><strong>Disposition mix</strong></div>
+    ${renderChipRow(chips)}
+  `;
+}
+
+function recommendationCandidateTitle(item) {
+  const parts = [item.symbol || "Symbol"];
+  if (typeof item.rank === "number") {
+    parts.push(`rank ${item.rank}`);
+  }
+  if (typeof item.preset_name === "string" && item.preset_name.trim()) {
+    parts.push(item.preset_name.trim());
+  }
+  if (typeof item.candidate_disposition === "string" && item.candidate_disposition.trim()) {
+    parts.push(formatCandidateDisposition(item.candidate_disposition));
+  }
+  return parts.join(" | ");
+}
+
+function recommendationCandidateBody(item) {
+  const parts = [];
+  if (typeof item.actionable_now === "boolean") {
+    parts.push(item.actionable_now ? "Actionable now" : "Not actionable now");
+  }
+  if (typeof item.priority_bucket === "string" && item.priority_bucket.trim()) {
+    parts.push(`queue=${formatSnakeCaseLabel(item.priority_bucket).toLowerCase()}`);
+  }
+  if (typeof item.entry_price_hint === "number") {
+    parts.push(`entry=${formatPrice(item.entry_price_hint)}`);
+  }
+  if (typeof item.stop_level === "number") {
+    parts.push(`stop=${formatPrice(item.stop_level)}`);
+  }
+  if (typeof item.sector_name === "string" && item.sector_name.trim()) {
+    parts.push(`sector=${item.sector_name.trim()}`);
+  }
+  const blockerCategories = asArray(item.blocker_categories)
+    .map((value) => formatSnakeCaseLabel(value).toLowerCase())
+    .filter(Boolean);
+  if (blockerCategories.length) {
+    parts.push(`blockers=${blockerCategories.join(", ")}`);
+  }
+  const degradedContexts = asArray(item.degraded_or_missing_contexts)
+    .map((value) => formatCandidateContextLabel(value))
+    .filter(Boolean);
+  if (degradedContexts.length) {
+    parts.push(`context=${degradedContexts.join(", ")}`);
+  }
+  if (typeof item.rationale === "string" && item.rationale.trim()) {
+    parts.push(item.rationale.trim());
+  } else if (parts.length === 0) {
+    parts.push(describeCandidateActionability(item));
+  }
+  return parts.join(" | ");
+}
+
+function renderRecommendationCandidateBlock(title, items, emptyText) {
+  return `
+    <div class="detail-stack">
+      <div class="detail-line"><strong>${escapeHtml(title)}</strong></div>
+      ${renderList(
+        asArray(items).map((item) => ({
+          title: recommendationCandidateTitle(asObject(item)),
+          body: recommendationCandidateBody(asObject(item)),
+        })),
+        emptyText
+      )}
+    </div>
+  `;
+}
+
+function renderRecommendationStateSummaryBlock(
+  recommendationState,
+  {
+    title = "Recommendation state",
+    emptyText = "Recommendation state is not available.",
+  } = {}
+) {
+  const state = asObject(recommendationState);
+  const hasCounts = [
+    state.top_priority_candidate_count,
+    state.actionable_candidate_count,
+    state.approved_candidate_count,
+    state.capacity_blocked_candidate_count,
+    state.sector_gated_candidate_count,
+    state.degraded_context_candidate_count,
+    state.fundamental_rejected_candidate_count,
+  ].some((value) => typeof value === "number");
+  if (!hasCounts && !asArray(state.empty_reasons).length && !asArray(state.context_notes).length) {
+    return `
+      <div class="detail-stack">
+        <div class="detail-line"><strong>${escapeHtml(title)}</strong></div>
+        <div class="empty-row">${escapeHtml(emptyText)}</div>
+      </div>
+    `;
+  }
+  return `
+    <div class="detail-stack">
+      <div class="detail-line"><strong>${escapeHtml(title)}</strong></div>
+      ${renderMetricGrid([
+        ["Top priority", formatNumber(state.top_priority_candidate_count)],
+        ["Actionable now", formatNumber(state.actionable_candidate_count)],
+        ["Approved queue", formatNumber(state.approved_candidate_count)],
+        ["Capacity blocked", formatNumber(state.capacity_blocked_candidate_count)],
+        ["Sector-gated", formatNumber(state.sector_gated_candidate_count)],
+        ["Degraded context", formatNumber(state.degraded_context_candidate_count)],
+        ["Fundamental rejected", formatNumber(state.fundamental_rejected_candidate_count)],
+      ])}
+      ${renderRecommendationDispositionChips(state)}
+      ${renderNotes(asArray(state.empty_reasons), asArray(state.empty_reasons).length ? "warn" : "neutral")}
+      ${renderNotes(asArray(state.context_notes), asArray(state.context_notes).length ? "warn" : "neutral")}
     </div>
   `;
 }
@@ -1579,6 +1760,10 @@ function renderMarketState(marketResult, transitionsResult) {
         "No meaningful transitions detected."
       )}
     </div>
+    ${renderRecommendationStateSummaryBlock(recommendationState, {
+      title: "Recommendation state",
+      emptyText: "Recommendation-state details are not available yet.",
+    })}
     ${renderWorkflowInputOverviewBlock(
       asObject(recommendationState.workflow_input_overview),
       {
@@ -1854,28 +2039,44 @@ function renderCandidateQueue(result) {
   const data = asObject(payload.data);
   const snapshot = asObject(data.snapshot);
   const recommendationState = asObject(data.recommendation_state);
-  const topPriority = asArray(data.top_priority_candidates);
   const approvedQueue = asArray(snapshot.approved_candidate_queue);
-  const constrained = approvedQueue.filter((item) => item.priority_bucket === "capacity_constrained");
+  const actionableQueue = approvedQueue.filter((item) => item.actionable_now === true);
   const rejectedReasons = asArray(snapshot.top_rejected_reasons_summary);
+  const capacityBlocked = asArray(recommendationState.top_capacity_blocked_candidates);
+  const sectorGated = asArray(recommendationState.top_sector_gated_candidates);
+  const degradedContext = asArray(recommendationState.top_degraded_context_candidates);
+  const fundamentalRejected = asArray(recommendationState.top_fundamental_rejected_candidates);
 
   element.innerHTML = `
-    ${renderMetricGrid([
-      ["Top priority", formatNumber(topPriority.length)],
-      ["Approved queue", formatNumber(approvedQueue.length)],
-      ["Capacity constrained", formatNumber(constrained.length)],
-      ["Rejected reasons tracked", formatNumber(rejectedReasons.length)],
-    ])}
-    <div class="detail-stack">
-      <div class="detail-line"><strong>Top-priority names</strong></div>
-      ${renderList(
-        topPriority.map((item) => ({
-          title: `${item.symbol || "Symbol"} | rank ${item.rank || "n/a"} | ${item.preset_name || "preset"}`,
-          body: describeCandidateActionability(item),
-        })),
-        "No top-priority candidates."
-      )}
-    </div>
+    ${renderRecommendationStateSummaryBlock(recommendationState, {
+      title: "Recommendation queue",
+      emptyText: "Recommendation-state details are not available for the current queue.",
+    })}
+    ${renderRecommendationCandidateBlock(
+      "Actionable candidates",
+      actionableQueue,
+      "No actionable candidates are currently visible."
+    )}
+    ${renderRecommendationCandidateBlock(
+      "Blocked by capacity",
+      capacityBlocked,
+      "No capacity-blocked candidates are currently surfaced."
+    )}
+    ${renderRecommendationCandidateBlock(
+      "Sector-gated candidates",
+      sectorGated,
+      "No sector-gated candidates are currently surfaced."
+    )}
+    ${renderRecommendationCandidateBlock(
+      "Degraded-context candidates",
+      degradedContext,
+      "No degraded-context candidates are currently surfaced."
+    )}
+    ${renderRecommendationCandidateBlock(
+      "Fundamental rejects",
+      fundamentalRejected,
+      "No fundamentally rejected candidates are currently surfaced."
+    )}
     <div class="detail-stack">
       <div class="detail-line"><strong>Common rejected reasons</strong></div>
       ${renderList(
