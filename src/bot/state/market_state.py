@@ -19,7 +19,10 @@ from bot.data.state_persistence import (
     write_text_file,
 )
 from bot.features import MarketContext
-from bot.risk.candidate_outcome import CandidateDisposition
+from bot.risk.candidate_outcome import (
+    is_actionable_candidate_disposition,
+    is_operator_approved_disposition,
+)
 from bot.reporting.daily_report import (
     DailyResearchSummary,
     IntradayPortfolioReviewReport,
@@ -55,15 +58,6 @@ _PORTFOLIO_ACTION_SEVERITY = {
     "RAISE STOP": 1,
     "WATCH CLOSELY": 2,
     "EXIT CANDIDATE": 3,
-}
-_OPERATOR_APPROVED_DISPOSITIONS = {
-    CandidateDisposition.ACTIONABLE.value,
-    CandidateDisposition.APPROVED_CAPACITY_BLOCKED.value,
-    CandidateDisposition.DEGRADED_APPROVED.value,
-}
-_ACTIONABLE_DISPOSITIONS = {
-    CandidateDisposition.ACTIONABLE.value,
-    CandidateDisposition.DEGRADED_APPROVED.value,
 }
 _CURRENT_MARKET_STATE_PATH = StateArtifactPath(
     preferred_relative_path=(
@@ -1667,14 +1661,18 @@ def _row_actionable_now(row: Any) -> bool:
     metadata = _mapping_or_empty(getattr(row, "metadata", None), "row.metadata")
     execution_priority = _optional_mapping(metadata.get("execution_priority"))
     disposition = _row_candidate_disposition(row)
-    default = disposition in _ACTIONABLE_DISPOSITIONS if disposition is not None else False
+    default = (
+        is_actionable_candidate_disposition(disposition)
+        if disposition is not None
+        else False
+    )
     return _required_bool_with_default(execution_priority, key="actionable_now", default=default)
 
 
 def _row_is_operator_approved(row: Any) -> bool:
     disposition = _row_candidate_disposition(row)
     if disposition is not None:
-        return disposition in _OPERATOR_APPROVED_DISPOSITIONS
+        return is_operator_approved_disposition(disposition)
     status = _optional_text(getattr(row, "status", None))
     return status == "approved"
 

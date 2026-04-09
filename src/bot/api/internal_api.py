@@ -18,7 +18,10 @@ from bot.data.pending_orders import (
     pending_order_reserves_unmatched_slot,
 )
 from bot.logging_utils import get_logger
-from bot.risk.candidate_outcome import CandidateDisposition
+from bot.risk.candidate_outcome import (
+    is_capacity_blocked_candidate_disposition,
+    is_operator_approved_disposition,
+)
 from bot.risk.portfolio_rules import (
     ExistingPosition,
     PortfolioInputError,
@@ -37,13 +40,6 @@ from bot.workflow_status import (
 
 
 LOGGER = get_logger(__name__)
-_OPERATOR_APPROVED_DISPOSITIONS = {
-    CandidateDisposition.ACTIONABLE.value,
-    CandidateDisposition.APPROVED_CAPACITY_BLOCKED.value,
-    CandidateDisposition.DEGRADED_APPROVED.value,
-}
-_CAPACITY_BLOCKED_DISPOSITION = CandidateDisposition.APPROVED_CAPACITY_BLOCKED.value
-
 INTERNAL_API_VERSION = 1
 INTERNAL_API_ENDPOINTS = (
     "/",
@@ -671,13 +667,13 @@ def _market_state_recommendation_context_notes(
 def _market_state_candidate_is_operator_approved(candidate: Any) -> bool:
     disposition = _optional_text(getattr(candidate, "candidate_disposition", None))
     if disposition is not None:
-        return disposition in _OPERATOR_APPROVED_DISPOSITIONS
+        return is_operator_approved_disposition(disposition)
     return bool(getattr(candidate, "status", None) == "approved")
 
 
 def _market_state_candidate_is_capacity_blocked(candidate: Any) -> bool:
     disposition = _optional_text(getattr(candidate, "candidate_disposition", None))
-    if disposition == _CAPACITY_BLOCKED_DISPOSITION:
+    if is_capacity_blocked_candidate_disposition(disposition):
         return True
     return _market_state_candidate_is_operator_approved(candidate) and not bool(
         getattr(candidate, "actionable_now", False)

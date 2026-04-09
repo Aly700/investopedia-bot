@@ -5886,8 +5886,10 @@ def _attach_evaluation_decision_ids(
 
 def _candidate_feature_snapshot(candidate: RiskAssessedCandidate) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
+    if candidate.operator_disposition is not None:
+        snapshot["candidate_disposition"] = candidate.operator_disposition.value
     if candidate.outcome is not None:
-        snapshot["candidate_disposition"] = candidate.outcome.disposition.value
+        snapshot["assessment_candidate_disposition"] = candidate.outcome.disposition.value
         degraded_contexts = candidate.outcome.context_availability.degraded_or_missing_contexts
         if degraded_contexts:
             snapshot["degraded_or_missing_contexts"] = list(degraded_contexts)

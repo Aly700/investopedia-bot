@@ -42,13 +42,28 @@ class ContextStatus(str, Enum):
 
 
 class CandidateDisposition(str, Enum):
-    """Final structured recommendation disposition for one candidate."""
+    """Structured recommendation classification shared across assessment and queue state."""
 
     ACTIONABLE = "actionable"
     APPROVED_CAPACITY_BLOCKED = "approved_capacity_blocked"
     SOFT_GATED = "soft_gated"
     HARD_REJECTED = "hard_rejected"
     DEGRADED_APPROVED = "degraded_approved"
+
+
+OPERATOR_APPROVED_CANDIDATE_DISPOSITIONS = frozenset(
+    {
+        CandidateDisposition.ACTIONABLE,
+        CandidateDisposition.APPROVED_CAPACITY_BLOCKED,
+        CandidateDisposition.DEGRADED_APPROVED,
+    }
+)
+ACTIONABLE_CANDIDATE_DISPOSITIONS = frozenset(
+    {
+        CandidateDisposition.ACTIONABLE,
+        CandidateDisposition.DEGRADED_APPROVED,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -111,7 +126,7 @@ class ContextAvailability:
 
 @dataclass(frozen=True)
 class CandidateOutcome:
-    """Structured decision outcome for one assessed candidate."""
+    """Structured assessment-time decision outcome for one candidate."""
 
     disposition: CandidateDisposition
     blockers: tuple[CandidateBlocker, ...] = ()
@@ -247,6 +262,70 @@ def legacy_candidate_outcome(
     )
 
 
+def is_operator_approved_disposition(
+    disposition: CandidateDisposition | str | None,
+) -> bool:
+    """Return whether one disposition belongs in the operator-approved queue."""
+
+    resolved = _coerce_candidate_disposition(disposition)
+    return resolved in OPERATOR_APPROVED_CANDIDATE_DISPOSITIONS
+
+
+def is_actionable_candidate_disposition(
+    disposition: CandidateDisposition | str | None,
+) -> bool:
+    """Return whether one disposition is actionable without queue-time blocking."""
+
+    resolved = _coerce_candidate_disposition(disposition)
+    return resolved in ACTIONABLE_CANDIDATE_DISPOSITIONS
+
+
+def is_capacity_blocked_candidate_disposition(
+    disposition: CandidateDisposition | str | None,
+) -> bool:
+    """Return whether one disposition represents a capacity-blocked setup."""
+
+    return _coerce_candidate_disposition(disposition) == CandidateDisposition.APPROVED_CAPACITY_BLOCKED
+
+
+def operator_candidate_disposition(
+    *,
+    outcome: CandidateOutcome | None,
+    actionable_now: bool | None = None,
+    approved: bool | None = None,
+    rejection_reasons: Sequence[str] = (),
+) -> CandidateDisposition | None:
+    """Return the final operator-facing recommendation disposition.
+
+    ``CandidateOutcome.disposition`` is the assessment-time result. Queue-time
+    capacity handling can still turn an otherwise actionable setup into a
+    capacity-blocked queue entry, so operator-facing surfaces should consume
+    this derived disposition instead of the raw assessment disposition.
+    """
+
+    if outcome is not None:
+        if outcome.disposition == CandidateDisposition.APPROVED_CAPACITY_BLOCKED:
+            return outcome.disposition
+        if outcome.disposition in {
+            CandidateDisposition.SOFT_GATED,
+            CandidateDisposition.HARD_REJECTED,
+        }:
+            return outcome.disposition
+        if actionable_now is False and outcome.operator_approved:
+            return CandidateDisposition.APPROVED_CAPACITY_BLOCKED
+        return outcome.disposition
+
+    if approved is None:
+        return None
+    if approved:
+        if actionable_now is False:
+            return CandidateDisposition.APPROVED_CAPACITY_BLOCKED
+        return CandidateDisposition.ACTIONABLE
+    if any(str(reason).strip() for reason in rejection_reasons):
+        return CandidateDisposition.HARD_REJECTED
+    return CandidateDisposition.HARD_REJECTED
+
+
 def _coerce_context_status(value: ContextStatus | str | bool | None) -> ContextStatus:
     if isinstance(value, ContextStatus):
         return value
@@ -264,3 +343,19 @@ def _coerce_context_status(value: ContextStatus | str | bool | None) -> ContextS
     if normalized == ContextStatus.UNKNOWN.value:
         return ContextStatus.UNKNOWN
     raise ValueError(f"Unsupported context status: {value!r}")
+
+
+def _coerce_candidate_disposition(
+    value: CandidateDisposition | str | None,
+) -> CandidateDisposition | None:
+    if isinstance(value, CandidateDisposition):
+        return value
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    try:
+        return CandidateDisposition(normalized)
+    except ValueError:
+        return None

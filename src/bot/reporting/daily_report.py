@@ -17,7 +17,11 @@ from bot.execution.prioritization import (
     score_risk_candidate_opportunity as _score_risk_candidate_opportunity,
 )
 from bot.features import MarketContext
-from bot.risk.candidate_outcome import BlockerCategory, CandidateDisposition
+from bot.risk.candidate_outcome import (
+    BlockerCategory,
+    is_actionable_candidate_disposition,
+    is_operator_approved_disposition,
+)
 from bot.risk.portfolio_rules import (
     PORTFOLIO_REVIEW_ACTIONS,
     ExistingPosition,
@@ -137,15 +141,6 @@ _MARKET_MONITOR_RECOMMENDATION_SECTION_ORDER = (
     "degraded_context_candidates",
     "fundamental_rejected_candidates",
 )
-_OPERATOR_APPROVED_DISPOSITIONS = {
-    CandidateDisposition.ACTIONABLE.value,
-    CandidateDisposition.APPROVED_CAPACITY_BLOCKED.value,
-    CandidateDisposition.DEGRADED_APPROVED.value,
-}
-_ACTIONABLE_DISPOSITIONS = {
-    CandidateDisposition.ACTIONABLE.value,
-    CandidateDisposition.DEGRADED_APPROVED.value,
-}
 _SECTOR_GATED_BLOCKER_CATEGORIES = {
     BlockerCategory.SECTOR_REGIME.value,
     BlockerCategory.SECTOR_RELATIVE_STRENGTH.value,
@@ -1912,7 +1907,7 @@ def _candidate_rationale(candidate: RiskAssessedCandidate) -> str:
 
 
 def _candidate_report_status(candidate: RiskAssessedCandidate) -> str:
-    return "approved" if candidate.operator_approved else "rejected"
+    return "approved" if is_operator_approved_disposition(candidate.operator_disposition) else "rejected"
 
 
 def _candidate_outcome_row_fields(candidate: RiskAssessedCandidate) -> dict[str, Any]:
@@ -1922,12 +1917,14 @@ def _candidate_outcome_row_fields(candidate: RiskAssessedCandidate) -> dict[str,
     if execution_priority is not None:
         actionable_now = execution_priority.actionable_now
     elif outcome is not None:
-        actionable_now = outcome.disposition.value in _ACTIONABLE_DISPOSITIONS
+        actionable_now = is_actionable_candidate_disposition(outcome.disposition)
     else:
         actionable_now = candidate.approved
     return {
         "candidate_disposition": (
-            outcome.disposition.value if outcome is not None else None
+            candidate.operator_disposition.value
+            if candidate.operator_disposition is not None
+            else None
         ),
         "blocker_categories": tuple(
             blocker.category.value for blocker in outcome.blockers
@@ -2226,14 +2223,14 @@ def _row_actionable_now(row: DailyResearchOpportunityRow) -> bool:
     if not isinstance(execution_priority, Mapping):
         disposition = _row_candidate_disposition(row)
         if disposition is not None:
-            return disposition in _ACTIONABLE_DISPOSITIONS
+            return is_actionable_candidate_disposition(disposition)
         return row.status == "approved"
     actionable_now = execution_priority.get("actionable_now")
     if isinstance(actionable_now, bool):
         return actionable_now
     disposition = _row_candidate_disposition(row)
     if disposition is not None:
-        return disposition in _ACTIONABLE_DISPOSITIONS
+        return is_actionable_candidate_disposition(disposition)
     return row.status == "approved"
 
 
@@ -2260,7 +2257,7 @@ def _market_monitor_recommendation_section_name(row: DailyResearchOpportunityRow
 def _row_is_operator_approved(row: DailyResearchOpportunityRow) -> bool:
     disposition = _row_candidate_disposition(row)
     if disposition is not None:
-        return disposition in _OPERATOR_APPROVED_DISPOSITIONS
+        return is_operator_approved_disposition(disposition)
     return row.status == "approved"
 
 

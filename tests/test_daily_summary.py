@@ -1734,7 +1734,8 @@ def test_market_monitor_report_surfaces_capacity_blocked_sector_gated_and_degrad
     assert payload["recommendation_summary"]["fundamental_rejected_candidate_count"] == 1
     assert payload["recommendation_summary"]["approved_candidate_count"] == 2
     assert payload["recommendation_summary"]["candidate_disposition_counts"] == {
-        "actionable": 2,
+        "actionable": 1,
+        "approved_capacity_blocked": 1,
         "soft_gated": 1,
         "hard_rejected": 2,
     }
@@ -1749,7 +1750,10 @@ def test_market_monitor_report_surfaces_capacity_blocked_sector_gated_and_degrad
     ]
     assert payload["recommendation_sections"]["capacity_blocked_candidates"][0][
         "candidate_disposition"
-    ] == "actionable"
+    ] == "approved_capacity_blocked"
+    assert payload["recommendation_sections"]["capacity_blocked_candidates"][0]["metadata"][
+        "candidate_outcome"
+    ]["disposition"] == "actionable"
     assert payload["recommendation_sections"]["sector_gated_candidates"][0][
         "candidate_disposition"
     ] == "soft_gated"

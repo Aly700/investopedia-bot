@@ -3813,6 +3813,33 @@ def test_market_state_store_rebuilds_candidate_queue_after_restart_from_empty_mo
     assert result.current_snapshot.current_alertable_states[0].symbol == "AVGO"
 
 
+def test_market_state_store_preserves_final_operator_disposition_in_candidate_queue(
+    tmp_path: Path,
+) -> None:
+    store = MarketStateStore(tmp_path)
+
+    result = store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="monitor-market",
+        daily_summary=_daily_research_summary(
+            rows=(
+                _daily_research_row(
+                    symbol="AMD",
+                    candidate_disposition="approved_capacity_blocked",
+                    actionable_now=False,
+                    priority_bucket="capacity_constrained",
+                ),
+            ),
+        ),
+    )
+
+    candidate = result.current_snapshot.approved_candidate_queue[0]
+    assert candidate.symbol == "AMD"
+    assert candidate.candidate_disposition == "approved_capacity_blocked"
+    assert candidate.actionable_now is False
+    assert candidate.priority_bucket == "capacity_constrained"
+
+
 def _market_state_snapshot(
     *,
     action_states: Mapping[str, str] | None = None,
@@ -3926,6 +3953,7 @@ def _daily_research_row(
     symbol: str,
     rank: int = 1,
     status: str = "approved",
+    candidate_disposition: str | None = None,
     actionable_now: bool = True,
     priority_bucket: str | None = "top_priority",
     rejection_reasons: tuple[str, ...] = (),
@@ -3965,5 +3993,8 @@ def _daily_research_row(
         per_share_risk=6.0,
         notional_value=2_525.0 if status == "approved" else 0.0,
         rejection_reasons=rejection_reasons,
+        candidate_disposition=candidate_disposition,
+        actionable_now=actionable_now,
+        priority_bucket=priority_bucket,
         metadata=metadata,
     )

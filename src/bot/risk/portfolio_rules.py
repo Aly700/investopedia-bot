@@ -32,7 +32,9 @@ from bot.risk.candidate_outcome import (
     ContextAvailability,
     ContextStatus,
     build_context_availability,
+    is_operator_approved_disposition,
     legacy_candidate_outcome,
+    operator_candidate_disposition,
 )
 from bot.risk.position_sizing import PositionSizingResult, size_position
 from bot.strategy.signal_models import StrategySignal
@@ -219,7 +221,25 @@ class RiskAssessedCandidate:
 
     @property
     def operator_approved(self) -> bool:
-        return self.outcome.operator_approved if self.outcome is not None else bool(self.approved)
+        return is_operator_approved_disposition(self.operator_disposition)
+
+    @property
+    def assessment_disposition(self) -> CandidateDisposition | None:
+        return self.outcome.disposition if self.outcome is not None else None
+
+    @property
+    def operator_disposition(self) -> CandidateDisposition | None:
+        actionable_now = (
+            self.execution_priority.actionable_now
+            if self.execution_priority is not None
+            else None
+        )
+        return operator_candidate_disposition(
+            outcome=self.outcome,
+            actionable_now=actionable_now,
+            approved=self.approved,
+            rejection_reasons=self.rejection_reasons,
+        )
 
 
 @dataclass(frozen=True)
