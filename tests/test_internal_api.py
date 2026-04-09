@@ -155,6 +155,9 @@ def test_internal_api_market_state_reports_capacity_blocked_candidates_when_no_t
                 actionable_now=False,
                 priority_bucket="capacity_constrained",
                 candidate_disposition="approved_capacity_blocked",
+                blocker_categories=("capacity",),
+                blocker_severities=("soft",),
+                degraded_or_missing_contexts=("earnings_context",),
             ),
         ),
     )
@@ -177,6 +180,16 @@ def test_internal_api_market_state_reports_capacity_blocked_candidates_when_no_t
     assert recommendation_state["actionable_queue_empty"] is True
     assert recommendation_state["top_priority_empty"] is True
     assert recommendation_state["top_capacity_blocked_candidates"][0]["symbol"] == "NVDA"
+    assert (
+        recommendation_state["top_capacity_blocked_candidates"][0]["candidate_disposition"]
+        == "approved_capacity_blocked"
+    )
+    assert recommendation_state["top_capacity_blocked_candidates"][0]["blocker_categories"] == [
+        "capacity"
+    ]
+    assert recommendation_state["top_capacity_blocked_candidates"][0][
+        "degraded_or_missing_contexts"
+    ] == ["earnings_context"]
     assert recommendation_state["candidate_disposition_counts"] == {
         "approved_capacity_blocked": 1
     }

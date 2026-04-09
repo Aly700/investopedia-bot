@@ -232,6 +232,7 @@ from bot.reporting.trade_review import (
     write_trade_review_summary,
 )
 from bot.reporting.trade_log import write_trade_log_report
+from bot.risk.candidate_outcome import ContextStatus
 from bot.risk.portfolio_rules import (
     ExistingPosition,
     PortfolioConstraints,
@@ -4554,7 +4555,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
     assessed_candidates = []
     no_signal_symbols: list[str] = []
     symbol_frames: dict[str, pd.DataFrame] = {}
-    earnings_contexts = _load_earnings_contexts(
+    earnings_contexts_result = _load_earnings_contexts_result(
         config=config,
         env_file=getattr(args, "env_file", None),
         provider=None,
@@ -4564,6 +4565,7 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
         refresh_cache=args.refresh_cache,
         log_label="generate-orders",
     )
+    earnings_contexts = earnings_contexts_result.value or {}
     sector_history_start = sector_context_history_start(
         args.as_of,
         benchmark_sma_slow=config.strategy.signals.benchmark_sma_slow,
@@ -4697,7 +4699,13 @@ def _handle_generate_orders(args: argparse.Namespace) -> int:
             signal,
             metadata={
                 **dict(signal.metadata),
-                **earnings_context_metadata(earnings_context),
+                **earnings_context_metadata(
+                    earnings_context,
+                    context_status=_candidate_earnings_context_status(
+                        earnings_context=earnings_context,
+                        load_status=earnings_contexts_result.status,
+                    ),
+                ),
                 **sector_context_metadata(sector_context),
                 **market_context_metadata(
                     market_context,
@@ -7327,7 +7335,15 @@ def _run_daily_summary_workflow(
                     preset_name=preset.name,
                 )
             signal_metadata = dict(signal.metadata)
-            signal_metadata.update(earnings_context_metadata(earnings_context))
+            signal_metadata.update(
+                earnings_context_metadata(
+                    earnings_context,
+                    context_status=_candidate_earnings_context_status(
+                        earnings_context=earnings_context,
+                        load_status=research_inputs.earnings_contexts.status,
+                    ),
+                )
+            )
             signal_metadata.update(sector_context_metadata(sector_context))
             signal_metadata.update(
                 market_context_metadata(
@@ -8829,6 +8845,23 @@ def _load_earnings_contexts(
         ).value
         or {}
     )
+
+
+def _candidate_earnings_context_status(
+    *,
+    earnings_context: EarningsRiskContext | None,
+    load_status: str | None,
+) -> str | None:
+    if earnings_context is not None:
+        return ContextStatus.AVAILABLE.value
+    normalized_status = load_status.strip().lower() if isinstance(load_status, str) else None
+    if normalized_status == "ok":
+        return ContextStatus.AVAILABLE.value
+    if normalized_status == "degraded":
+        return ContextStatus.DEGRADED.value
+    if normalized_status in {"unavailable", "failed"}:
+        return ContextStatus.UNAVAILABLE.value
+    return None
 
 
 def _load_sector_contexts(

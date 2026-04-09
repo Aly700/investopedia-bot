@@ -1270,7 +1270,6 @@ def evaluate_portfolio_rules(
     *,
     current_positions: Sequence[ExistingPosition],
     constraints: PortfolioConstraints,
-    preserve_capacity_blocked_candidates: bool = False,
 ) -> PortfolioRuleResult:
     """Evaluate deterministic portfolio rules for a candidate position.
 
@@ -1279,11 +1278,9 @@ def evaluate_portfolio_rules(
     upstream by ``size_position`` before this function is ever called, so it
     is not re-checked here.
 
-    ``preserve_capacity_blocked_candidates`` is retained only for backward
-    compatibility. Capacity is now represented as a structured soft blocker via
-    ``CandidateOutcome`` regardless of caller.
+    Capacity is represented as a structured soft blocker via
+    ``CandidateOutcome``.
     """
-    _ = preserve_capacity_blocked_candidates
 
     blockers: list[CandidateBlocker] = []
     existing_position = _find_existing_position(current_positions, signal.symbol)
@@ -1361,10 +1358,8 @@ def assess_signal_candidate(
     vix_entry_block_threshold: float | None = None,
     require_sector_regime_for_entries: bool = False,
     sector_relative_strength_entry_reject_threshold: float | None = None,
-    preserve_capacity_blocked_candidates: bool = False,
 ) -> RiskAssessedCandidate:
     """Combine sizing and portfolio rules into one risk-assessed entry candidate."""
-    _ = preserve_capacity_blocked_candidates
 
     if candidate_features is not None and market_context is not None:
         raise ValueError(
@@ -1772,10 +1767,29 @@ def _earnings_context_status(
     metadata: Mapping[str, Any],
     features: CandidateFeatures | None,
 ) -> ContextStatus:
+    explicit = metadata.get("earnings_context_status")
+    if isinstance(explicit, str):
+        normalized = explicit.strip().lower()
+        if normalized == ContextStatus.AVAILABLE.value:
+            return ContextStatus.AVAILABLE
+        if normalized == ContextStatus.DEGRADED.value:
+            return ContextStatus.DEGRADED
+        if normalized == ContextStatus.UNAVAILABLE.value:
+            return ContextStatus.UNAVAILABLE
+        if normalized == ContextStatus.UNKNOWN.value:
+            return ContextStatus.UNKNOWN
     if features is not None and (
         features.earnings_date is not None
         or features.earnings_days_away is not None
         or features.is_earnings_risk
+    ):
+        return ContextStatus.AVAILABLE
+    if (
+        metadata.get("earnings_date") is not None
+        or metadata.get("earnings_days_away") is not None
+        or bool(metadata.get("is_earnings_risk"))
+        or metadata.get("earnings_event_status") is not None
+        or metadata.get("earnings_source") is not None
     ):
         return ContextStatus.AVAILABLE
     if any(
@@ -1786,6 +1800,7 @@ def _earnings_context_status(
             "is_earnings_risk",
             "earnings_event_status",
             "earnings_source",
+            "earnings_context_status",
         )
     ):
         return ContextStatus.UNKNOWN

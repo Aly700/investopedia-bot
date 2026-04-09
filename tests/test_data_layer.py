@@ -3840,6 +3840,51 @@ def test_market_state_store_preserves_final_operator_disposition_in_candidate_qu
     assert candidate.priority_bucket == "capacity_constrained"
 
 
+def test_market_state_store_recovers_candidate_semantics_from_report_metadata_fallbacks(
+    tmp_path: Path,
+) -> None:
+    store = MarketStateStore(tmp_path)
+
+    result = store.update(
+        as_of_date=date(2024, 1, 5),
+        workflow="monitor-market",
+        daily_summary=_daily_research_summary(
+            rows=(
+                _daily_research_row(
+                    symbol="AMD",
+                    candidate_disposition=None,
+                    actionable_now=False,
+                    priority_bucket="capacity_constrained",
+                    metadata={
+                        "candidate_outcome": {
+                            "disposition": "approved_capacity_blocked",
+                            "blockers": [
+                                {
+                                    "category": "capacity",
+                                    "severity": "soft",
+                                    "reason": "Max concurrent positions reached.",
+                                }
+                            ],
+                            "context_availability": {
+                                "earnings_context": "degraded",
+                            },
+                        }
+                    },
+                ),
+            ),
+        ),
+    )
+
+    candidate = result.current_snapshot.approved_candidate_queue[0]
+    assert candidate.symbol == "AMD"
+    assert candidate.candidate_disposition == "approved_capacity_blocked"
+    assert candidate.blocker_categories == ("capacity",)
+    assert candidate.blocker_severities == ("soft",)
+    assert candidate.degraded_or_missing_contexts == ("earnings_context",)
+    assert candidate.actionable_now is False
+    assert candidate.priority_bucket == "capacity_constrained"
+
+
 def _market_state_snapshot(
     *,
     action_states: Mapping[str, str] | None = None,
@@ -3957,18 +4002,21 @@ def _daily_research_row(
     actionable_now: bool = True,
     priority_bucket: str | None = "top_priority",
     rejection_reasons: tuple[str, ...] = (),
+    metadata: Mapping[str, object] | None = None,
 ) -> DailyResearchOpportunityRow:
-    metadata: dict[str, object] = {
+    resolved_metadata: dict[str, object] = {
         "signal_metadata": {
             "sector_name": "Technology",
             "sector_etf_symbol": "XLK",
         }
     }
     if priority_bucket is not None:
-        metadata["execution_priority"] = {
+        resolved_metadata["execution_priority"] = {
             "actionable_now": actionable_now,
             "priority_bucket": priority_bucket,
         }
+    if metadata:
+        resolved_metadata.update(metadata)
     return DailyResearchOpportunityRow(
         rank=rank,
         date=date(2024, 1, 5),
@@ -3996,5 +4044,5 @@ def _daily_research_row(
         candidate_disposition=candidate_disposition,
         actionable_now=actionable_now,
         priority_bucket=priority_bucket,
-        metadata=metadata,
+        metadata=resolved_metadata,
     )

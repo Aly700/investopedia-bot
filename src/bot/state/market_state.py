@@ -22,6 +22,10 @@ from bot.features import MarketContext
 from bot.risk.candidate_outcome import (
     is_actionable_candidate_disposition,
     is_operator_approved_disposition,
+    serialized_candidate_blocker_categories,
+    serialized_candidate_blocker_severities,
+    serialized_candidate_degraded_or_missing_contexts,
+    serialized_candidate_disposition,
 )
 from bot.reporting.daily_report import (
     DailyResearchSummary,
@@ -1678,72 +1682,34 @@ def _row_is_operator_approved(row: Any) -> bool:
 
 
 def _row_candidate_disposition(row: Any) -> str | None:
-    disposition = _optional_text(getattr(row, "candidate_disposition", None))
-    if disposition is not None:
-        return disposition
-    metadata = _optional_mapping(getattr(row, "metadata", None))
-    if metadata is None:
-        return None
-    candidate_outcome = _optional_mapping(metadata.get("candidate_outcome"))
-    return _optional_text_from_mapping(candidate_outcome, key="disposition")
+    return serialized_candidate_disposition(
+        getattr(row, "candidate_disposition", None),
+        metadata=_optional_mapping(getattr(row, "metadata", None)),
+    )
 
 
 def _row_blocker_categories(row: Any) -> tuple[str, ...]:
-    categories = getattr(row, "blocker_categories", ())
-    if categories:
-        return tuple(_string_tuple(categories, "row.blocker_categories"))
-    metadata = _optional_mapping(getattr(row, "metadata", None))
-    if metadata is None:
-        return ()
-    candidate_outcome = _optional_mapping(metadata.get("candidate_outcome"))
-    blockers = _sequence_of_mappings(
-        candidate_outcome.get("blockers") if candidate_outcome is not None else None,
-        "candidate_outcome.blockers",
-    )
-    return tuple(
-        category
-        for blocker in blockers
-        if (category := _optional_text(blocker.get("category"))) is not None
+    return serialized_candidate_blocker_categories(
+        _string_tuple(getattr(row, "blocker_categories", ()), "row.blocker_categories"),
+        metadata=_optional_mapping(getattr(row, "metadata", None)),
     )
 
 
 def _row_blocker_severities(row: Any) -> tuple[str, ...]:
-    severities = getattr(row, "blocker_severities", ())
-    if severities:
-        return tuple(_string_tuple(severities, "row.blocker_severities"))
-    metadata = _optional_mapping(getattr(row, "metadata", None))
-    if metadata is None:
-        return ()
-    candidate_outcome = _optional_mapping(metadata.get("candidate_outcome"))
-    blockers = _sequence_of_mappings(
-        candidate_outcome.get("blockers") if candidate_outcome is not None else None,
-        "candidate_outcome.blockers",
-    )
-    return tuple(
-        severity
-        for blocker in blockers
-        if (severity := _optional_text(blocker.get("severity"))) is not None
+    return serialized_candidate_blocker_severities(
+        _string_tuple(getattr(row, "blocker_severities", ()), "row.blocker_severities"),
+        metadata=_optional_mapping(getattr(row, "metadata", None)),
     )
 
 
 def _row_degraded_or_missing_contexts(row: Any) -> tuple[str, ...]:
-    contexts = getattr(row, "degraded_or_missing_contexts", ())
-    if contexts:
-        return tuple(_string_tuple(contexts, "row.degraded_or_missing_contexts"))
-    metadata = _optional_mapping(getattr(row, "metadata", None))
-    if metadata is None:
-        return ()
-    candidate_outcome = _optional_mapping(metadata.get("candidate_outcome"))
-    context_availability = _optional_mapping(
-        candidate_outcome.get("context_availability") if candidate_outcome is not None else None
+    return serialized_candidate_degraded_or_missing_contexts(
+        _string_tuple(
+            getattr(row, "degraded_or_missing_contexts", ()),
+            "row.degraded_or_missing_contexts",
+        ),
+        metadata=_optional_mapping(getattr(row, "metadata", None)),
     )
-    if context_availability is None:
-        return ()
-    degraded_contexts: list[str] = []
-    for key, status in context_availability.items():
-        if _optional_text(status) in {"degraded", "unavailable"}:
-            degraded_contexts.append(str(key))
-    return tuple(degraded_contexts)
 
 
 def _candidate_blocked_by_portfolio_heat(metadata: Mapping[str, Any]) -> bool:
@@ -1888,13 +1854,3 @@ def _required_bool_with_default(
     if resolved is None:
         return default
     return resolved
-
-
-def _optional_text_from_mapping(
-    mapping_value: Mapping[str, Any] | None,
-    *,
-    key: str,
-) -> str | None:
-    if mapping_value is None:
-        return None
-    return _optional_text(mapping_value.get(key))

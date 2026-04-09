@@ -15,6 +15,10 @@ from bot.risk.candidate_outcome import (
     is_operator_approved_disposition,
     legacy_candidate_outcome,
     operator_candidate_disposition,
+    serialized_candidate_blocker_categories,
+    serialized_candidate_blocker_severities,
+    serialized_candidate_degraded_or_missing_contexts,
+    serialized_candidate_disposition,
 )
 from bot.execution.prioritization import ExecutionPriority
 from bot.risk.portfolio_rules import RiskAssessedCandidate
@@ -204,3 +208,25 @@ def test_risk_assessed_candidate_operator_disposition_prefers_final_operator_mea
 def test_build_context_availability_rejects_unknown_status_text() -> None:
     with pytest.raises(ValueError, match="Unsupported context status"):
         build_context_availability(sector_context="broken")
+
+
+def test_serialized_candidate_helpers_fall_back_to_candidate_outcome_metadata() -> None:
+    metadata = {
+        "candidate_outcome": {
+            "disposition": "approved_capacity_blocked",
+            "blockers": [
+                {"category": "capacity", "severity": "soft", "reason": "Full portfolio."}
+            ],
+            "context_availability": {
+                "sector_context": "available",
+                "earnings_context": "degraded",
+            },
+        }
+    }
+
+    assert serialized_candidate_disposition(metadata=metadata) == "approved_capacity_blocked"
+    assert serialized_candidate_blocker_categories(metadata=metadata) == ("capacity",)
+    assert serialized_candidate_blocker_severities(metadata=metadata) == ("soft",)
+    assert serialized_candidate_degraded_or_missing_contexts(metadata=metadata) == (
+        "earnings_context",
+    )

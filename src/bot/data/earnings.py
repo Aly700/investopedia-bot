@@ -426,7 +426,11 @@ def build_earnings_risk_contexts(
     return contexts
 
 
-def earnings_context_metadata(context: EarningsRiskContext | None) -> dict[str, Any]:
+def earnings_context_metadata(
+    context: EarningsRiskContext | None,
+    *,
+    context_status: str | None = None,
+) -> dict[str, Any]:
     """Return JSON-friendly earnings metadata for a symbol."""
 
     if context is None:
@@ -437,8 +441,12 @@ def earnings_context_metadata(context: EarningsRiskContext | None) -> dict[str, 
             "earnings_event_status": None,
             "earnings_event_name": None,
             "earnings_source": None,
+            "earnings_context_status": context_status,
         }
-    return context.to_metadata()
+    return {
+        **context.to_metadata(),
+        "earnings_context_status": context_status or "available",
+    }
 
 
 def trading_days_until(as_of_date: date, target_date: date) -> int:

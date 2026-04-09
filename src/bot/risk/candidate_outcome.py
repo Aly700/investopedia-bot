@@ -64,6 +64,12 @@ ACTIONABLE_CANDIDATE_DISPOSITIONS = frozenset(
         CandidateDisposition.DEGRADED_APPROVED,
     }
 )
+_DEGRADED_OR_UNAVAILABLE_CONTEXT_STATUSES = frozenset(
+    {
+        ContextStatus.DEGRADED.value,
+        ContextStatus.UNAVAILABLE.value,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -326,6 +332,79 @@ def operator_candidate_disposition(
     return CandidateDisposition.HARD_REJECTED
 
 
+def serialized_candidate_disposition(
+    candidate_disposition: CandidateDisposition | str | None = None,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Resolve one serialized candidate disposition from top-level fields or metadata."""
+
+    explicit = _optional_text(candidate_disposition)
+    if explicit is not None:
+        resolved = _coerce_candidate_disposition(explicit)
+        return resolved.value if resolved is not None else explicit
+    candidate_outcome = _serialized_candidate_outcome(metadata)
+    if candidate_outcome is None:
+        return None
+    disposition = _optional_text(candidate_outcome.get("disposition"))
+    if disposition is None:
+        return None
+    resolved = _coerce_candidate_disposition(disposition)
+    return resolved.value if resolved is not None else disposition
+
+
+def serialized_candidate_blocker_categories(
+    blocker_categories: Sequence[str] = (),
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Resolve serialized blocker categories from top-level fields or metadata."""
+
+    explicit = _normalized_string_tuple(blocker_categories)
+    if explicit:
+        return explicit
+    return _serialized_candidate_blocker_values(metadata=metadata, key="category")
+
+
+def serialized_candidate_blocker_severities(
+    blocker_severities: Sequence[str] = (),
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Resolve serialized blocker severities from top-level fields or metadata."""
+
+    explicit = _normalized_string_tuple(blocker_severities)
+    if explicit:
+        return explicit
+    return _serialized_candidate_blocker_values(metadata=metadata, key="severity")
+
+
+def serialized_candidate_degraded_or_missing_contexts(
+    degraded_or_missing_contexts: Sequence[str] = (),
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> tuple[str, ...]:
+    """Resolve degraded optional contexts from top-level fields or outcome metadata."""
+
+    explicit = _normalized_string_tuple(degraded_or_missing_contexts)
+    if explicit:
+        return explicit
+    candidate_outcome = _serialized_candidate_outcome(metadata)
+    if candidate_outcome is None:
+        return ()
+    context_availability = candidate_outcome.get("context_availability")
+    if not isinstance(context_availability, Mapping):
+        return ()
+    degraded_contexts: list[str] = []
+    for key, status in context_availability.items():
+        context_key = _optional_text(key)
+        if context_key is None:
+            continue
+        if _optional_text(status) in _DEGRADED_OR_UNAVAILABLE_CONTEXT_STATUSES:
+            degraded_contexts.append(context_key)
+    return tuple(degraded_contexts)
+
+
 def _coerce_context_status(value: ContextStatus | str | bool | None) -> ContextStatus:
     if isinstance(value, ContextStatus):
         return value
@@ -359,3 +438,54 @@ def _coerce_candidate_disposition(
         return CandidateDisposition(normalized)
     except ValueError:
         return None
+
+
+def _optional_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _normalized_string_tuple(values: Sequence[str] | None) -> tuple[str, ...]:
+    if values is None or isinstance(values, (str, bytes)):
+        return ()
+    normalized: list[str] = []
+    for value in values:
+        text = _optional_text(value)
+        if text is not None:
+            normalized.append(text)
+    return tuple(normalized)
+
+
+def _serialized_candidate_outcome(
+    metadata: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if not isinstance(metadata, Mapping):
+        return None
+    candidate_outcome = metadata.get("candidate_outcome")
+    if not isinstance(candidate_outcome, Mapping):
+        return None
+    return candidate_outcome
+
+
+def _serialized_candidate_blocker_values(
+    *,
+    metadata: Mapping[str, Any] | None,
+    key: str,
+) -> tuple[str, ...]:
+    candidate_outcome = _serialized_candidate_outcome(metadata)
+    if candidate_outcome is None:
+        return ()
+    blockers = candidate_outcome.get("blockers")
+    if not isinstance(blockers, Sequence) or isinstance(blockers, (str, bytes)):
+        return ()
+    values: list[str] = []
+    for blocker in blockers:
+        if not isinstance(blocker, Mapping):
+            continue
+        resolved = _optional_text(blocker.get(key))
+        if resolved is not None:
+            values.append(resolved)
+    return tuple(values)

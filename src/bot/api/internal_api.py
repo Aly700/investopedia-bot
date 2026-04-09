@@ -21,6 +21,7 @@ from bot.logging_utils import get_logger
 from bot.risk.candidate_outcome import (
     is_capacity_blocked_candidate_disposition,
     is_operator_approved_disposition,
+    serialized_candidate_disposition,
 )
 from bot.risk.portfolio_rules import (
     ExistingPosition,
@@ -727,20 +728,19 @@ def _recommendation_candidate_disposition_counts(
     if recommendation_sections:
         for section_rows in recommendation_sections.values():
             for row in section_rows:
-                disposition = _optional_text(row.get("candidate_disposition"))
-                if disposition is None:
-                    candidate_outcome = row.get("metadata")
-                    if isinstance(candidate_outcome, Mapping):
-                        outcome_payload = candidate_outcome.get("candidate_outcome")
-                        if isinstance(outcome_payload, Mapping):
-                            disposition = _optional_text(outcome_payload.get("disposition"))
+                disposition = serialized_candidate_disposition(
+                    row.get("candidate_disposition"),
+                    metadata=row.get("metadata") if isinstance(row, Mapping) else None,
+                )
                 if disposition is None:
                     continue
                 counts[disposition] = counts.get(disposition, 0) + 1
         if counts:
             return counts
     for candidate in approved_candidate_queue:
-        disposition = _optional_text(getattr(candidate, "candidate_disposition", None))
+        disposition = serialized_candidate_disposition(
+            getattr(candidate, "candidate_disposition", None),
+        )
         if disposition is None:
             continue
         counts[disposition] = counts.get(disposition, 0) + 1

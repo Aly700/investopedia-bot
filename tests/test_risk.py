@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from bot.data.earnings import earnings_context_metadata
 from bot.data.intraday_state_journal import IntradayTrajectoryFeatures
 from bot.data.portfolio_heat import (
     PortfolioHoldingExposure,
@@ -364,6 +365,52 @@ def test_assess_signal_candidate_marks_missing_optional_context_as_degraded_appr
     assert candidate.outcome is not None
     assert candidate.outcome.disposition == CandidateDisposition.DEGRADED_APPROVED
     assert candidate.outcome.context_availability.sector_context == ContextStatus.UNAVAILABLE
+
+
+def test_assess_signal_candidate_marks_explicitly_available_earnings_context_without_event_as_available() -> None:
+    signal = replace(
+        _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0),
+        metadata=earnings_context_metadata(None, context_status="available"),
+    )
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+    )
+
+    assert candidate.outcome is not None
+    assert candidate.outcome.context_availability.earnings_context == ContextStatus.AVAILABLE
+    assert candidate.outcome.disposition == CandidateDisposition.ACTIONABLE
+
+
+def test_assess_signal_candidate_marks_explicitly_degraded_earnings_context_as_degraded() -> None:
+    signal = replace(
+        _signal(symbol="AAPL", entry_price=100.0, stop_price=95.0),
+        metadata=earnings_context_metadata(None, context_status="degraded"),
+    )
+    constraints = PortfolioConstraints(
+        max_concurrent_positions=5,
+        max_position_pct_equity=0.25,
+        no_averaging_down=True,
+    )
+
+    candidate = assess_signal_candidate(
+        signal,
+        current_equity=100_000.0,
+        base_risk_per_trade=0.01,
+        constraints=constraints,
+    )
+
+    assert candidate.outcome is not None
+    assert candidate.outcome.context_availability.earnings_context == ContextStatus.DEGRADED
+    assert candidate.outcome.disposition == CandidateDisposition.DEGRADED_APPROVED
 
 
 def test_assess_signal_candidate_blocks_sector_exposure_when_sector_bucket_is_crowded() -> None:

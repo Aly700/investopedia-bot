@@ -21,6 +21,9 @@ from bot.risk.candidate_outcome import (
     BlockerCategory,
     is_actionable_candidate_disposition,
     is_operator_approved_disposition,
+    serialized_candidate_blocker_categories,
+    serialized_candidate_degraded_or_missing_contexts,
+    serialized_candidate_disposition,
 )
 from bot.risk.portfolio_rules import (
     PORTFOLIO_REVIEW_ACTIONS,
@@ -2262,50 +2265,24 @@ def _row_is_operator_approved(row: DailyResearchOpportunityRow) -> bool:
 
 
 def _row_candidate_disposition(row: DailyResearchOpportunityRow) -> str | None:
-    if isinstance(row.candidate_disposition, str) and row.candidate_disposition.strip():
-        return row.candidate_disposition
-    candidate_outcome = _optional_mapping(row.metadata.get("candidate_outcome"))
-    if candidate_outcome is None:
-        return None
-    disposition = candidate_outcome.get("disposition")
-    if isinstance(disposition, str) and disposition.strip():
-        return disposition.strip()
-    return None
+    return serialized_candidate_disposition(
+        row.candidate_disposition,
+        metadata=_optional_mapping(row.metadata),
+    )
 
 
 def _row_blocker_categories(row: DailyResearchOpportunityRow) -> tuple[str, ...]:
-    if row.blocker_categories:
-        return row.blocker_categories
-    candidate_outcome = _optional_mapping(row.metadata.get("candidate_outcome"))
-    if candidate_outcome is None:
-        return ()
-    blockers = candidate_outcome.get("blockers")
-    if not isinstance(blockers, Sequence) or isinstance(blockers, (str, bytes)):
-        return ()
-    categories: list[str] = []
-    for blocker in blockers:
-        if not isinstance(blocker, Mapping):
-            continue
-        category = blocker.get("category")
-        if isinstance(category, str) and category.strip():
-            categories.append(category.strip())
-    return tuple(categories)
+    return serialized_candidate_blocker_categories(
+        row.blocker_categories,
+        metadata=_optional_mapping(row.metadata),
+    )
 
 
 def _row_degraded_or_missing_contexts(row: DailyResearchOpportunityRow) -> tuple[str, ...]:
-    if row.degraded_or_missing_contexts:
-        return row.degraded_or_missing_contexts
-    candidate_outcome = _optional_mapping(row.metadata.get("candidate_outcome"))
-    if candidate_outcome is None:
-        return ()
-    context_availability = _optional_mapping(candidate_outcome.get("context_availability"))
-    if context_availability is None:
-        return ()
-    degraded_contexts: list[str] = []
-    for context_key, status in context_availability.items():
-        if isinstance(status, str) and status in {"degraded", "unavailable"}:
-            degraded_contexts.append(str(context_key))
-    return tuple(degraded_contexts)
+    return serialized_candidate_degraded_or_missing_contexts(
+        row.degraded_or_missing_contexts,
+        metadata=_optional_mapping(row.metadata),
+    )
 
 
 def _brief_context_label(context_key: str) -> str:

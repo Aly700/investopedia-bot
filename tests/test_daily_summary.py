@@ -4067,6 +4067,38 @@ def test_load_earnings_contexts_degrades_entitlement_failures_with_clear_warning
     assert "continuing without earnings gate" in caplog.text
 
 
+def test_candidate_earnings_context_status_tracks_loader_availability_explicitly() -> None:
+    assert (
+        main_module._candidate_earnings_context_status(
+            earnings_context=None,
+            load_status="ok",
+        )
+        == "available"
+    )
+    assert (
+        main_module._candidate_earnings_context_status(
+            earnings_context=None,
+            load_status="degraded",
+        )
+        == "degraded"
+    )
+    assert (
+        main_module._candidate_earnings_context_status(
+            earnings_context=EarningsRiskContext(
+                symbol="AAPL",
+                earnings_date=date(2024, 1, 10),
+                earnings_days_away=3,
+                is_earnings_risk=True,
+                status="confirmed",
+                name="Apple",
+                source="polygon",
+            ),
+            load_status="degraded",
+        )
+        == "available"
+    )
+
+
 def test_run_daily_summary_workflow_warns_and_proceeds_without_benchmark_context(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
